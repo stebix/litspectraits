@@ -1,12 +1,12 @@
 """Command-line interface (``docs/overview-v3.md`` §10, §17.9).
 
-Three commands ship in this iteration: ``ingest``, ``doctor``, ``show``.
-``extract`` and ``sideload`` from the §10 surface land alongside their
-backends — ``extract/`` (Step 10) and ``sideload.py`` (Step 8) — and are
-intentionally absent until then. Operators who type
-``litspectraits extract`` or ``litspectraits sideload`` get Typer's
-"unknown command" message; we don't ship NotImplementedError stubs
-because a stub would imply the surface is wired up but broken.
+Four commands ship today: ``ingest``, ``sideload``, ``doctor``, ``show``
+(plus the convenience ``smoke`` ephemeral-tempdir wrapper around
+``ingest``). ``extract`` from the §10 surface lands alongside its
+backend (``extract/`` — Step 10) and is intentionally absent until
+then. Operators who type ``litspectraits extract`` get Typer's
+"unknown command" message; we don't ship a ``NotImplementedError``
+stub because a stub would imply the surface is wired up but broken.
 
 Failure model
 -------------
@@ -71,6 +71,7 @@ from litspectraits.errors import (
 from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
 from litspectraits.manifest import AcquisitionRecord, converter
+from litspectraits.sideload import sideload as run_sideload
 from litspectraits.store import ArtifactStore
 
 app = typer.Typer(
@@ -177,6 +178,100 @@ async def _run_ingest(*, doi: str, cache_hit_ok: bool, json_output: bool) -> Non
                 store=store,
                 client=client,
                 cache_hit_ok=cache_hit_ok,
+            )
+    except InvalidDOIError as exc:
+        _render_invalid_doi(exc, console=err_console)
+        raise typer.Exit(2) from exc
+    except IngestError as exc:
+        _render_error_panel(exc, console=err_console)
+        raise typer.Exit(_EXIT_CODES.get(type(exc), 1)) from exc
+    if json_output:
+        _emit_record_json(record)
+    else:
+        _render_record_panel(record, settings=settings, console=out_console)
+
+
+# ---------------------------------------------------------------------------
+# sideload
+# ---------------------------------------------------------------------------
+
+
+@app.command(name='sideload')
+def cmd_sideload(
+    doi: str = typer.Argument(..., help='DOI of the article being sideloaded.'),
+    pdf_path: Path = typer.Argument(
+        ...,
+        help='Path to the operator-retrieved PDF.',
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+    license_assertion: str = typer.Option(
+        ...,
+        '--license',
+        help=(
+            'SPDX identifier or free-form license assertion '
+            '(e.g. "wiley-tdm-internal-use-only"). Mandatory: this is the legal trail.'
+        ),
+    ),
+    source_url: str | None = typer.Option(
+        None,
+        '--source-url',
+        help='URL the PDF was retrieved from (recorded in manual_provenance).',
+    ),
+    note: str = typer.Option(
+        '',
+        '--note',
+        help='Free-form note about how the PDF was obtained.',
+    ),
+    json_output: bool = typer.Option(
+        False, '--json', help='Emit the manifest as JSON on stdout.'
+    ),
+) -> None:
+    """Register an operator-retrieved PDF in the local store (PDF-only).
+
+    JATS / Elsevier-XML sideload is intentionally out of scope for v3:
+    the realistic operator workflow is "I downloaded the publisher PDF
+    via my library proxy". Idempotent on ``(doi, sha256)``.
+    """
+    asyncio.run(
+        _run_sideload(
+            doi=doi,
+            pdf_path=pdf_path,
+            license_assertion=license_assertion,
+            source_url=source_url,
+            note=note,
+            json_output=json_output,
+        )
+    )
+
+
+async def _run_sideload(
+    *,
+    doi: str,
+    pdf_path: Path,
+    license_assertion: str,
+    source_url: str | None,
+    note: str,
+    json_output: bool,
+) -> None:
+    settings = _load_settings()
+    store = ArtifactStore(settings.data_dir)
+    err_console = _stderr_console()
+    out_console = _stdout_console()
+    try:
+        async with http_client(settings) as client:
+            record = await run_sideload(
+                doi,
+                pdf_path,
+                license_assertion=license_assertion,
+                source_url=source_url,
+                note=note,
+                settings=settings,
+                store=store,
+                client=client,
             )
     except InvalidDOIError as exc:
         _render_invalid_doi(exc, console=err_console)

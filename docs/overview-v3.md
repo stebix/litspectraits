@@ -1012,13 +1012,27 @@ pending the Step 7 orchestrator decision).
       success integration per publisher; one representative loud-failure
       per `IngestError` subclass.
 
-### Step 8 — Sideload (§17.8, §9)
+### Step 8 — Sideload (§17.8, §9, done)
 
-- [ ] Create `src/litspectraits/sideload.py`: PDF-only, magic-byte
+- [x] Create `src/litspectraits/sideload.py`: PDF-only, magic-byte
       check, hash + atomic copy, mandatory `ManualProvenance`.
-- [ ] Tests: happy path; idempotency on `(doi, sha256)`; non-PDF input
+- [x] Tests: happy path; idempotency on `(doi, sha256)`; non-PDF input
       → `MalformedArtifactError`; missing `LITSPECTRAITS_CONTACT_EMAIL`
-      surfaces at startup, not at sideload time.
+      surfaces at startup, not at sideload time (via the
+      `test_missing_contact_email_exits_2_with_panel` regression — the
+      ``Settings.from_env`` check fires at the same place for sideload).
+- [x] CLI `sideload` command wired through with class-specific exit
+      codes; `--license` mandatory; `--source-url` and `--note`
+      optional. Idempotent on `(doi, sha256)` at the orchestrator
+      layer — re-running with the same bytes never re-writes the
+      manifest or appends a duplicate index entry.
+
+Design calls made during this step are logged in `docs/triage.md`
+entries S8-1 … S8-5 — the substantive ones are S8-1 (CrossRef is
+fetched on every sideload; no `--no-metadata` flag), S8-4 (manifest
+path is sha256-keyed, not `(doi, sha256)`-keyed — pre-existing v3
+quirk surfaced by sideload), and S8-5 (sniff-first / idempotency-
+before-CrossRef ordering).
 
 ### Step 9 — CLI + doctor (§17.9, §12)
 

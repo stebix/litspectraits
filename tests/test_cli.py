@@ -303,6 +303,269 @@ def test_ingest_invalid_doi_exits_2(
 
 
 # ---------------------------------------------------------------------------
+# sideload
+# ---------------------------------------------------------------------------
+
+
+def _patch_sideload(
+    monkeypatch: pytest.MonkeyPatch, behaviour: Callable[..., AcquisitionRecord]
+) -> None:
+    async def _async_stub(*args: object, **kwargs: object) -> AcquisitionRecord:
+        return behaviour(*args, **kwargs)
+
+    monkeypatch.setattr('litspectraits.cli.run_sideload', _async_stub)
+
+
+def _patch_sideload_to_raise(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    async def _async_stub(*args: object, **kwargs: object) -> AcquisitionRecord:
+        raise exc
+
+    monkeypatch.setattr('litspectraits.cli.run_sideload', _async_stub)
+
+
+def _example_manual_record(*, doi: str = '10.1002/sideload.cli') -> AcquisitionRecord:
+    from litspectraits.manifest import ManualProvenance
+
+    sha = 'b' * 64
+    return AcquisitionRecord(
+        doi=doi,
+        sha256=sha,
+        artifact_path=f'artifacts/pdf/sha256/bb/{sha}.pdf',
+        format=Format.PDF,
+        publisher=Publisher.WILEY,
+        metadata=CrossRefMetadata(
+            doi=doi,
+            publisher_str='Wiley',
+            title='A sideloaded paper',
+            authors=('Doe, Jane',),
+            year=2024,
+            type='journal-article',
+            license='https://creativecommons.org/licenses/by/4.0/',
+        ),
+        fetched_url='',
+        fetched_at=datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC),
+        fetcher_version='0.1.0',
+        sdk_version='manual',
+        byte_size=12345,
+        origin='manual',
+        manual_provenance=ManualProvenance(
+            operator='test@example.com',
+            retrieved_at=datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC),
+            source_url='https://onlinelibrary.wiley.com/doi/pdf/' + doi,
+            note='via library proxy',
+            license_assertion='wiley-tdm-internal-use-only',
+        ),
+    )
+
+
+@pytest.fixture
+def sideload_pdf(tmp_path: Path) -> Path:
+    """A real on-disk PDF that satisfies Typer's ``exists=True`` check.
+
+    The CLI tests stub the sideload orchestrator, so the file's *contents*
+    never get sniffed or hashed — but Typer rejects the call before our
+    code runs if the path doesn't exist on disk, hence a real file.
+    """
+    path = tmp_path / 'operator.pdf'
+    path.write_bytes(b'%PDF-1.7\nmock body\n%%EOF\n')
+    return path
+
+
+def test_sideload_text_mode_renders_record_panel(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sideload_pdf: Path
+) -> None:
+    record = _example_manual_record()
+    _patch_sideload(monkeypatch, lambda *a, **kw: record)
+    result = runner.invoke(
+        app,
+        [
+            'sideload',
+            record.doi,
+            str(sideload_pdf),
+            '--license',
+            'wiley-tdm-internal-use-only',
+            '--source-url',
+            'https://onlinelibrary.wiley.com/doi/pdf/' + record.doi,
+            '--note',
+            'via library proxy',
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert record.doi in result.stdout
+    assert 'manual' in result.stdout
+    assert record.sha256 in result.stdout
+
+
+def test_sideload_json_mode_emits_machine_readable_payload(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sideload_pdf: Path
+) -> None:
+    record = _example_manual_record()
+    _patch_sideload(monkeypatch, lambda *a, **kw: record)
+    result = runner.invoke(
+        app,
+        [
+            'sideload',
+            '--json',
+            record.doi,
+            str(sideload_pdf),
+            '--license',
+            'cc-by-4.0',
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert converter.structure(payload, AcquisitionRecord) == record
+
+
+def test_sideload_forwards_optional_arguments_to_orchestrator(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sideload_pdf: Path
+) -> None:
+    """``--license`` / ``--source-url`` / ``--note`` reach the orchestrator."""
+    captured: dict[str, object] = {}
+
+    def _capture(*args: object, **kwargs: object) -> AcquisitionRecord:
+        del args
+        captured.update(kwargs)
+        return _example_manual_record()
+
+    _patch_sideload(monkeypatch, _capture)
+    result = runner.invoke(
+        app,
+        [
+            'sideload',
+            '10.1002/sideload.cli',
+            str(sideload_pdf),
+            '--license',
+            'cc-by-4.0',
+            '--source-url',
+            'https://example.org/x.pdf',
+            '--note',
+            'retrieved 2026-05-11',
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert captured['license_assertion'] == 'cc-by-4.0'
+    assert captured['source_url'] == 'https://example.org/x.pdf'
+    assert captured['note'] == 'retrieved 2026-05-11'
+
+
+def test_sideload_default_source_url_and_note_when_omitted(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, sideload_pdf: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _capture(*args: object, **kwargs: object) -> AcquisitionRecord:
+        del args
+        captured.update(kwargs)
+        return _example_manual_record()
+
+    _patch_sideload(monkeypatch, _capture)
+    result = runner.invoke(
+        app,
+        [
+            'sideload',
+            '10.1002/sideload.cli',
+            str(sideload_pdf),
+            '--license',
+            'unknown',
+        ],
+    )
+    assert result.exit_code == 0
+    assert captured['source_url'] is None
+    assert captured['note'] == ''
+
+
+@pytest.mark.parametrize(
+    ('exc_factory', 'expected_code'),
+    [
+        (
+            lambda doi: MalformedArtifactError(
+                doi=doi,
+                expected=Format.PDF.value,
+                detected='unrecognized',
+                path='/tmp/x',
+                byte_size=42,
+            ),
+            6,
+        ),
+        (
+            lambda doi: UnsupportedPublisherError(doi=doi, prefix='10.9999'),
+            2,
+        ),
+        (
+            lambda doi: DOINotFoundError(doi=doi, http_status=404),
+            2,
+        ),
+        (
+            lambda doi: IntegrityError(
+                doi=doi,
+                sha256='a' * 64,
+                existing_size=100,
+                incoming_size=200,
+                artifact_path='artifacts/pdf/sha256/aa/x.pdf',
+            ),
+            7,
+        ),
+    ],
+)
+def test_sideload_exit_codes_per_error_class(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    sideload_pdf: Path,
+    exc_factory: Callable[[str], Exception],
+    expected_code: int,
+) -> None:
+    doi = '10.1002/sideload.cli'
+    _patch_sideload_to_raise(monkeypatch, exc_factory(doi))
+    result = runner.invoke(
+        app,
+        ['sideload', doi, str(sideload_pdf), '--license', 'unknown'],
+    )
+    assert result.exit_code == expected_code
+    assert exc_factory(doi).__class__.__name__ in result.stderr
+
+
+def test_sideload_invalid_doi_exits_2(
+    runner: CliRunner, sideload_pdf: Path
+) -> None:
+    """A non-DOI shape is rejected with Invalid DOI panel."""
+    result = runner.invoke(
+        app,
+        ['sideload', 'not a doi', str(sideload_pdf), '--license', 'unknown'],
+    )
+    assert result.exit_code == 2
+    assert 'Invalid DOI' in result.stderr
+
+
+def test_sideload_missing_pdf_path_typer_exit(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Typer's path-existence check rejects nonexistent paths before us.
+
+    The Typer/Click error message goes to stderr with exit code 2.
+    """
+    missing = tmp_path / 'does-not-exist.pdf'
+    result = runner.invoke(
+        app,
+        ['sideload', '10.1002/sideload.cli', str(missing), '--license', 'unknown'],
+    )
+    assert result.exit_code == 2
+
+
+def test_sideload_missing_license_flag_typer_exit(
+    runner: CliRunner, sideload_pdf: Path
+) -> None:
+    """``--license`` is mandatory; Typer rejects when omitted."""
+    result = runner.invoke(
+        app,
+        ['sideload', '10.1002/sideload.cli', str(sideload_pdf)],
+    )
+    assert result.exit_code == 2
+
+
+# ---------------------------------------------------------------------------
 # show
 # ---------------------------------------------------------------------------
 

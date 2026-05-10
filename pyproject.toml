@@ -58,6 +58,12 @@ select = ['E', 'F', 'W', 'I', 'B', 'UP', 'N', 'RUF', 'SIM']
 [tool.ruff.lint.per-file-ignores]
 'tests/**' = ['S101']
 
+[tool.ruff.lint.flake8-bugbear]
+# Typer's marker factories must live in argument defaults — that's the
+# library's API contract. Whitelist them so B008 doesn't flag the
+# idiomatic ``param: T = typer.Option(...)`` pattern.
+extend-immutable-calls = ['typer.Argument', 'typer.Option']
+
 [tool.pyright]
 pythonVersion = '3.14'
 typeCheckingMode = 'standard'

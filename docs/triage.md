@@ -212,3 +212,122 @@ under the entry rather than rewriting history.
   explicitly. No call needed; documenting only because the §16
   list is the place to look if a new module needs a logger.
 - **Revisit when:** never expected — kept for audit.
+
+---
+
+## Step 8 — Sideload (committed TBD, 2026-05-11)
+
+### S8-1 — CrossRef metadata is fetched on every sideload
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/sideload.py` — `sideload()`; cross-ref
+  `docs/overview-v3.md` §9.
+- **Decision:** the sideload happy path calls
+  `metadata.fetch_metadata(doi)` exactly like the auto-ingest
+  orchestrator. There is no `--no-metadata` flag, and the manifest
+  carries the same `CrossRefMetadata` shape regardless of `origin`.
+  CrossRef errors (404 → `DOINotFoundError`; 5xx → raw
+  `httpx.HTTPError` per M5-1) bubble unmodified.
+- **Why:** the §9 wording "Synthesize an `AcquisitionRecord`" doesn't
+  say anything about CrossRef, but the `AcquisitionRecord.metadata`
+  field is non-optional and `Document` consumers (extraction, the
+  future agent triad) need title/authors/year/license uniformly.
+  Shipping a `--no-metadata` flag would re-open the abstract-only-
+  manifest hole that v3 closed for auto-ingest, just under a different
+  name. Network access during sideload is unfortunate, but the
+  operator workaround (retry once CrossRef recovers) is small and the
+  local PDF stays put.
+- **Revisit when:** CrossRef availability becomes a real operational
+  blocker for batch sideloads. The remediation is *not* a
+  `--no-metadata` flag but a "stage now, enrich later" decoupled
+  manifest-completion pass.
+
+### S8-2 — Idempotency is keyed on `(doi, sha256)`, no-op on match
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/sideload.py` — `sideload()` between
+  `_stage_pdf()` and `fetch_metadata()`; `docs/overview-v3.md` §9
+  ("Idempotent on `(doi, sha256)`").
+- **Decision:** after the source is hashed, the sideload looks the DOI
+  up via `store.find_by_doi`. If an existing record matches the
+  computed sha256, the staged tmp copy is unlinked and the existing
+  record is returned untouched — no manifest re-write, no second
+  index entry, no CrossRef call.
+- **Why:** "idempotent" must mean *observably* idempotent: re-running
+  sideload twice should produce one record and one index entry, not
+  two. The store's commit is idempotent on sha256 alone, but the index
+  is append-only; without the short-circuit, the index would grow on
+  every re-sideload. Doing the check between hash and CrossRef lets
+  the no-op stay offline.
+- **Revisit when:** a use-case appears for "re-sideload to refresh
+  manual_provenance fields" (e.g. operator wants to update the license
+  assertion). Today that requires deleting the manifest and re-running;
+  if it becomes common, add a `--force-update` flag rather than
+  silently re-writing.
+
+### S8-3 — `sdk_version='manual'` sentinel + `fetched_url=''`
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/sideload.py` — record construction in
+  `sideload()`; `docs/overview-v3.md` §4 (`RetrievePayload`).
+- **Decision:** on a manual sideload, `AcquisitionRecord.sdk_version`
+  is the literal string `'manual'` (not the publisher's SDK version,
+  not the empty string) and `AcquisitionRecord.fetched_url` is `''`.
+  The operator-supplied URL goes into
+  `manual_provenance.source_url`; the canonical-URL field stays empty.
+- **Why:** the manifest carries one field per concept. `sdk_version`
+  is "what software fetched these bytes"; for manual sideload that's
+  unambiguously *not* an SDK, so a sentinel string is the honest
+  encoding. `fetched_url` is "URL we ourselves fetched from"; for
+  manual sideload that's empty by construction. Promoting either to
+  `str | None` is scope creep against the existing model.
+- **Revisit when:** a downstream consumer treats `sdk_version` as a
+  package-version string and crashes on `'manual'`. The fix at that
+  point is making `sdk_version` `str | None` with `None` for manual,
+  not introducing a free-text mode.
+
+### S8-4 — Manifest path is sha256-keyed, not (doi, sha256)-keyed
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/store.py` — `manifest_path()`;
+  `docs/overview-v3.md` §3.
+- **Decision:** noted, not fixed in Step 8. Two distinct DOIs
+  sideloading the same PDF bytes will collide on the manifest path —
+  the second write overwrites the first, and the first DOI's
+  `find_by_doi` then resolves to a manifest carrying the second DOI.
+  Sideload makes this slightly more reachable than auto-ingest does,
+  but it is a pre-existing v3 modelling decision, not sideload-
+  specific (auto-ingest of two DOIs that happened to compress to the
+  same TDM bytes would hit the same hole).
+- **Why:** §3's "content-addressed, sharded by sha256" maps one sha
+  to one file. Promoting the manifest key to `(doi, sha256)` would
+  duplicate metadata for legitimately-shared bytes and break the
+  "one artifact, one canonical path" rule. The conservative remedy
+  is *detecting* the collision (raise `IntegrityError` when the
+  existing manifest has a different DOI) rather than silently
+  overwriting.
+- **Revisit when:** the corpus actually contains two DOIs sharing
+  bytes. At that point: add a sha-already-mapped-to-different-DOI
+  check inside `ArtifactStore.commit` and surface as a typed error.
+  Not worth the code in Step 8.
+
+### S8-5 — Order of operations: sniff → stage+hash → idem → CrossRef
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/sideload.py` — `sideload()` step
+  order; `tests/test_sideload.py::test_non_pdf_input_raises_malformed_before_network_call`.
+- **Decision:** five stages in fixed order — pre-stage magic-byte
+  sniff, stream-copy + hash into tmp, `find_by_doi` idempotency check,
+  CrossRef + dispatch, defence-in-depth re-sniff, commit. Non-PDF
+  inputs never copy bytes into the store; idempotent re-runs never
+  reach the network.
+- **Why:** sniff-first keeps paywall HTML and error pages out of the
+  staging tree (cheap 4 KiB read at the source). Hashing during the
+  stream-copy is a single read of the source for the common case.
+  Idempotency check before CrossRef means a re-sideload of an already-
+  registered artifact stays fully offline (matches §9's "idempotent
+  on (doi, sha256)" intent). Defence-in-depth re-sniff at the
+  orchestrator boundary mirrors `ingest.py` (S0 invariant: nothing
+  reaches `commit` without passing `verify` at the orchestrator).
+- **Revisit when:** never expected — the ordering is constrained by
+  the failure model.

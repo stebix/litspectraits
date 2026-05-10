@@ -112,6 +112,29 @@ and error panels go to stderr):
 uv run litspectraits ingest 10.1002/mrm.xxxxx --json | jq .sha256
 ```
 
+### `sideload` — register an operator-retrieved PDF
+
+For DOIs where TDM access is unavailable (typical case: a Wiley title
+the operator pulls via the library proxy), drop a PDF you fetched
+out-of-band into the same content-addressed store. PDF-only.
+
+```sh
+uv run litspectraits sideload 10.1002/mrm.xxxxx ~/Downloads/paper.pdf \
+    --license 'wiley-tdm-internal-use-only' \
+    --source-url 'https://onlinelibrary.wiley.com/doi/pdf/10.1002/mrm.xxxxx' \
+    --note 'via uni-wuerzburg library proxy'
+```
+
+`--license` is mandatory — it's the legal trail for proxies that
+permit the fetch but forbid redistribution. The operator email
+(from `LITSPECTRAITS_CONTACT_EMAIL`) and timestamp are written into
+the manifest's `manual_provenance` block.
+
+Idempotent on `(doi, sha256)`: re-running with the same bytes
+returns the existing record without re-writing the manifest or
+duplicating the index entry. Sideload also fetches CrossRef metadata
+so the manifest shape stays uniform with auto-ingested records.
+
 ### `doctor` — preflight credentials + egress
 
 Run before any batch ingest. Verifies the contact email is set, probes
