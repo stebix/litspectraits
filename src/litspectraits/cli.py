@@ -18,10 +18,15 @@ from rich.panel import Panel
 from rich.table import Table
 
 from litspectraits._logging import configure_logging
+from litspectraits.acquisition.attempt import AcquisitionAttempt
 from litspectraits.acquisition.fetch import acquire
 from litspectraits.acquisition.manifest import AcquisitionRecord
 from litspectraits.acquisition.sideload import sideload as sideload_artifact
-from litspectraits.acquisition.store import ArtifactStore, NoSourceAvailableError
+from litspectraits.acquisition.store import (
+    AcquisitionExhaustedError,
+    ArtifactStore,
+    NoSourceAvailableError,
+)
 from litspectraits.config import MissingConfigError, Settings
 from litspectraits.http import http_client
 from litspectraits.resolver.policy import PRESETS, RankingPolicy
@@ -115,6 +120,44 @@ def _render_probe_table(result: ResolveResult) -> Table:
     return table
 
 
+def _render_attempts_table(
+    attempts: tuple[AcquisitionAttempt, ...], *, success_marker: bool
+) -> Table:
+    """Render the per-route fetch log as a table.
+
+    ``success_marker`` adds a ``← stored`` annotation to the SUCCESS row;
+    omit it for the exhausted-error case where there is no success row.
+    """
+    table = Table(title='attempts', show_lines=False)
+    table.add_column('source')
+    table.add_column('outcome')
+    table.add_column('http', justify='right')
+    table.add_column('ms', justify='right')
+    table.add_column('note')
+    for attempt in attempts:
+        status = str(attempt.http_status) if attempt.http_status is not None else ''
+        if attempt.outcome.value == 'success':
+            outcome = '[bold green]success[/]'
+            note = '[bold]← stored[/]' if success_marker else ''
+        else:
+            outcome = f'[yellow]{attempt.outcome.value}[/]'
+            if attempt.sniffed_prefix is not None:
+                preview = attempt.sniffed_prefix.decode('utf-8', errors='replace').strip()
+                note = f'sniff: {preview!r}'
+            elif attempt.error:
+                note = attempt.error
+            else:
+                note = ''
+        table.add_row(
+            attempt.availability.source_kind.value,
+            outcome,
+            status,
+            str(attempt.duration_ms),
+            note,
+        )
+    return table
+
+
 def _record_panel(record: AcquisitionRecord, title: str) -> Panel:
     body = (
         f'[bold]doi[/]      {record.doi}\n'
@@ -191,7 +234,13 @@ def ingest(
     except NoSourceAvailableError as exc:
         _CONSOLE.print(f'[bold red]ingest failed:[/] {exc}')
         raise typer.Exit(code=1) from exc
+    except AcquisitionExhaustedError as exc:
+        _CONSOLE.print(f'[bold red]ingest failed:[/] {exc}')
+        _CONSOLE.print(_render_attempts_table(exc.attempts, success_marker=False))
+        raise typer.Exit(code=1) from exc
 
+    if len(record.attempts) > 1:
+        _CONSOLE.print(_render_attempts_table(record.attempts, success_marker=True))
     _CONSOLE.print(_record_panel(record, title='acquired'))
 
 

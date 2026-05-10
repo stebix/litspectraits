@@ -45,6 +45,8 @@ class UnpaywallProbe:
             return ProbeOutcome(probe=self.name, duration_ms=measure(start))
         resp.raise_for_status()
         payload = resp.json()
+        if payload.get('is_oa') is not True:
+            return ProbeOutcome(probe=self.name, duration_ms=measure(start))
         availabilities = tuple(_locations_to_availabilities(payload))
         return ProbeOutcome(
             probe=self.name,

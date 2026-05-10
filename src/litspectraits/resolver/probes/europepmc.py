@@ -63,7 +63,7 @@ class EuropePMCProbe:
         resp = await ctx.client.get(_SEARCH_URL, params=params)
         resp.raise_for_status()
         hit = _first_hit(resp.json())
-        if hit is None or hit.get('inEPMC') != 'Y':
+        if hit is None or not _hit_has_open_fulltext(hit):
             return ProbeOutcome(probe=self.name, duration_ms=measure(start))
 
         source = hit.get('source')
@@ -95,3 +95,18 @@ def _first_hit(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if not results:
         return None
     return results[0]
+
+
+def _hit_has_open_fulltext(hit: Mapping[str, Any]) -> bool:
+    """All three flags must be ``Y`` for the fullTextXML endpoint to actually serve.
+
+    EPMC's ``inEPMC`` says 'we have a record', not 'we have full text we'll
+    let you fetch'. ``hasFullText`` and ``isOpenAccess`` together gate the
+    bytes — observed-in-the-wild after ``10.1002/mrm.26701`` slipped
+    through the looser ``inEPMC=Y`` check and 404'd on fetch.
+    """
+    return (
+        hit.get('inEPMC') == 'Y'
+        and hit.get('hasFullText') == 'Y'
+        and hit.get('isOpenAccess') == 'Y'
+    )

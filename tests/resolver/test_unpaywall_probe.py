@@ -27,6 +27,7 @@ def ctx_factory(settings: Settings):
 @respx.mock
 async def test_unpaywall_yields_one_availability_per_oa_location(ctx_factory) -> None:
     payload = {
+        'is_oa': True,
         'oa_locations': [
             {
                 'url_for_pdf': 'https://example.com/published.pdf',
@@ -41,7 +42,7 @@ async def test_unpaywall_yields_one_availability_per_oa_location(ctx_factory) ->
                 'host_type': 'repository',
             },
             {
-                'url_for_pdf': None,  # filtered out
+                'url_for_pdf': None,  # filtered out: no PDF url
                 'version': 'publishedVersion',
             },
         ],
@@ -69,6 +70,22 @@ async def test_unpaywall_yields_one_availability_per_oa_location(ctx_factory) ->
 async def test_unpaywall_returns_empty_on_404(ctx_factory) -> None:
     respx.get(url__startswith='https://api.unpaywall.org/v2/').mock(
         return_value=httpx.Response(404)
+    )
+
+    async with httpx.AsyncClient() as client:
+        ctx = await ctx_factory(client)
+        outcome = await UnpaywallProbe().run(ctx)
+
+    assert outcome.availabilities == ()
+    assert outcome.error is None
+
+
+@respx.mock
+async def test_unpaywall_skips_when_parent_is_oa_false(ctx_factory) -> None:
+    """Closed-access papers carry oa_locations=[] and is_oa=false at the top level."""
+    payload = {'is_oa': False, 'oa_locations': []}
+    respx.get(url__startswith='https://api.unpaywall.org/v2/').mock(
+        return_value=httpx.Response(200, json=payload)
     )
 
     async with httpx.AsyncClient() as client:

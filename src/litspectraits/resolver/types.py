@@ -130,6 +130,17 @@ class ResolveResult:
     policy_name: str
     resolved_at: datetime
 
+    @property
+    def permitted_candidates(self) -> tuple[Availability, ...]:
+        """Candidates not excluded by policy, in policy-rank order.
+
+        Derived from ``candidates`` minus the URLs found in ``excluded``;
+        the resolver places permitted entries first in ``candidates``, so
+        rank order is preserved.
+        """
+        excluded_urls = {a.url for a, _ in self.excluded}
+        return tuple(c for c in self.candidates if c.url not in excluded_urls)
+
 
 def make_extra(**kwargs: str | None) -> tuple[tuple[str, str], ...]:
     """Build a sorted, hashable ``extra`` tuple from keyword arguments.

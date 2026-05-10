@@ -21,6 +21,7 @@ from litspectraits.acquisition.manifest import (
     ManualProvenance,
     Origin,
 )
+from litspectraits.acquisition.sniff import SNIFF_BYTES, magic_bytes_match
 from litspectraits.acquisition.store import ArtifactStore, MalformedArtifactError
 from litspectraits.config import Settings
 from litspectraits.doi import normalize as normalize_doi
@@ -40,12 +41,6 @@ _FORMAT_MEDIA_TYPE: Final = {
     Format.LATEX: 'application/x-eprint-tar',
     Format.PDF: 'application/pdf',
 }
-
-# Magic-byte sniffers — small enough to inline.
-_MAGIC_PDF: Final = b'%PDF-'
-_MAGIC_GZ: Final = b'\x1f\x8b'
-_MAGIC_JATS_PREFIXES: Final = (b'<?xml', b'<article', b'<!DOCTYPE')
-_MAGIC_LATEX_KEYWORDS: Final = (b'\\documentclass', b'\\begin{document}')
 
 log = structlog.get_logger('litspectraits.acquisition.sideload')
 
@@ -164,19 +159,6 @@ def _hash_file(path: Path) -> tuple[str, int]:
 def _check_magic(path: Path, format_: Format) -> None:
     """Sniff the file head and raise :class:`MalformedArtifactError` on mismatch."""
     with path.open('rb') as fh:
-        head = fh.read(2048)
-    if format_ is Format.PDF:
-        if not head.startswith(_MAGIC_PDF):
-            raise MalformedArtifactError(f'{path}: not a PDF (missing %PDF- header)')
-        return
-    if format_ is Format.JATS:
-        stripped = head.lstrip()
-        if not any(stripped.startswith(p) for p in _MAGIC_JATS_PREFIXES):
-            raise MalformedArtifactError(f'{path}: not JATS XML (missing XML/article header)')
-        return
-    if format_ is Format.LATEX:
-        if head.startswith(_MAGIC_GZ):
-            return  # tarball — accept
-        if any(kw in head for kw in _MAGIC_LATEX_KEYWORDS):
-            return
-        raise MalformedArtifactError(f'{path}: not LaTeX (no \\documentclass or gzip magic)')
+        head = fh.read(SNIFF_BYTES)
+    if not magic_bytes_match(format_, head):
+        raise MalformedArtifactError(f'{path}: bytes do not match format {format_.value}')

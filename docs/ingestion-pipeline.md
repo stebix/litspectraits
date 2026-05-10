@@ -662,6 +662,246 @@ committed that doesn't pass all three.
 9. CLI `resolve` and `ingest` with Rich rendering.
 10. README quickstart with one OA DOI worked example.
 
+## Amendment — Acquire-Time Verification (2026-05-09)
+
+### Motivation
+
+The probe layer's job is to ask metadata APIs 'does a fetchable route exist?'.
+The acquire step then trusts that answer and fetches. In practice this is too
+optimistic, in two distinct ways:
+
+- **Eager probes.** `10.1002/mrm.26701` triggered EPMC to report
+  `inEPMC=Y, isOpenAccess=N`, no `hasFullText` field. The probe gates only on
+  `inEPMC=Y` (`europepmc.py:66`) and confidently advertised a `fullTextXML`
+  URL that 404s on fetch.
+- **Imperfect metadata.** No upstream is perfect. PMC's OA index lags ingest;
+  Unpaywall's `oa_locations` includes mirrors that go offline; Crossref
+  `link` arrays sometimes point at landing pages instead of payloads. Probes
+  will always be best-effort.
+
+The current acquire step (`fetch.py`) calls `raise_for_status()` on the chosen
+URL and lets the exception propagate as an unhandled `HTTPStatusError`. That:
+
+1. Surfaces as a raw traceback instead of a structured CLI error.
+2. Discards the rest of `ResolveResult.candidates` even when fetchable
+   alternatives exist (in the example above, `pdf_unpaywall` was permitted and
+   ranked next).
+3. Loses the audit information — 'we tried X, it 404'd' — that an operator
+   needs to debug or escalate.
+
+### Decision
+
+Verification is **acquisition's** responsibility, not the probe's. Probes
+remain cheap, metadata-only operations and keep their current contract.
+Acquisition gains three things:
+
+1. **First-byte magic-byte sniffing.** After the response headers say 200 OK,
+   read the first 4 KiB into memory and match against the format's expected
+   magic bytes (`%PDF-` for PDF, `<?xml` / `<article` for JATS,
+   `\documentclass` for LaTeX). Only commit to writing the temp file if the
+   sniff passes. The sideload path's existing magic-byte sniffer
+   (`acquisition/sideload.py`) is the canonical implementation; both call
+   sites must use the same function. Semantic validity ('is this JATS
+   actually fulltext or just an abstract stub?') is an extraction-stage
+   concern — acquisition's bar is 'plausibly represents the format'.
+2. **Chosen-route fall-through.** On 4xx, on a 200-with-failed-magic-byte
+   sniff, or on a connection drop before the body is committed, the failed
+   `Availability` is appended to an `AcquisitionAttempt` log with a structured
+   reason; acquisition retries with the next permitted candidate from
+   `ResolveResult.candidates`. Cap at `MAX_ACQUIRE_ATTEMPTS = 4` to bound
+   publisher-side load on pathological cases.
+3. **Per-probe metadata-gate tightening.** Opportunistic, belt-and-braces,
+   *not* the primary defense. The EPMC probe must additionally gate on
+   `hasFullText == 'Y'` and `isOpenAccess == 'Y'`. Other probes get
+   tightened as real failures teach us what's worth gating.
+
+5xx and 4xx are treated identically in this step — both fall through
+immediately. There is no per-attempt retry layer in step 1 of the
+pipeline; the fall-through itself is the safety net. Adding tenacity-driven
+retry for transient 5xx is deferred until pathological flapping shows up
+in real batch runs (see Punted, below).
+
+### Data Model Changes
+
+Additive to `acquisition/attempt.py` (new file, sibling to
+`acquisition/manifest.py` — keeps acquire-stage event types out of
+`resolver/types.py` so the resolver layer stays focused on availability
+discovery):
+
+```python
+class AttemptOutcome(StrEnum):
+    SUCCESS = 'success'
+    HTTP_4XX = 'http_4xx'
+    HTTP_5XX = 'http_5xx'              # after retry exhaustion
+    MAGIC_BYTE_MISMATCH = 'magic_byte_mismatch'
+    CONNECTION_DROPPED = 'connection_dropped'
+    EMPTY_BODY = 'empty_body'
+
+@frozen
+class AcquisitionAttempt:
+    availability: Availability
+    outcome: AttemptOutcome
+    http_status: int | None            # populated for HTTP_4XX / HTTP_5XX
+    sniffed_prefix: bytes | None       # first 64 bytes on MAGIC_BYTE_MISMATCH
+    duration_ms: int
+    attempted_at: datetime
+    error: str | None                  # raw exception message for debug
+```
+
+`AcquisitionRecord` (in `acquisition/manifest.py`) grows one field:
+
+```python
+@frozen
+class AcquisitionRecord:
+    # ... existing fields ...
+    attempts: tuple[AcquisitionAttempt, ...] = ()   # successful route is last entry
+```
+
+`ResolveResult` gains a derived `permitted_candidates` property — not a
+stored field, so cattrs round-trips are unchanged — that returns
+`candidates − excluded` in policy-rank order. `acquire()` walks this
+slice. The audit trail of *what was tried* lives on the
+`AcquisitionRecord` because resolve still legitimately picks one route —
+the fall-throughs are an acquire-stage concern.
+
+The `cattrs` converter in `acquisition/manifest.py` registers a
+`bytes ↔ base64` round-trip hook so the `sniffed_prefix: bytes | None`
+field on `AcquisitionAttempt` serializes cleanly into the manifest JSON.
+
+### Updated Acquire Flow
+
+```python
+async def acquire(result: ResolveResult, *, force: bool = False) -> AcquisitionRecord:
+    if result.chosen is None:
+        raise NoSourceAvailableError(result.doi)
+
+    # ranked permitted candidates — chosen first, then the rest by policy.sort_key
+    queue = result.permitted_candidates[:MAX_ACQUIRE_ATTEMPTS]
+    attempts: list[AcquisitionAttempt] = []
+    for availability in queue:
+        attempt, payload = await _try_fetch(client, availability, store.tmp_dir)
+        attempts.append(attempt)
+        if attempt.outcome is AttemptOutcome.SUCCESS:
+            return _commit(result, availability, payload, tuple(attempts))
+    raise AcquisitionExhaustedError(result.doi, tuple(attempts))
+```
+
+`_try_fetch` opens a streaming GET, reads the first 4 KiB into memory,
+validates magic bytes against `availability.format`, and only then opens the
+temp file and continues streaming hash-on-the-fly. On any failure mode it
+unlinks any partial temp file (closing the gap noted in the smoke-test
+write-up) and returns the structured `AcquisitionAttempt`.
+
+`AcquisitionExhaustedError` carries the full attempts list so the CLI can
+render a 'we tried N routes, here's what each said' panel.
+
+### Updated Failure Semantics
+
+Adds to the existing list (the rest is unchanged):
+
+- **Chosen route returns 4xx** → record `AcquisitionAttempt(outcome=HTTP_4XX)`,
+  fall through to next permitted candidate.
+- **Chosen route returns 200 with wrong magic bytes** → record
+  `AcquisitionAttempt(outcome=MAGIC_BYTE_MISMATCH, sniffed_prefix=...)`,
+  fall through. Catches paywall-HTML-as-PDF, error-page-as-XML, etc.
+- **Chosen route 5xx** → record `AcquisitionAttempt(outcome=HTTP_5XX)`,
+  fall through immediately. No per-attempt retry in step 1 (deferred —
+  see Punted).
+- **All `MAX_ACQUIRE_ATTEMPTS` permitted candidates exhausted** → raise
+  `AcquisitionExhaustedError`. CLI exits non-zero with the attempts table.
+- **Mid-stream connection drop after temp file opened** → unlink the partial
+  `.part` file in a `try/finally`, record
+  `AcquisitionAttempt(outcome=CONNECTION_DROPPED)`, fall through.
+
+### CLI Changes
+
+`ingest`'s final summary panel grows an 'Attempts' sub-table when
+`len(attempts) > 1`:
+
+```
+Attempts
+  jats_europepmc       http_4xx              123 ms
+  pdf_unpaywall        success               842 ms  ← stored
+```
+
+`AcquisitionExhaustedError` renders the same table without a `success` row
+and exits 1. `resolve --json` is unaffected; `ingest --json` includes the
+`attempts` array under the record.
+
+### Tightenings to Existing Probes
+
+Tracked here so they don't drift off as separate issues:
+
+- **EuropePMCProbe** — gate on `inEPMC=Y AND hasFullText=Y AND isOpenAccess=Y`.
+  `_VERSION_BY_SOURCE` mapping is unchanged; this is purely *whether to yield
+  an `Availability` at all*.
+- **PMCProbe** — confirm the OA web service returned a non-empty `<oa>` record
+  with at least one `<link>` element before yielding. (The `oa.fcgi` endpoint
+  returns an XML envelope even for non-OA articles; the absence of `<link>` is
+  the real 'not in OA subset' signal.)
+- **UnpaywallProbe** — gate on the **parent payload's** `is_oa: true`
+  (Unpaywall does not set `is_oa` per `oa_locations` entry — verified
+  against `10.1002/mrm.26701`); per-location filter remains
+  `url_for_pdf` truthy + recognized `version`.
+
+### Testing
+
+New cases under `tests/acquisition/`:
+
+- `test_acquire_fallthrough_404.py` — first candidate 404s, second succeeds;
+  assert final record carries both attempts in order, with `sha256` and
+  `byte_size` from the second.
+- `test_acquire_fallthrough_magic_bytes.py` — first candidate returns
+  `<html>...</html>` with `Content-Type: application/pdf`, second succeeds;
+  assert magic-byte mismatch is recorded with the sniffed prefix.
+- `test_acquire_exhausted.py` — all permitted candidates fail; assert
+  `AcquisitionExhaustedError` and a full attempts log.
+- `test_acquire_partial_cleanup.py` — connection drops mid-stream after the
+  temp file opens; assert the `.part` is unlinked.
+
+New case under `tests/resolver/`:
+
+- `test_europepmc_gate_hasfulltext.py` — fixture with
+  `inEPMC=Y, hasFullText=N` yields no `Availability`; sister fixture with
+  `hasFullText=Y, isOpenAccess=N` also yields nothing.
+
+### Order of Work (Delta)
+
+Insert between current steps 5 and 6:
+
+> **5b.** Extract magic-byte sniff helper into `acquisition/sniff.py` (shared
+> with `sideload.py`); add `AttemptOutcome` / `AcquisitionAttempt` to
+> `resolver/types.py`; rewrite `acquire()` as the fall-through loop; tighten
+> the EPMC probe gate; respx tests for 404, magic-byte mismatch, exhaustion,
+> partial-cleanup, and the EPMC gate. Single commit, all of: pytest +
+> ruff check + pyright green.
+
+The rest of the order of work (local probe → resolver orchestrator → CLI) is
+unaffected; CLI rendering of the attempts table lands as part of step 9.
+
+### Punted (Within This Amendment)
+
+- **Per-attempt tenacity retry for transient 5xx.** Step 1's `acquire()`
+  treats 5xx the same as 4xx — record-and-fall-through. The fall-through
+  loop itself is the safety net and is sufficient for the failure modes
+  we have in hand. A small `tenacity` wrapper around `_try_fetch` for 5xx
+  is straightforward to add later if real batch traffic shows flapping
+  publishers (e.g. Wiley intermittent 503s) where waiting 1–2 seconds and
+  retrying the *same* route would have succeeded.
+- **Per-probe HEAD/Range-GET preflight.** Would shift verification from
+  acquire-time to resolve-time and pre-verify *all* candidates, not just the
+  chosen one. Architecturally cleaner — `chosen` would carry a 'verified'
+  guarantee — but doubles publisher-side request volume on every resolve, and
+  the in-acquire fall-through already covers the operator-facing pain.
+  Revisit if probe over-eagerness causes systemic resolver inaccuracy in
+  batch runs.
+- **Memoizing per-Availability fetch failures.** 'We tried this URL 7 days
+  ago and got 404, skip it' is the same Postgres-shaped concern as
+  failed-acquisition memoization, already deferred to step 5 of the overall
+  pipeline.
+- **Semantic validity of fetched payloads** ('is this JATS a real fulltext
+  or just an abstract stub?'). Lives in extraction, not acquisition.
+
 ## Deferred (Explicit Punts)
 
 Listed so future-us doesn't mistake them for missing requirements:

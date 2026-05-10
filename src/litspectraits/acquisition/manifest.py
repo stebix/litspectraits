@@ -6,6 +6,7 @@ are typically institutional-access artifacts and the manifest is the only
 durable record of how they were obtained.
 """
 
+import base64
 from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
@@ -16,6 +17,7 @@ import cattrs
 from attrs import frozen
 from cattrs.preconf.json import make_converter
 
+from litspectraits.acquisition.attempt import AcquisitionAttempt
 from litspectraits.resolver.types import Availability, ResolveResult
 
 
@@ -92,6 +94,7 @@ class AcquisitionRecord:
     byte_size: int
     origin: Origin
     manual_provenance: ManualProvenance | None
+    attempts: tuple[AcquisitionAttempt, ...] = ()
 
 
 def _build_converter() -> cattrs.Converter:
@@ -100,6 +103,8 @@ def _build_converter() -> cattrs.Converter:
     conv.register_unstructure_hook(Path, str)
     conv.register_structure_hook(datetime, lambda v, _: datetime.fromisoformat(v))
     conv.register_unstructure_hook(datetime, lambda d: d.isoformat())
+    conv.register_structure_hook(bytes, lambda v, _: base64.b64decode(v) if v else b'')
+    conv.register_unstructure_hook(bytes, lambda b: base64.b64encode(b).decode('ascii'))
     return conv
 
 

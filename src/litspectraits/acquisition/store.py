@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+from litspectraits.acquisition.attempt import AcquisitionAttempt
 from litspectraits.acquisition.manifest import (
     AcquisitionRecord,
     deserialize,
@@ -51,6 +52,22 @@ class IntegrityError(RuntimeError):
 
 class MalformedArtifactError(RuntimeError):
     """Raised when a sideloaded artifact fails magic-byte validation."""
+
+
+class AcquisitionExhaustedError(RuntimeError):
+    """Raised when every permitted candidate failed to fetch.
+
+    Carries the full :class:`~litspectraits.acquisition.attempt.AcquisitionAttempt`
+    log so the CLI can render a 'we tried N routes, here's what each said'
+    panel without re-resolving.
+    """
+
+    def __init__(self, doi: str, attempts: tuple[AcquisitionAttempt, ...]) -> None:
+        super().__init__(
+            f'no permitted candidate for {doi} succeeded after {len(attempts)} attempt(s)'
+        )
+        self.doi = doi
+        self.attempts = attempts
 
 
 class ArtifactStore:

@@ -102,7 +102,14 @@ class PMCProbe:
 
 
 def _parse_oa_license(body: str) -> str | None:
-    """Parse the PMC OA service XML and return the license string, if any."""
+    """Parse the PMC OA service XML and return the license string, if any.
+
+    The OA endpoint returns a 200 envelope even for non-OA articles; only
+    OA records carry one or more ``<link>`` children pointing at tarball /
+    PDF / package locations. Treat the absence of ``<link>`` as the
+    canonical 'not in OA subset' signal — the ``license`` attribute alone
+    is not sufficient.
+    """
     try:
         root = ET.fromstring(body)
     except ET.ParseError:
@@ -111,5 +118,7 @@ def _parse_oa_license(body: str) -> str | None:
         return None
     record = root.find('.//record')
     if record is None:
+        return None
+    if record.find('link') is None:
         return None
     return record.attrib.get('license') or ''
