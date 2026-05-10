@@ -951,12 +951,12 @@ should land as one (or a tight few) commits ending green on
       read, `find_by_doi` returns latest by sha256, `format` column
       populated in `by_doi.jsonl`.
 
-### Step 4 — Sniff (§17.4)
+### Step 4 — Sniff (§17.4, done)
 
-- [ ] Create `src/litspectraits/sniff.py`: PDF (`%PDF-`), JATS XML
+- [x] Create `src/litspectraits/sniff.py`: PDF (`%PDF-`), JATS XML
       (`<?xml` + JATS root marker), Elsevier XML
       (`<full-text-retrieval-response>` root). 4 KiB read window.
-- [ ] `tests/test_sniff.py`: positive + negative fixtures per format,
+- [x] `tests/test_sniff.py`: positive + negative fixtures per format,
       including paywall-HTML-as-PDF and HTML-with-XML-prelude.
 
 ### Step 5 — Metadata + dispatch (§17.5, §6)
