@@ -115,7 +115,7 @@ under the entry rather than rewriting history.
 
 ---
 
-## Step 5 — Metadata + dispatch (committed TBD, 2026-05-10)
+## Step 5 — Metadata + dispatch (committed 5c13338, 2026-05-10)
 
 ### M5-1 — CrossRef non-404 errors propagate as raw `httpx.HTTPError`
 
