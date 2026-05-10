@@ -11,14 +11,22 @@ their primary source.
 
 ## Status
 
-Step 1 — **DOI → best-available source resolver + content-addressed
-acquisition store** — has landed. The resolver picks across JATS XML
-(PMC OA / Europe PMC / bioRxiv), arXiv LaTeX source, OA PDFs (Unpaywall),
-and publisher TDM endpoints under a configurable `RankingPolicy`, with
-manual operator-sideloads as a first-class path for paywalled artifacts.
+The ingestion stage is being rebuilt under the **v3 design**
+(`docs/overview-v3.md`). The v1 resolver / acquisition / ranking-policy stack
+has been deleted; the surviving CLI commands are `ingest`, `doctor`, and
+`show`. `extract` and `sideload` from the §10 surface land alongside their
+backends and are intentionally absent until then — Typer reports
+"unknown command" rather than shipping NotImplementedError stubs.
 
-Extraction, reference resolution, the Postgres index, and the agent triad
-remain on the roadmap — see `docs/overview.md`.
+v3 covers exactly three publishers:
+
+- **Wiley** via the `wiley-tdm` SDK → PDF
+- **Springer Nature** via `springernature-api-client` → JATS XML
+- **Elsevier** via raw httpx + lxml (`view=FULL`) → Elsevier-flavored XML
+
+Anything else fails with `UnsupportedPublisherError`. Extraction, the
+Postgres index, and the agent triad remain on the roadmap — see
+`docs/overview.md`.
 
 ## Install
 
@@ -26,24 +34,51 @@ remain on the roadmap — see `docs/overview.md`.
 uv sync
 ```
 
-This installs runtime + dev dependencies into `.venv` (Python 3.14).
+This installs runtime + dev dependencies into `.venv` (Python 3.14). Two
+optional extras pull in the publisher SDKs:
+
+```sh
+uv sync --extra wiley --extra springer
+# or, once extraction lands:
+uv sync --extra all
+```
+
+Elsevier has no extra — the v3 retriever talks to ScienceDirect with raw
+`httpx` + `lxml` (the reference SDK `elsapy` was archived 2025-01-13).
 
 ## Configuration
 
-`.env` (or process environment) is read once at CLI entry. The contact
-email is mandatory — it goes into the polite-pool `User-Agent` for
-CrossRef and Unpaywall, and is recorded as the operator on manual
-sideloads.
+The CLI calls `dotenv.load_dotenv()` once at startup (in `cli.py`'s root
+callback). With no path argument, `python-dotenv` walks up from the
+caller's directory (`src/litspectraits/`) toward the filesystem root and
+loads the first `.env` it finds. **The expected location is the project
+root**: `<repo>/.env`. Variables already present in the process
+environment are never overridden.
 
-| Variable                           | Purpose                                            | Default                            |
-| ---------------------------------- | -------------------------------------------------- | ---------------------------------- |
-| `LITSPECTRAITS_CONTACT_EMAIL`      | Polite-pool mailto + sideload operator             | **required**                       |
-| `LITSPECTRAITS_DATA_DIR`           | Root for `artifacts/`, `manifests/`, `index/`      | `~/.local/share/litspectraits`     |
-| `LITSPECTRAITS_CROSSREF_TDM_TOKEN` | Crossref Click-Through token (optional)            | unset → TDM hits stay auth-blocked |
-| `LITSPECTRAITS_HTTP_TIMEOUT_S`     | Per-request timeout in seconds                     | `30`                               |
-| `LITSPECTRAITS_LOG_FORMAT`         | `rich` (human) or `json` (aggregation)             | `rich`                             |
+Add `.env` to your `.gitignore` (or use `.env.local`) before putting
+publisher tokens in it — credentials must not be committed.
 
-A minimal `.env` to get going:
+Only `LITSPECTRAITS_CONTACT_EMAIL` fails at startup. Publisher
+credentials are checked lazily by the corresponding retriever and raise
+`MissingCredentialError` only when actually needed.
+
+| Variable                                | Purpose                                                                  | Default                            |
+| --------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
+| `LITSPECTRAITS_CONTACT_EMAIL`           | Polite-pool mailto for CrossRef + sideload operator                      | **required**                       |
+| `LITSPECTRAITS_DATA_DIR`                | Root for `artifacts/`, `manifests/`, `index/`, `tmp/`                    | `~/.local/share/litspectraits`     |
+| `LITSPECTRAITS_HTTP_TIMEOUT_S`          | Per-request timeout for first-party HTTP (CrossRef, Elsevier, doctor)    | `30`                               |
+| `LITSPECTRAITS_LOG_FORMAT`              | `rich` (human) or `json` (aggregation)                                   | `rich`                             |
+| `LITSPECTRAITS_RATE_LIMIT_WILEY`        | Wiley retriever ceiling (req/s)                                          | `3`                                |
+| `LITSPECTRAITS_RATE_LIMIT_SPRINGER`     | Springer Nature retriever ceiling (req/s)                                | `5`                                |
+| `LITSPECTRAITS_RATE_LIMIT_ELSEVIER`     | Elsevier retriever ceiling (req/s)                                       | `6`                                |
+| `LITSPECTRAITS_EXPECTED_EGRESS_CIDRS`   | Comma-separated allow-list checked by `doctor`                           | empty (warn-only)                  |
+| `WILEY_TDM_TOKEN`                       | Wiley TDM token, forwarded into `wiley-tdm` as `TDM_API_TOKEN`           | unset → IP-based auth              |
+| `SPRINGER_API_KEY`                      | Springer Nature TDM API key (no IP fallback)                             | unset → retriever raises           |
+| `ELSEVIER_API_KEY`                      | ScienceDirect API key, sent as `X-ELS-APIKey`                            | unset → retriever raises           |
+| `ELSEVIER_INSTTOKEN`                    | Elsevier institutional token, sent as `X-ELS-Insttoken`                  | unset → OA-tier titles only        |
+
+A minimal `.env` to get going (CrossRef-only — every actual ingest will
+fail at the retriever step until publisher credentials are added):
 
 ```dotenv
 LITSPECTRAITS_CONTACT_EMAIL=you@example.com
@@ -51,115 +86,103 @@ LITSPECTRAITS_CONTACT_EMAIL=you@example.com
 
 ## CLI
 
-### `resolve` — DOI → ranked acquisition candidates
+### `ingest` — fetch, validate, and commit a single DOI
 
-Probes every supported source in parallel and prints what it found,
-ranked under the active policy. Does not download anything.
-
-```sh
-uv run litspectraits resolve 10.1101/2023.05.01.539123
-```
-
-Pipe-friendly JSON for programmatic use:
+Resolves CrossRef metadata, dispatches on DOI prefix, calls the
+publisher-specific TDM retriever, validates the response by magic bytes,
+and atomically commits the artifact + manifest. Fails loudly with a
+typed `IngestError` and a deterministic exit code (see
+`docs/overview-v3.md` §14) if any step rejects.
 
 ```sh
-uv run litspectraits resolve 10.1101/2023.05.01.539123 --json | jq .chosen
+uv run litspectraits ingest 10.1002/mrm.xxxxx
 ```
 
-Switch policies to invert the format-vs-version trade-off:
+By default `ingest` **refetches** even when a manifest already exists.
+Pass `--cache-hit-ok` for the opt-in short-circuit:
 
 ```sh
-uv run litspectraits resolve <doi> --policy fidelity_first
+uv run litspectraits ingest 10.1002/mrm.xxxxx --cache-hit-ok
 ```
 
-### `ingest` — resolve, then fetch the chosen artifact
-
-Streams the artifact, hashes it on the fly, and stores it
-content-addressed under `LITSPECTRAITS_DATA_DIR`. Idempotent: a second
-call with the same DOI returns the cached record instead of
-re-downloading.
+JSON output for programmatic consumers (stdout stays clean — diagnostics
+and error panels go to stderr):
 
 ```sh
-uv run litspectraits ingest 10.1101/2023.05.01.539123
+uv run litspectraits ingest 10.1002/mrm.xxxxx --json | jq .sha256
 ```
 
-The on-disk layout per artifact:
+### `doctor` — preflight credentials + egress
+
+Run before any batch ingest. Verifies the contact email is set, probes
+each configured publisher credential with a minimal authenticated
+request, and reports the egress IP against
+`LITSPECTRAITS_EXPECTED_EGRESS_CIDRS` if set.
+
+```sh
+uv run litspectraits doctor
+```
+
+### `show` — look up an existing record
+
+Reads the local DOI index and prints the manifest for a DOI that has
+already been ingested. Does not touch the network.
+
+```sh
+uv run litspectraits show 10.1002/mrm.xxxxx
+uv run litspectraits show 10.1002/mrm.xxxxx --json
+```
+
+### Storage layout
 
 ```
-<data_dir>/artifacts/pdf/sha256/9a/3f/9a3f….pdf
-<data_dir>/manifests/sha256/9a/3f/9a3f….manifest.json
+<data_dir>/artifacts/pdf/sha256/9a/9a3f….pdf
+<data_dir>/artifacts/jats/sha256/9a/9a3f….xml
+<data_dir>/artifacts/elsevier/sha256/9a/9a3f….xml
+<data_dir>/manifests/sha256/9a/9a3f….manifest.json
 <data_dir>/index/by_doi.jsonl
 ```
 
-### `sideload` — register a manually-retrieved artifact
-
-For papers reachable only through institutional access (publisher PDF via
-library proxy, etc.), drop a file you fetched out-of-band into the same
-content-addressed store. Future `resolve` calls will find it via the
-local probe and rank it normally — a manual `(published, pdf)`
-automatically beats an Unpaywall `(preprint, pdf)` under the default
-policy.
-
-```sh
-uv run litspectraits sideload 10.1002/mrm.xxxxx ~/Downloads/paper.pdf \
-    --version published \
-    --format pdf \
-    --license 'wiley-tdm-internal-use-only' \
-    --source-url 'https://onlinelibrary.wiley.com/doi/pdf/10.1002/mrm.xxxxx' \
-    --note 'via uni-wuerzburg library proxy'
-```
-
-The operator email and the timestamp are pulled from the environment and
-recorded in the manifest's `manual_provenance` field — that is the
-durable legal trail for the artifact.
+One-level sharding (first two hex chars of the sha256). The DOI index
+carries a `format` column so a single scan answers "what do we have for
+this DOI?".
 
 ## Library usage
 
-The CLI is a thin shell over the library entry points:
+The CLI is a thin shell over `litspectraits.ingest.ingest`:
 
 ```python
 import asyncio
-from litspectraits.acquisition.store import ArtifactStore
+
 from litspectraits.config import Settings
-from litspectraits.resolver.policy import PUBLISHED_FIRST
-from litspectraits.resolver.resolver import resolve
+from litspectraits.http import http_client
+from litspectraits.ingest import ingest
+from litspectraits.store import ArtifactStore
+
 
 async def main() -> None:
     settings = Settings.from_env()
     store = ArtifactStore(settings.data_dir)
-    result = await resolve(
-        '10.1101/2023.05.01.539123',
-        settings=settings,
-        store=store,
-        policy=PUBLISHED_FIRST,
-    )
-    print(result.chosen)
-    for outcome in result.probes:
-        print(outcome.probe, len(outcome.availabilities), outcome.error)
+    async with http_client(settings) as client:
+        record = await ingest(
+            '10.1002/mrm.xxxxx',
+            settings=settings,
+            store=store,
+            client=client,
+            cache_hit_ok=False,
+        )
+        print(record.sha256, record.format, record.artifact_path)
+
 
 asyncio.run(main())
 ```
 
-`ResolveResult` carries the full audit trail (every probe outcome, every
-candidate, exclusion reasons) — useful for batch-pipelining and
-debugging.
-
-## Ranking policy
-
-Sources are tagged on three independent axes — `Version`
-(published / accepted_manuscript / preprint), `Format` (jats / latex /
-pdf), and `Access` (open / tdm_token / subscription) — and ranked
-lexicographically by a `RankingPolicy`. Two presets ship:
-
-- **`published_first`** (default): version-of-record beats preprint
-  regardless of format. A published PDF outranks a preprint LaTeX.
-- **`fidelity_first`**: format wins over version. A preprint JATS
-  outranks a published PDF.
-
-When a high-ranked source exists but the environment lacks credentials
-to fetch it (e.g. a Wiley TDM JATS detected without a token configured),
-the entry stays in `candidates` for the audit trail but is never
-selected — the resolver falls through to the next fetchable tier.
+Every failure is a typed `IngestError` subclass from
+`litspectraits.errors` — `DOINotFoundError`, `UnsupportedPublisherError`,
+`MissingCredentialError`, `AuthRejectedError`, `EntitlementDowngradeError`,
+`RateLimitExhaustedError`, `PublisherAPIError`, `MalformedArtifactError`,
+`IntegrityError`. Subclass identity is the contract; the CLI maps it to
+exit codes.
 
 ## Development
 
@@ -167,15 +190,15 @@ selected — the resolver falls through to the next fetchable tier.
 uv run ruff check src/ tests/        # lint
 uv run ruff format src/ tests/       # format
 uv run pyright src/ tests/           # type check
-uv run pytest                        # 38 tests, fully offline (respx-mocked)
+uv run pytest                        # offline (respx-mocked + SDK monkeypatched)
 ```
 
 ## Documentation
 
-- `docs/overview.md` — full pipeline design (resolver → acquisition →
-  extraction → measurements → agent triad).
-- `docs/ingestion-pipeline.md` — detailed design for step 1 (this
-  package).
+- `docs/overview.md` — full pipeline design (ingestion → extraction →
+  measurements → agent triad). Unchanged across design revisions.
+- `docs/overview-v3.md` — **authoritative** design for the ingestion
+  stage. Section 17 is the intended order of work.
 - `docs/project-infra-overview.md` — code-style and infra conventions.
 
 ## Downstream

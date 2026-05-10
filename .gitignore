@@ -9,6 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
+# Local environment / secrets (publisher tokens live here)
+.env
+.env.local
+.env.*.local
+
 # Stray logs from third-party SDKs (e.g. springernature-api-client writes
 # api_client.log to cwd on import).
 api_client.log
