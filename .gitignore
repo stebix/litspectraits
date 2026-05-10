@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Stray logs from third-party SDKs (e.g. springernature-api-client writes
+# api_client.log to cwd on import).
+api_client.log
