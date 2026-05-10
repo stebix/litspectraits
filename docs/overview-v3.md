@@ -236,6 +236,24 @@ class AcquisitionRecord:
     manual_provenance: ManualProvenance | None
 ```
 
+### Invariants (producer-side contracts)
+
+- **All `datetime` fields are tz-aware UTC.** Producers (`ingest.py`,
+  `sideload.py`) construct via `datetime.now(tz=UTC)`. The cattrs
+  converter does **not** enforce this — `fromisoformat` will silently
+  round-trip a naive value back to a naive value. A dedicated check is a
+  future hardening item; for now the contract lives in code review and
+  the call-site of every datetime constructor.
+- **Field-name shadowing of builtins.** `CrossRefMetadata.type` and
+  `RetrievePayload.format` / `AcquisitionRecord.format` mirror the
+  upstream schemas (CrossRef payload key; format dimension across §3
+  and §11). Ruff's `A` (flake8-builtins) group is intentionally not
+  enabled; if it ever is, prefer `# noqa: A003` over renaming.
+- **`origin` is an inline `Literal['auto', 'manual']`** on
+  `AcquisitionRecord`. Promote to a named alias if more than one or two
+  call-sites force a `# type: ignore[arg-type]` against pyright's
+  literal narrowing.
+
 ### What's gone vs v2
 
 `AcquisitionAttempt`, `RetrieveAttempt`, `attempts: tuple[...]`,
@@ -337,15 +355,18 @@ generic / Unpaywall path.
 
 ## 7. Retrievers
 
-Three SDK shims, each ~60 LOC, all sync-bridged via `asyncio.to_thread`.
-Each one:
+Three retrievers, each ~60 LOC. Wiley and Springer are sync SDK shims
+bridged via `asyncio.to_thread`; Elsevier talks to the HTTP endpoint
+directly with our `httpx.AsyncClient` (the Elsevier reference SDK is
+archived — see §7.3). Each retriever:
 
 1. Acquires the per-publisher rate-limit token.
 2. Checks credential presence; raises `MissingCredentialError` early if
    missing **and** Würzburg IP-fallback is unavailable for that publisher
    (Wiley supports IP-only auth; Springer and Elsevier require the key).
-3. Calls the SDK in a worker thread.
-4. Translates SDK exceptions to our `IngestError` subclasses.
+3. Calls the SDK in a worker thread (Wiley, Springer) or `await`s the
+   `httpx` call (Elsevier).
+4. Translates SDK / HTTP exceptions to our `IngestError` subclasses.
 5. Returns `RetrievePayload` on success.
 
 ```python
@@ -391,53 +412,81 @@ see bytes). One extra read of the file — negligible for typical PDFs.
 
 ### 7.2 Springer Nature (`retrievers/springer.py`)
 
-- **SDK:** `springernature-api-client`,
-  import `springernature_api_client.tdm.TDMAPI`.
-- **Endpoint:** `https://api.springernature.com/{api}/...` (lib-managed).
+- **SDK:** `springernature-api-client` (PyPI, actively maintained;
+  upstream `springernature/springernature_api_client`).
+  Import `from springernature_api_client import tdm`.
+- **Endpoint:** `https://api.springernature.com/...` (lib-managed).
 - **Auth:** `api_key` query parameter — `SPRINGER_API_KEY` env. **No
   IP-only fallback** — the key is required.
 - **Format:** JATS XML.
 - **Rate limit:** per-minute quota (premium tier higher); default 5 req/s
   conservative.
-- **SDK call:** TDM endpoint per-DOI retrieval (exact method TBD against the
-  installed lib; the call shape is `TDMAPI(api_key=...).fetch_by_doi(doi)`
-  or similar).
+- **SDK call:** the TDM SDK is **query-based**, not DOI-keyed. There is no
+  `fetch_by_doi` method. Per-DOI retrieval is a one-record search:
+  ```python
+  client = tdm.TDMAPI(api_key=settings.springer_api_key)
+  response = client.search(q=f'doi:{doi}', p=1, s=1,
+                           fetch_all=False, is_premium=True)
+  ```
+  `is_premium=True` is **mandatory** — the non-premium endpoint returns
+  metadata only; only the premium tier returns the JATS XML payload. Assert
+  exactly one record came back; zero or multiple hits → `PublisherAPIError`
+  (zero = DOI not in the Springer Nature corpus despite a Springer prefix;
+  >1 = defensive — should not happen for a `doi:` query).
+- **Bytes handling:** route the payload through our `tmp_dir` rather than
+  the SDK's default path. The SDK's `save_xml(response, path)` accepts a
+  caller-supplied destination — pass `tmp_dir / 'fetch-<rand>.part'`. Hash
+  + sniff happen post-write, same pattern as the Wiley shim.
 - **Magic-byte sniff:** read first 4 KiB; require `<?xml` declaration plus
   `<article` (or JATS namespace marker) within that prefix. HTML wrappers
   fail this and raise `MalformedArtifactError`.
 - **Failure translation:** SDK exceptions for missing key / 401 →
-  `MissingCredentialError` / `AuthRejectedError`; 5xx or malformed →
+  `MissingCredentialError` / `AuthRejectedError`; 403 (e.g. premium tier
+  not on this key) → `AuthRejectedError`; 5xx or malformed →
   `PublisherAPIError`.
 
 ### 7.3 Elsevier (`retrievers/elsevier.py`)
 
-- **SDK:** `elsapy`, import `elsapy.elsclient.ElsClient` and
-  `elsapy.elsdoc.FullDoc`.
-- **Endpoint:** `https://api.elsevier.com/content/article/doi/{doi}` (lib-managed).
-- **Auth:** `X-ELS-APIKey` header — `ELSEVIER_API_KEY` env.
-  **`X-ELS-Insttoken`** header — `ELSEVIER_INSTTOKEN` env, optional, needed
-  for institutional access beyond the OA tier. **IP-scoped entitlement**
-  applies on top of the key: from a non-Würzburg IP, the response silently
-  downgrades to `META_ABS`.
-- **Format:** Elsevier XML (`view=FULL`).
+- **SDK:** none — direct `httpx`. Elsevier's reference client `elsapy` was
+  archived 2025-01-13 (last release v0.5.0, 2019-08-15) and was a thin
+  sync `requests` wrapper around a single endpoint. We talk to the API
+  directly with our existing `httpx.AsyncClient` — saves a stale dep, fits
+  the async stack, no `to_thread` hop, and the entitlement check (below)
+  is the same `lxml` parse either way.
+- **Endpoint:** `GET https://api.elsevier.com/content/article/doi/{doi}`
+  with `view=FULL` query param.
+- **Headers:**
+  - `X-ELS-APIKey: {ELSEVIER_API_KEY}` — required.
+  - `X-ELS-Insttoken: {ELSEVIER_INSTTOKEN}` — optional, needed for
+    institutional access beyond the OA tier.
+  - `Accept: text/xml` — request the XML envelope; the API also serves
+    JSON and we want consistent parsing under `extract/elsevier.py`.
+- **IP-scoped entitlement** applies on top of the key: from a
+  non-Würzburg IP, the response silently downgrades to `META_ABS`.
+- **Format:** Elsevier XML (`<full-text-retrieval-response>`).
 - **Rate limit:** per-key, varies by product; default 6 req/s conservative.
-- **SDK call:**
+- **Call shape:**
   ```python
-  client = ElsClient(api_key=settings.elsevier_api_key,
-                     inst_token=settings.elsevier_insttoken or None)
-  doc = FullDoc(doi=doi)
-  doc.read(client, view='FULL')   # always view=FULL
+  url = f'https://api.elsevier.com/content/article/doi/{doi}'
+  headers = {'X-ELS-APIKey': settings.elsevier_api_key,
+             'Accept': 'text/xml'}
+  if settings.elsevier_insttoken:
+      headers['X-ELS-Insttoken'] = settings.elsevier_insttoken
+  resp = await client.get(url, params={'view': 'FULL'}, headers=headers)
+  resp.raise_for_status()
+  body = resp.content      # bytes — written to tmp_dir, then sniffed
   ```
-- **Entitlement check:** after `doc.read()`, inspect the response's root
-  element. The full-text response root is `<full-text-retrieval-response>`
-  with content under `<originalText>` (or equivalent). The abstract-only
-  fallback returns the same envelope but without the full-text payload —
-  detectable by absence of the originalText/body subtree. If full-text is
-  absent, raise `EntitlementDowngradeError`. **This check happens in the
-  retriever**, not in `ingest.py` — it's a publisher-specific concern.
-- **Failure translation:** 401 or missing key → `MissingCredentialError`;
-  403 → `AuthRejectedError`; META_ABS fallback → `EntitlementDowngradeError`;
-  5xx → `PublisherAPIError`.
+- **Entitlement check:** parse the body root with `lxml`. The full-text
+  envelope is `<full-text-retrieval-response>` containing an
+  `<originalText>` / `<xocs:doc>` subtree. The abstract-only fallback
+  returns the same envelope without that subtree (only `<coredata>`
+  metadata + `<dc:description>`). Absence of full-text →
+  `EntitlementDowngradeError`. **This check happens in the retriever**,
+  not in `ingest.py` — it's a publisher-specific concern.
+- **Failure translation:** 401 with key sent → `AuthRejectedError`; 401
+  with no key → `MissingCredentialError`; 403 → `AuthRejectedError`;
+  META_ABS envelope → `EntitlementDowngradeError`; 5xx →
+  `PublisherAPIError`.
 
 ### 7.4 Dispatch (`retrievers/dispatch.py`)
 
@@ -516,16 +565,24 @@ and would need its own design.
 ## 10. CLI
 
 ```
-litspectraits ingest   <doi> [--force]
+litspectraits ingest   <doi> [--cache-hit-ok]
 litspectraits extract  <doi-or-sha> [--reextract]
 litspectraits sideload <doi> <pdf-path> --license <str> [--source-url <url>] [--note <str>]
 litspectraits doctor
 litspectraits show     <doi>
 ```
 
-`ingest` runs the happy path. Cache-hit short-circuit is the only branch.
-On any `IngestError` subclass, render a Rich error panel with class, DOI,
-context, and operator hint; exit non-zero with class-specific exit codes.
+`ingest` runs the happy path. **Default is refetch** — every `ingest <doi>`
+invocation goes through the publisher retriever even when a manifest
+already exists for the DOI. `--cache-hit-ok` opts into the short-circuit:
+if a manifest exists for the DOI, return it without touching the network.
+Refetch-by-default keeps the loud-failure model symmetric ("I asked for an
+ingest, I expect fresh bytes or a loud error") and avoids silent skips
+that look indistinguishable from successful fetches in batch logs;
+`--cache-hit-ok` is the opt-in optimization. Cache-hit short-circuit is
+the only branch in either mode. On any `IngestError` subclass, render a
+Rich error panel with class, DOI, context, and operator hint; exit
+non-zero with class-specific exit codes.
 
 `extract` dispatches by the manifest's `format` field (§11).
 
@@ -632,9 +689,11 @@ Doctor never writes to the artifact store. It is a pure read-only diagnostic.
 | `LITSPECTRAITS_EXPECTED_EGRESS_CIDRS` | comma-separated CIDRs for `doctor` IP check | empty → doctor warns but doesn't fail |
 
 The publisher tokens use the bare names that match each SDK's documented
-env vars (`TDM_API_TOKEN` for Wiley is internal to the lib;
-`SPRINGER_API_KEY` and `ELSEVIER_API_KEY` are the conventions used in
-`elsapy` and `springernature-api-client` examples). Less translation
+env vars where applicable: `TDM_API_TOKEN` for Wiley is internal to the
+lib (forwarded from `WILEY_TDM_TOKEN` via a scoped env context, §7.1);
+`SPRINGER_API_KEY` matches the SDK's example. `ELSEVIER_API_KEY` and
+`ELSEVIER_INSTTOKEN` follow the `X-ELS-*` header naming used in
+Elsevier's API docs — there is no SDK to match (§7.3). Less translation
 surface, fewer foot-guns.
 
 ## 14. Failure semantics
@@ -670,18 +729,25 @@ Runtime base:
   `platformdirs`, `python-dotenv`
 - `tenacity` — restored from v2's drop list; needed for 429 retry inside
   retrievers (no fall-through to fall back on)
-- `lxml` — JATS and Elsevier XML parsing in `extract/`
+- `lxml` — JATS + Elsevier XML parsing in `extract/`, plus the Elsevier
+  retriever's entitlement check (§7.3)
 
 Optional extras:
 - `[wiley]` → `wiley-tdm`
 - `[springer]` → `springernature-api-client`
-- `[elsevier]` → `elsapy`
 - `[extract]` → `docling` (PyTorch + image models)
 - `[all]` → everything
 
-Each retriever imports its SDK lazily inside `fetch()`. Without the extra,
-the retriever raises a clean `MissingCredentialError` (with a hint to
-install the extra) rather than `ImportError` at startup.
+There is no `[elsevier]` extra: the Elsevier retriever uses our base
+`httpx` client directly because the upstream `elsapy` SDK is archived
+(§7.3). Without the publisher's API key the retriever still raises
+`MissingCredentialError` — the gating is on the credential, not on a
+missing extra.
+
+The Wiley and Springer retrievers import their SDK lazily inside
+`fetch()`. Without the extra installed, those retrievers raise a clean
+`MissingCredentialError` (with a hint to install the extra) rather than
+`ImportError` at startup.
 
 Dev:
 - `pyright`, `pytest`, `pytest-asyncio`, `respx`, `ruff` — unchanged
@@ -710,9 +776,10 @@ Each step ends green on `pytest`, `ruff check`, `pyright`. Ten commits.
 1. **Wipe and bootstrap.** Delete current `acquisition/` + `resolver/`. Keep
    `_logging.py`, `config.py`, `doi.py`, `http.py`. Add publisher creds +
    rate-limit vars to `config.py`. Add `errors.py` with the taxonomy stubs.
-   Update `pyproject.toml` deps: drop `tenacity` from base (re-add for
-   429 retry), add `lxml`, add `wiley-tdm`/`springernature-api-client`/
-   `elsapy` under appropriate extras.
+   Update `pyproject.toml` deps: keep `tenacity` (needed for 429 retry),
+   add `lxml`, add `wiley-tdm` under `[wiley]` and
+   `springernature-api-client` under `[springer]`. **No `[elsevier]`
+   extra** — Elsevier uses raw `httpx` (§7.3).
 2. **Data model.** `manifest.py` with `Format`, `Publisher`,
    `CrossRefMetadata`, `RetrievePayload`, `AcquisitionRecord`,
    `ManualProvenance`, cattrs hooks. Round-trip tests.
@@ -742,6 +809,11 @@ Each step ends green on `pytest`, `ruff check`, `pyright`. Ten commits.
 Optional 11: batch ingest CLI flag (`--batch <doi-list.txt>`) plus the
 concurrency story when there's data to test against. The rate-limit bucket
 makes this safe.
+
+Optional 12: per-publisher end-to-end smoke tests (§22). Gated on
+publisher credentials; ephemeral tempdir-backed; assert structural
+invariants, not byte equality. Lands once Step 7 (the ingest orchestrator)
+is in place.
 
 ## 18. What this drops
 
@@ -783,18 +855,295 @@ To keep across sessions:
   entitled — that's the `EntitlementDowngradeError` case. `litspectraits
   doctor` is the preflight.
 
-## 20. Open questions (small)
+## 20. Resolved questions
 
-1. **CrossRef metadata still worth fetching?** ~200 ms extra per ingest, but
-   gives DOI-404-fast-fail, publisher cross-check, and richer manifest.
-   **Recommendation: keep it.**
-2. **Default cache-hit behavior on `ingest <doi>`** — short-circuit if any
-   record exists for that DOI (recommendation), or always re-fetch unless
-   `--cache-hit-ok`?
-3. **Where does the Elsevier entitlement check live exactly?** Inside the
-   `elsapy` response object inspection in `retrievers/elsevier.py`. Need to
-   confirm against the lib's actual response shape — there may be an
-   `ElsDoc.entitled` attribute or similar that simplifies the check.
-4. **Springer SDK call shape** for per-DOI retrieval — exact method on
-   `springernature_api_client.tdm.TDMAPI` should be confirmed against the
-   installed lib version before §6 of the order of work.
+All §20 entries from earlier drafts are now decided. Kept here as a short
+audit trail; new questions should be raised inline against the relevant
+section, not as a new §20 list.
+
+1. *(Resolved 2026-05-10.)* **CrossRef metadata fetch stays in the happy
+   path.** ~200 ms extra per ingest is acceptable in exchange for
+   DOI-404-fast-fail, publisher cross-check, and richer manifest (§6).
+2. *(Resolved 2026-05-10.)* **`ingest <doi>` refetches by default.**
+   `--cache-hit-ok` is the opt-in to short-circuit on an existing
+   manifest. Rationale and semantics in §10. Refetch-by-default fits the
+   loud-failure model — silent cache-hits in batch logs would look
+   indistinguishable from successful fetches.
+3. *(Resolved 2026-05-10.)* **Elsevier entitlement check** lives in the
+   retriever as a direct `lxml` parse of the
+   `<full-text-retrieval-response>` envelope — no SDK dependency now that
+   we've dropped `elsapy` (§7.3).
+4. *(Resolved 2026-05-10.)* **Springer SDK call shape** — query-based,
+   not DOI-keyed; per-DOI retrieval uses
+   `TDMAPI.search(q=f'doi:{doi}', p=1, s=1, is_premium=True)` (§7.2).
+
+## 21. Implementation checklist
+
+Granular checklist that mirrors §17 with file-level resolution. Each step
+should land as one (or a tight few) commits ending green on
+`uv run pytest`, `uv run ruff check`, and `uv run pyright`. Items marked
+`[x]` are done as of 2026-05-10.
+
+### Phase 0 — Pre-flight (done)
+
+- [x] Delete `src/litspectraits/acquisition/` (v2 fall-through machinery).
+- [x] Delete `src/litspectraits/resolver/` (v2 probe set + RankingPolicy).
+- [x] Delete `tests/acquisition/` and `tests/resolver/`.
+- [x] Delete superseded docs (`ingestion-pipeline.md`, `overview-v2.md`,
+      `publisher-routes.md`).
+- [x] Update `CLAUDE.md` for the v3 design.
+- [x] Save `project_elsapy_archived.md` to memory.
+
+### Step 1 — Bootstrap (§17.1, done)
+
+- [x] Update `pyproject.toml`: add `lxml` to base deps; add extras
+      `[wiley]` (`wiley-tdm`), `[springer]` (`springernature-api-client`),
+      `[extract]` (`docling`), `[all]`. **No `[elsevier]` extra** (§7.3).
+      Pins: `wiley-tdm>=1.0` (only release), `springernature-api-client>=0.0.9`
+      (latest; SDK never reached 1.0), `docling>=2.0`, `lxml>=5.3`.
+- [x] Rewrite `src/litspectraits/config.py`: drop `crossref_tdm_token`;
+      add `wiley_tdm_token`, `springer_api_key`, `elsevier_api_key`,
+      `elsevier_insttoken`, three `rate_limit_*` overrides,
+      `expected_egress_cidrs`. Float-and-CIDR parsing helpers fail loudly
+      on bad input via `MissingConfigError`.
+- [x] Create `src/litspectraits/errors.py` with the full `IngestError`
+      taxonomy from §5 (DOI + context attrs; no logic yet). Base
+      `__init__(message='', *, doi, **context)` synthesizes a
+      `ClassName doi=… key=value` message when none is supplied so
+      `str(exc)` is useful before the §17.9 Rich panel lands.
+- [x] Update `tests/conftest.py` for the new `Settings` shape:
+      `settings` fixture (no creds) + `settings_with_creds` (dummy values
+      for all four publisher tokens).
+- [x] Stub `src/litspectraits/cli.py` to a single empty `app =
+      typer.Typer()` so the package imports cleanly until §17.9 lands.
+- [x] `uv sync && uv run pytest && uv run ruff check && uv run pyright`
+      all green. Each `[wiley]` / `[springer]` / `[extract]` / `[all]`
+      extra dry-resolves successfully against PyPI.
+
+### Step 2 — Data model (§17.2, done)
+
+- [x] Create `src/litspectraits/manifest.py`: `Format`, `Publisher`,
+      `CrossRefMetadata`, `RetrievePayload`, `AcquisitionRecord`,
+      `ManualProvenance`, plus the `cattrs` converter. Only `datetime`
+      hooks are registered; `pathlib.Path` already round-trips natively
+      in `cattrs >= 24`. **No `bytes` hook** — no field uses `bytes`,
+      so the §21 ask was tightened to "only the hooks that records
+      actually exercise" (revisit if a field ever goes binary).
+- [x] `tests/test_manifest.py`: round-trip every record type through
+      `converter.unstructure` / `converter.structure`, including a
+      `json.dumps`/`json.loads` round-trip on the unstructured form so
+      the on-disk shape is asserted JSON-clean (no custom encoder
+      required at the boundary).
+- **Producer-side invariants captured in §4** ("Invariants"): tz-aware
+  UTC datetimes, builtin-shadowing field names (`type`, `format`),
+  and the inline-`Literal` choice for `origin`. Each is mirrored as a
+  `Notes` block in the relevant `manifest.py` docstring so the contract
+  is visible at the call-site as well as in the design doc.
+
+### Step 3 — Store (§17.3)
+
+- [ ] Create `src/litspectraits/store.py`: three format dirs
+      (`pdf/`, `jats/`, `elsevier/`), one-level sharding, atomic
+      `os.replace` from `tmp/`, manifest write, DOI index with `format`
+      column.
+- [ ] Clear `tmp/` on `ArtifactStore.__init__` (per §3).
+- [ ] `tests/test_store.py`: shard path computation, manifest write +
+      read, `find_by_doi` returns latest by sha256, `format` column
+      populated in `by_doi.jsonl`.
+
+### Step 4 — Sniff (§17.4)
+
+- [ ] Create `src/litspectraits/sniff.py`: PDF (`%PDF-`), JATS XML
+      (`<?xml` + JATS root marker), Elsevier XML
+      (`<full-text-retrieval-response>` root). 4 KiB read window.
+- [ ] `tests/test_sniff.py`: positive + negative fixtures per format,
+      including paywall-HTML-as-PDF and HTML-with-XML-prelude.
+
+### Step 5 — Metadata + dispatch (§17.5, §6)
+
+- [ ] Create `src/litspectraits/metadata.py`: `fetch_metadata(doi)`
+      against CrossRef polite pool; `_PUBLISHER_BY_PREFIX` table;
+      `publisher_for_doi(doi)`.
+- [ ] `tests/test_metadata.py` with `respx`: OA paper happy path; 404
+      → `DOINotFoundError`; unknown prefix → `UnsupportedPublisherError`;
+      publisher cross-check warning logged on mismatch.
+
+### Step 6 — Retrievers (§17.6, §7)
+
+- [ ] `src/litspectraits/retrievers/base.py`: `Retriever` Protocol +
+      success-only `RetrievePayload`.
+- [ ] `src/litspectraits/retrievers/_ratelimit.py`: per-publisher token
+      bucket using `asyncio.Lock` + monotonic timestamps.
+- [ ] `src/litspectraits/retrievers/wiley.py`: `wiley-tdm` shim,
+      scoped `_patched_env` forwarding `WILEY_TDM_TOKEN` →
+      `TDM_API_TOKEN`, post-download magic-byte sniff (defense in depth).
+- [ ] `src/litspectraits/retrievers/springer.py`:
+      `TDMAPI.search(q=f'doi:{doi}', p=1, s=1, is_premium=True)` shim,
+      single-record assertion, `save_xml(response, tmp_path)` into our
+      `tmp_dir`.
+- [ ] `src/litspectraits/retrievers/elsevier.py`: **raw `httpx`** to
+      `/content/article/doi/{doi}?view=FULL`, `lxml` entitlement check
+      against `<full-text-retrieval-response>`, distinct exits for
+      `EntitlementDowngradeError` vs `MissingCredentialError` vs
+      `AuthRejectedError`.
+- [ ] `src/litspectraits/retrievers/dispatch.py`: `Publisher → Retriever`
+      table.
+- [ ] Per-retriever tests: `MissingCredentialError`, `AuthRejectedError`,
+      success path (Wiley + Springer SDKs monkeypatched; Elsevier via
+      `respx`).
+- [ ] `tests/retrievers/test_ratelimit.py`: timing assertion that the
+      bucket throttles to its configured rate.
+
+### Step 7 — Ingest orchestrator (§17.7)
+
+- [ ] Create `src/litspectraits/ingest.py`: the five-step happy path
+      from §0; DOI bound via `structlog.contextvars` at the top of
+      `ingest()`.
+- [ ] Cache-hit short-circuit gated on `--cache-hit-ok` (§10); default
+      refetches.
+- [ ] Tests: cache-hit short-circuit fires only when flag set; one
+      success integration per publisher; one representative loud-failure
+      per `IngestError` subclass.
+
+### Step 8 — Sideload (§17.8, §9)
+
+- [ ] Create `src/litspectraits/sideload.py`: PDF-only, magic-byte
+      check, hash + atomic copy, mandatory `ManualProvenance`.
+- [ ] Tests: happy path; idempotency on `(doi, sha256)`; non-PDF input
+      → `MalformedArtifactError`; missing `LITSPECTRAITS_CONTACT_EMAIL`
+      surfaces at startup, not at sideload time.
+
+### Step 9 — CLI + doctor (§17.9, §12)
+
+- [ ] Rewrite `src/litspectraits/cli.py`: `ingest`, `extract`,
+      `sideload`, `doctor`, `show` Typer commands; class-specific exit
+      codes (§14); Rich error panel on every `IngestError` subclass;
+      `--json` outputs for `ingest` and `show`.
+- [ ] Create `src/litspectraits/doctor.py`: egress-IP check via
+      `api.ipify.org`; per-publisher creds smoke test against hard-coded
+      OA test DOIs; Rich table render; exit 0 on all-green or no-creds,
+      exit 1 on configured-creds-failed.
+- [ ] Golden-output test for the `doctor` table render.
+
+### Step 10 — Extraction (§17.10, §11)
+
+- [ ] `src/litspectraits/extract/_dispatch.py`: format → extractor.
+- [ ] `src/litspectraits/extract/pdf.py`: `docling`, `asyncio.to_thread`
+      bridged, writes `documents/<sha>/document.json` + `meta.json`.
+- [ ] `src/litspectraits/extract/jats.py`: `lxml`-based section /
+      paragraph / table / reference parser.
+- [ ] `src/litspectraits/extract/elsevier.py`: `lxml`-based parser for
+      Elsevier's full-text envelope; emit dict shape similar to JATS so
+      downstream callers stay mostly publisher-agnostic.
+- [ ] One real-fixture test per extractor (synthetic PDF, small JATS
+      sample, small Elsevier-XML sample).
+
+### Step 11 (optional) — Batch ingest
+
+- [ ] `litspectraits ingest --batch <doi-list.txt>` with the rate-limit
+      bucket alive across DOIs.
+- [ ] Concurrency story (semaphore cap per publisher) verified against
+      real DOIs.
+
+### Step 12 (optional) — End-to-end smoke tests (§22)
+
+Lands after Step 7 at the earliest. Not part of the per-step green-bar
+gate; runs on demand via `uv run pytest -m smoke`. Default
+`uv run pytest` skips all three when no publisher creds are set.
+
+- [ ] Hardcoded OA DOI per publisher in
+      `src/litspectraits/_smoke_dois.py` (or alongside doctor's table).
+      Shared by `doctor` (§12) and the smoke tests so the constants
+      stay in sync.
+- [ ] Register `smoke`, `requires_wiley_creds`,
+      `requires_springer_creds`, `requires_elsevier_creds` markers in
+      `pyproject.toml` `[tool.pytest.ini_options].markers`.
+- [ ] `tests/smoke/conftest.py`: skip-on-missing-env-var logic for each
+      `requires_<publisher>_creds` marker; tempdir-backed `Settings`
+      fixture wired from real env vars.
+- [ ] `tests/smoke/test_wiley_e2e.py`: full happy-path against
+      `tmp_path`; invariants per §22 table (PDF magic + size + layout).
+- [ ] `tests/smoke/test_springer_e2e.py`: full happy-path against
+      `tmp_path`; invariants per §22 table (JATS XML + size + layout).
+- [ ] `tests/smoke/test_elsevier_e2e.py`: full happy-path against
+      `tmp_path`; invariants per §22 table (Elsevier full-text envelope
+      + `<originalText>` subtree + size + layout).
+- [ ] Verify `uv run pytest -m smoke` runs all three when all creds
+      present; verify default `uv run pytest` skips all three with no
+      creds.
+
+## 22. Smoke tests (gated end-to-end)
+
+Three pytest-level end-to-end tests — one per publisher — that exercise
+the full v3 happy path (`fetch_metadata` → publisher dispatch →
+real-network retrieve → magic-byte sniff → store + manifest) against an
+ephemeral tempdir-backed store. These are the highest-confidence
+regression signal for "does the pipeline actually wire DOI → bytes for
+this publisher today?", and the only test layer that catches
+publisher-side surprises (API changes, response-shape drift, expired
+tokens, IP de-allowlisting).
+
+### Design constraints
+
+- **Ephemeral.** Each test takes pytest's `tmp_path` as the
+  `Settings.data_dir`; nothing touches the operator's real corpus.
+  Teardown is pytest's normal tempdir cleanup.
+- **OA DOIs only.** One known-OA DOI per publisher, hardcoded next to
+  doctor's smoke-test DOI list (§12) so the same constants serve both.
+  Open-access avoids two distinct problems: redistribution concerns for
+  a paywalled fixture, and IP-scoping false-failures from a
+  non-Würzburg test environment.
+- **Invariant-style assertions, not byte equality.** Wiley TDM rotates
+  PDF metadata (`/CreationDate`, watermark layers) between fetches, so
+  `sha256(fetched) == sha256(reference)` flakes by design. Tests assert
+  format envelope, plausible byte size, and structural markers instead.
+- **Gated on credentials.** Markers `requires_wiley_creds` /
+  `requires_springer_creds` / `requires_elsevier_creds` plus a `smoke`
+  marker. `tests/smoke/conftest.py` skips a marked test when the
+  corresponding env var is unset, so the default `uv run pytest` (no
+  creds) skips all three; on-demand runs use `uv run pytest -m smoke`.
+- **Not part of the per-step green-bar gate.** Smoke tests run
+  pre-release, post-dep-bump, and after Wiley / Springer / Elsevier API
+  outages — failures need triage, not a revert.
+
+### Per-publisher invariants
+
+| Publisher | Format | Layout | Byte floor | Structural marker |
+|---|---|---|---|---|
+| Wiley | `Format.PDF` | `artifacts/pdf/sha256/<aa>/<sha>.pdf` | ≥ 50 KB | `%PDF-` prefix; `%%EOF` in last 1 KB |
+| Springer Nature | `Format.JATS_XML` | `artifacts/jats/sha256/<aa>/<sha>.xml` | ≥ 5 KB | `<?xml` declaration; `<article` (or JATS namespace) in first 4 KB |
+| Elsevier | `Format.ELSEVIER_XML` | `artifacts/elsevier/sha256/<aa>/<sha>.xml` | ≥ 10 KB | `<full-text-retrieval-response>` root; `<originalText>` subtree present (rules out a META_ABS that slipped past the retriever) |
+
+All three additionally assert: `record.publisher` matches the dispatch
+table; the manifest file exists at the manifest path; `by_doi.jsonl`
+carries a row with the right `format` column.
+
+### Sketch (Wiley — Springer + Elsevier follow the same shape)
+
+```python
+@pytest.mark.smoke
+@pytest.mark.requires_wiley_creds
+async def test_wiley_e2e(tmp_path: Path) -> None:
+    settings = _settings_from_env(data_dir=tmp_path)
+    store = ArtifactStore(tmp_path)
+    record = await ingest(SMOKE_DOI[Publisher.WILEY],
+                          settings=settings, store=store)
+    assert record.publisher is Publisher.WILEY
+    assert record.format is Format.PDF
+    assert record.byte_size >= 50_000
+    pdf = (settings.data_dir / record.artifact_path).read_bytes()
+    assert pdf.startswith(b'%PDF-')
+    assert b'%%EOF' in pdf[-1024:]
+    assert record.artifact_path.startswith('artifacts/pdf/sha256/')
+```
+
+### Operational notes
+
+- **DOI churn risk.** A DOI that's OA today may not be tomorrow (rare,
+  but possible). When a smoke test starts failing on a publisher API
+  call rather than an invariant assertion, suspect the DOI before the
+  code. Refresh the constant if needed.
+- **Overlap with `doctor` (§12) is intentional.** `doctor` is operator-
+  facing (interactive, Rich table, exit codes); the smoke tests are
+  regression-facing (pytest, structured assertions). Sharing the DOI
+  constants keeps them in sync; they never share runtime.
