@@ -959,14 +959,21 @@ should land as one (or a tight few) commits ending green on
 - [x] `tests/test_sniff.py`: positive + negative fixtures per format,
       including paywall-HTML-as-PDF and HTML-with-XML-prelude.
 
-### Step 5 — Metadata + dispatch (§17.5, §6)
+### Step 5 — Metadata + dispatch (§17.5, §6, done)
 
-- [ ] Create `src/litspectraits/metadata.py`: `fetch_metadata(doi)`
+- [x] Create `src/litspectraits/metadata.py`: `fetch_metadata(doi)`
       against CrossRef polite pool; `_PUBLISHER_BY_PREFIX` table;
-      `publisher_for_doi(doi)`.
-- [ ] `tests/test_metadata.py` with `respx`: OA paper happy path; 404
+      `publisher_for_doi(doi)`. Also includes
+      `warn_on_publisher_mismatch(metadata, publisher)` — the
+      observability-only CrossRef-publisher cross-check called by the
+      orchestrator (Step 7).
+- [x] `tests/test_metadata.py` with `respx`: OA paper happy path; 404
       → `DOINotFoundError`; unknown prefix → `UnsupportedPublisherError`;
       publisher cross-check warning logged on mismatch.
+
+Open design calls captured in `docs/triage.md` entries M5-1 … M5-5;
+notably M5-1 (CrossRef non-404 errors propagate as raw `httpx.HTTPError`
+pending the Step 7 orchestrator decision).
 
 ### Step 6 — Retrievers (§17.6, §7)
 
