@@ -30,6 +30,7 @@ litspectraits = 'litspectraits.cli:app'
 
 [dependency-groups]
 dev = [
+    'lxml-stubs>=0.5.1',
     'pyright>=1.1.385',
     'pytest>=8.3',
     'pytest-asyncio>=0.24',
