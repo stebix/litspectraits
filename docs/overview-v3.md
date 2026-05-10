@@ -940,14 +940,14 @@ should land as one (or a tight few) commits ending green on
   `Notes` block in the relevant `manifest.py` docstring so the contract
   is visible at the call-site as well as in the design doc.
 
-### Step 3 — Store (§17.3)
+### Step 3 — Store (§17.3, done)
 
-- [ ] Create `src/litspectraits/store.py`: three format dirs
+- [x] Create `src/litspectraits/store.py`: three format dirs
       (`pdf/`, `jats/`, `elsevier/`), one-level sharding, atomic
       `os.replace` from `tmp/`, manifest write, DOI index with `format`
       column.
-- [ ] Clear `tmp/` on `ArtifactStore.__init__` (per §3).
-- [ ] `tests/test_store.py`: shard path computation, manifest write +
+- [x] Clear `tmp/` on `ArtifactStore.__init__` (per §3).
+- [x] `tests/test_store.py`: shard path computation, manifest write +
       read, `find_by_doi` returns latest by sha256, `format` column
       populated in `by_doi.jsonl`.
 
