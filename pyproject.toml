@@ -8,12 +8,21 @@ dependencies = [
     'attrs>=24.2',
     'cattrs>=24.1',
     'httpx[http2]>=0.27',
+    'lxml>=5.3',
     'platformdirs>=4.3',
     'python-dotenv>=1.0',
     'rich>=13.9',
     'structlog>=24.4',
     'tenacity>=9.0',
     'typer>=0.13',
+]
+
+[project.optional-dependencies]
+wiley = ['wiley-tdm>=1.0']
+springer = ['springernature-api-client>=0.0.9']
+extract = ['docling>=2.0']
+all = [
+    'litspectraits[wiley,springer,extract]',
 ]
 
 [project.scripts]
