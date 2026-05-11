@@ -1153,14 +1153,47 @@ biggest single piece. Interior order in `extract-pdf-plan.md` §10.
       route through `extract_pdf` (with positional record/store +
       keyword `reextract`); JATS / Elsevier breadcrumbs still asserted.
 
-**10c — JATS extractor.** Wires JATS leg.
+**10c — JATS extractor (done).** Wires JATS leg.
 
-- [ ] `src/litspectraits/extract/jats.py`: `lxml`-based parser emitting
-      sections / paragraphs / tables / references dict. No
-      cross-publisher normalization (§11 defers).
+- [x] `src/litspectraits/extract/jats.py`: `lxml`-based five-stage
+      pipeline (preflight → parse → walk → serialize → commit) emitting a
+      schema-versioned dict with `front` (title + abstract), flattened
+      `sections` (id / title / level / root-to-leaf `path` / `blocks`
+      with inline-citation `xrefs` preserved), `tables` (2-D `cells`
+      grid with rowspan / colspan + section_path + caption), `figures`
+      (caption + section_path; no pixel data), and `references`
+      (raw_text + the easy structured fields: authors, title, source,
+      year, DOI). Namespace-agnostic via `local-name()` xpath so both
+      bare-DTD and `xmlns="https://jats.nlm.nih.gov/..."` shapes parse
+      the same way. No cross-publisher normalization — the agent triad's
+      normaliser walks this dict (§11). Cross-extractor `_commit` /
+      `_atomic_write` / `_file_sha256` helpers are duplicated rather
+      than abstracted; revisit after 10d when all three concretes exist.
+- [x] `errors.py`: added `MalformedDocumentError(ExtractError)` —
+      "artifact passed sniff but failed structural parse" — used by
+      JATS now and reusable by Elsevier in 10d. `tests/test_errors.py`
+      parametrize list + the disjointness check pick it up
+      automatically (60 cases now, was 52 in 10a).
 - [ ] Small JATS fixture trimmed to one section + one table + one ref.
-- [ ] Happy-path test: structural counts + spot-checks on section path
-      and table cells.
+      **Inline literal in `tests/extract/test_jats.py`** rather than a
+      tree-side file — same hermetic-byte-literal style as
+      `tests/test_sniff.py`; saves a fixture-tree round-trip and keeps
+      every test self-contained. Real Springer-Nature samples remain in
+      Step 12's gated end-to-end smoke.
+- [x] Tests (`tests/extract/test_jats.py`, 12 cases): happy path with
+      structural counts + section-path / table-cell / xref / reference
+      spot-checks; `WrongFormatForExtractorError` on a PDF record;
+      `MissingArtifactError`; `MalformedDocumentError` on syntactically
+      broken XML; `MalformedDocumentError` on a non-`<article>` root;
+      `EmptyDocumentError` on body-less JATS; namespaced `<jats:article>`
+      parses; floating top-level `<p>` outside any `<sec>` surfaces as
+      a synthetic section; `SerializationError` via a monkeypatched
+      `_walk` that injects an unjsonable value; idempotent re-extract
+      with same bytes is no-op; `ExtractIntegrityError` on diverging
+      re-extract; `--reextract` overwrites cleanly.
+      `tests/extract/test_dispatch.py` now parametrizes the leaf-routes-
+      through and missing-artifact pins across both PDF and JATS;
+      Elsevier branch breadcrumb still asserted.
 
 **10d — Elsevier extractor.** Wires Elsevier leg; `_dispatch.py` now
 fully covered.

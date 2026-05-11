@@ -192,6 +192,24 @@ class MissingArtifactError(ExtractError):
     """
 
 
+class MalformedDocumentError(ExtractError):
+    """Artifact passed magic-byte sniff at ingest but failed structural parse.
+
+    Raised by the JATS / Elsevier XML extractors when ``lxml`` rejects the
+    bytes (``XMLSyntaxError``) or when the parsed root carries no
+    recognizable JATS / Elsevier shape (e.g. an envelope without an
+    ``<article>`` body or a ``<full-text-retrieval-response>`` without
+    ``<originalText>``). Distinct from the structural sanity errors below
+    because the *parse step itself* failed — the sniff at ingest already
+    validated the root element, so anything that breaks here points at a
+    corrupted artifact, not "we couldn't extract enough content."
+
+    Distinct from :class:`MalformedArtifactError` (the ingest-side class
+    raised by the magic-byte sniff) so CLI panel dispatch can pattern-
+    match each pipeline stage independently.
+    """
+
+
 # Conversion ------------------------------------------------------------------
 
 

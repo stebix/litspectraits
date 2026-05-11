@@ -1,14 +1,15 @@
 """Format → extractor dispatch (``docs/overview-v3.md`` §11).
 
-A three-way ``match`` on :attr:`AcquisitionRecord.format`. The PDF branch
-is wired (step 10b); the JATS and Elsevier branches still raise
-:class:`NotImplementedError` until 10c / 10d land.
+A three-way ``match`` on :attr:`AcquisitionRecord.format`. PDF (step 10b)
+and JATS (step 10c) are wired; the Elsevier branch still raises
+:class:`NotImplementedError` until 10d lands.
 
 The :class:`~litspectraits.errors.ExtractError` taxonomy is the
 load-bearing piece of step 10a — every leaf extractor plugs into a
 dispatcher that already speaks the right error language.
 """
 
+from litspectraits.extract.jats import extract_jats
 from litspectraits.extract.pdf import extract_pdf
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -46,8 +47,7 @@ async def extract(
     Raises
     ------
     NotImplementedError
-        For :attr:`Format.JATS_XML` and :attr:`Format.ELSEVIER_XML` until
-        steps 10c / 10d land.
+        For :attr:`Format.ELSEVIER_XML` until step 10d lands.
     litspectraits.errors.ExtractError
         Any extractor-side failure. The class itself is the contract.
     """
@@ -55,6 +55,6 @@ async def extract(
         case Format.PDF:
             return await extract_pdf(record, store, reextract=reextract)
         case Format.JATS_XML:
-            raise NotImplementedError('extract_jats lands in step 10c')
+            return await extract_jats(record, store, reextract=reextract)
         case Format.ELSEVIER_XML:
             raise NotImplementedError('extract_elsevier lands in step 10d')
