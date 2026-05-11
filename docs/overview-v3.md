@@ -488,8 +488,9 @@ to know which tier was used.
 
 **Shared**
 
-- **Format:** JATS XML (sniff requires `<?xml` declaration + `<article>`
-  root after preamble stripping).
+- **Format:** JATS XML (sniff matches the `<article>` root element after
+  stripping any XML declaration / PIs / comments / DOCTYPE; the
+  declaration is optional — see §17.4).
 - **Rate limit:** per-minute quota; default 5 req/s conservative.
 - **`MissingCredentialError`** is raised when *neither* key is set; the
   hint names both env vars.
@@ -849,8 +850,10 @@ Each step ends green on `pytest`, `ruff check`, `pyright`. Ten commits.
 3. **Store.** `store.py` with three format dirs, one-level sharding,
    manifest write, DOI index with `format` column. Layout tests.
 4. **Sniff.** `sniff.py` with PDF + JATS + Elsevier-XML magic-byte
-   detection (read first 4 KiB, distinguish `<?xml` + root element). Tests
-   with real fixture bytes.
+   detection (read first 4 KiB; PDF by `%PDF-` prefix, the XML formats by
+   their root element after stripping any XML declaration / PIs /
+   comments / DOCTYPE — the declaration is optional). Tests with real
+   fixture bytes.
 5. **Metadata.** `metadata.py` — CrossRef fetch + DOI-prefix → Publisher
    table. Respx-mocked tests for OA paper, 404, unknown prefix.
 6. **Retrievers.** `retrievers/{base,_ratelimit,wiley,springer,elsevier,
@@ -1023,10 +1026,21 @@ should land as one (or a tight few) commits ending green on
 ### Step 4 — Sniff (§17.4, done)
 
 - [x] Create `src/litspectraits/sniff.py`: PDF (`%PDF-`), JATS XML
-      (`<?xml` + JATS root marker), Elsevier XML
-      (`<full-text-retrieval-response>` root). 4 KiB read window.
+      (`<article>` root), Elsevier XML (`<full-text-retrieval-response>`
+      root). 4 KiB read window; XML roots matched after stripping any
+      declaration / PIs / comments / DOCTYPE.
 - [x] `tests/test_sniff.py`: positive + negative fixtures per format,
       including paywall-HTML-as-PDF and HTML-with-XML-prelude.
+- [x] **Follow-up (Step 12 fallout):** the original sniff *required* a
+      leading `<?xml` declaration on the XML formats; the live
+      ScienceDirect full-text API omits it (body starts straight at
+      `<full-text-retrieval-response>`), so the Elsevier ingest path
+      never worked end-to-end. The declaration is optional in XML 1.0
+      and carries no discriminating signal (XHTML has one too), so the
+      gate was dropped — `classify` now keys purely on the first opening
+      tag after preamble stripping. `tests/test_sniff.py` gained a
+      declaration-less Elsevier fixture + `classify` / `verify`
+      regression cases; module docstring + §7.2 / §17.4 wording updated.
 
 ### Step 5 — Metadata + dispatch (§17.5, §6, done)
 
@@ -1413,32 +1427,55 @@ sits on top of the dispatcher landed in 10a.
 - [ ] Concurrency story (semaphore cap per publisher) verified against
       real DOIs.
 
-### Step 12 (optional) — End-to-end smoke tests (§22)
+### Step 12 (optional) — End-to-end smoke tests (§22, done)
 
-Lands after Step 7 at the earliest. Not part of the per-step green-bar
-gate; runs on demand via `uv run pytest -m smoke`. Default
-`uv run pytest` skips all three when no publisher creds are set.
+Not part of the per-step green-bar gate; runs on demand via
+`uv run pytest -m smoke`. The default `uv run pytest` *deselects* all
+three via `addopts = -m "not smoke"` in `pyproject.toml` (a `-m` on the
+command line overrides it), so a routine test run never makes a
+publisher API call even on a machine that happens to have credentials
+exported; a `-m smoke` run with a publisher's credential unset *skips*
+that publisher's test rather than failing it.
 
-- [ ] Hardcoded OA DOI per publisher in
-      `src/litspectraits/_smoke_dois.py` (or alongside doctor's table).
-      Shared by `doctor` (§12) and the smoke tests so the constants
-      stay in sync.
-- [ ] Register `smoke`, `requires_wiley_creds`,
+- [x] Hardcoded recent-OA DOI per publisher in
+      `src/litspectraits/_smoke_dois.py`. Shared by `doctor` (§12) and
+      the smoke tests so the constants stay in sync.
+- [x] Register `smoke`, `requires_wiley_creds`,
       `requires_springer_creds`, `requires_elsevier_creds` markers in
-      `pyproject.toml` `[tool.pytest.ini_options].markers`.
-- [ ] `tests/smoke/conftest.py`: skip-on-missing-env-var logic for each
-      `requires_<publisher>_creds` marker; tempdir-backed `Settings`
-      fixture wired from real env vars.
-- [ ] `tests/smoke/test_wiley_e2e.py`: full happy-path against
-      `tmp_path`; invariants per §22 table (PDF magic + size + layout).
-- [ ] `tests/smoke/test_springer_e2e.py`: full happy-path against
-      `tmp_path`; invariants per §22 table (JATS XML + size + layout).
-- [ ] `tests/smoke/test_elsevier_e2e.py`: full happy-path against
-      `tmp_path`; invariants per §22 table (Elsevier full-text envelope
-      + `<originalText>` subtree + size + layout).
-- [ ] Verify `uv run pytest -m smoke` runs all three when all creds
-      present; verify default `uv run pytest` skips all three with no
-      creds.
+      `pyproject.toml` `[tool.pytest.ini_options].markers`, plus
+      `addopts = ['-m', 'not smoke']` so the suite is opt-in.
+- [x] `tests/smoke/conftest.py`: `pytest_runtest_setup` loads the
+      project `.env` (same file the CLI reads; never overrides an
+      already-set var) then skips a `requires_<publisher>_creds` test
+      when none of that publisher's credential env vars is set
+      (Springer satisfied by *either* `SPRINGER_OA_API_KEY` or
+      `SPRINGER_TDM_API_KEY`). `smoke_settings` fixture =
+      `attrs.evolve(Settings.from_env(), data_dir=tmp_path)`. Shared
+      `run_e2e_ingest` / `assert_e2e_invariants` helpers carry the §22
+      cross-publisher invariant block (publisher matches dispatch,
+      format + byte floor, `artifacts/<fmt>/sha256/…` path, manifest
+      re-readable, `by_doi.jsonl` row with the right `format` column).
+- [x] `tests/smoke/test_wiley_e2e.py`: full happy-path against
+      `tmp_path`; PDF magic (`%PDF-` prefix, `%%EOF` in last 1 KiB) +
+      ≥ 50 KB + `artifacts/pdf/sha256/…`.
+- [x] `tests/smoke/test_springer_e2e.py`: full happy-path against
+      `tmp_path`; first 4 KiB is markup carrying the `<article` root
+      (bare or namespaced) + ≥ 5 KB + `artifacts/jats/sha256/…`.
+      Tier-agnostic — the OA path's envelope-unwrap lands the same
+      `<article>`-rooted artifact the TDM path does.
+- [x] `tests/smoke/test_elsevier_e2e.py`: full happy-path against
+      `tmp_path`; first 4 KiB is markup carrying the
+      `<full-text-retrieval-response>` root + `originalText` subtree
+      present (rules out a META_ABS that slipped past the retriever) +
+      ≥ 10 KB + `artifacts/elsevier/sha256/…`.
+- [x] Verified: default `uv run pytest` → 3 deselected; `uv run pytest
+      -m smoke` with all credential env vars unset → 3 skipped (one per
+      publisher, named in the skip reason); live three-publisher run
+      green (Wiley PDF, Springer JATS via the OA tier, Elsevier full-text
+      — the last after the §17.4 sniff fix this step turned up). The
+      live run is operator-driven going forward (real API calls, real
+      credentials, recent-OA DOIs that can churn — see §22's operational
+      notes).
 
 ## 22. Smoke tests (gated end-to-end)
 
@@ -1479,8 +1516,8 @@ tokens, IP de-allowlisting).
 | Publisher | Format | Layout | Byte floor | Structural marker |
 |---|---|---|---|---|
 | Wiley | `Format.PDF` | `artifacts/pdf/sha256/<aa>/<sha>.pdf` | ≥ 50 KB | `%PDF-` prefix; `%%EOF` in last 1 KB |
-| Springer Nature | `Format.JATS_XML` | `artifacts/jats/sha256/<aa>/<sha>.xml` | ≥ 5 KB | `<?xml` declaration; `<article` (or JATS namespace) in first 4 KB |
-| Elsevier | `Format.ELSEVIER_XML` | `artifacts/elsevier/sha256/<aa>/<sha>.xml` | ≥ 10 KB | `<full-text-retrieval-response>` root; `<originalText>` subtree present (rules out a META_ABS that slipped past the retriever) |
+| Springer Nature | `Format.JATS_XML` | `artifacts/jats/sha256/<aa>/<sha>.xml` | ≥ 5 KB | first 4 KB starts with markup and carries the JATS `<article` root (bare or namespaced) |
+| Elsevier | `Format.ELSEVIER_XML` | `artifacts/elsevier/sha256/<aa>/<sha>.xml` | ≥ 10 KB | first 4 KB starts with markup and carries the `<full-text-retrieval-response>` root (no XML declaration — the live API omits it); `originalText` subtree present somewhere in the body (rules out a META_ABS that slipped past the retriever) |
 
 All three additionally assert: `record.publisher` matches the dispatch
 table; the manifest file exists at the manifest path; `by_doi.jsonl`

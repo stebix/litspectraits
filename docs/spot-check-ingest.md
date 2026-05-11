@@ -9,13 +9,18 @@ follow the same shape with a different DOI and credential.
 This is not an automated test — it hits the network and uses your
 publisher credentials. It is the thing you do before trusting a batch
 run, or after a dependency bump, to confirm the happy path still
-produces sane artifacts. The gated end-to-end smoke suite (`§22` of
-`overview-v3.md`, Step 12) is the eventual automation of this; until it
-lands, this document is the procedure.
+produces sane artifacts and *visually* checks the bytes (open the PDF,
+eyeball the extracted prose). The gated end-to-end smoke suite (`§22` of
+`overview-v3.md`, Step 12 — `uv run pytest -m smoke`) is the automated
+counterpart: it covers the ingest half of this runbook with structured
+invariant assertions, but does not extract or eyeball anything. Run both
+— the suite for a fast regression signal, this runbook when you want to
+look at what landed.
 
 Subordinate to `overview-v3.md`; section refs of the form `§N` point
 there. Last revised against the codebase state at commit `1704bf2`
-(2026-05-11): Steps 0–10 landed, Steps 11–12 not started.
+(2026-05-11), with the §22 smoke suite (Step 12) landed shortly after:
+Steps 0–10 + 12 landed, Step 11 (`ingest --batch`) not started.
 
 ## 0. Setup — isolate the run in a scratch data dir
 

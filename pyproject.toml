@@ -92,6 +92,14 @@ include = ['src', 'tests']
 [tool.pytest.ini_options]
 asyncio_mode = 'auto'
 testpaths = ['tests']
+# Smoke tests hit real publisher APIs (overview-v3.md §22) — never part of the
+# default green-bar run. Deselected here; opt in with `uv run pytest -m smoke`
+# (a `-m` on the command line overrides this default).
+addopts = ['-m', 'not smoke']
 markers = [
     "extract_real: opt out of the default doctor extract-section mute (tests/test_doctor.py)",
+    "smoke: gated end-to-end test against a real publisher API; run with `-m smoke` (tests/smoke/)",
+    "requires_wiley_creds: smoke test needing WILEY_TDM_TOKEN (or Würzburg-egress IP auth)",
+    "requires_springer_creds: smoke test needing SPRINGER_OA_API_KEY or SPRINGER_TDM_API_KEY",
+    "requires_elsevier_creds: smoke test needing ELSEVIER_API_KEY",
 ]

@@ -53,6 +53,18 @@ _ELSEVIER = (
     b'</full-text-retrieval-response>'
 )
 
+# The live ScienceDirect full-text API serves the body with *no* XML
+# declaration — it starts straight at ``<full-text-retrieval-response>``.
+# Sniffing must accept that (regression: it used to require ``<?xml``).
+_ELSEVIER_NO_DECL = (
+    b'<full-text-retrieval-response '
+    b'xmlns="http://www.elsevier.com/xml/svapi/article/dtd" '
+    b'xmlns:xocs="http://www.elsevier.com/xml/xocs/dtd">'
+    b'<coredata><dc:title>Foo</dc:title></coredata>'
+    b'<originalText><xocs:doc/></originalText>'
+    b'</full-text-retrieval-response>'
+)
+
 _PAYWALL_HTML = (
     b'<!DOCTYPE html>\n'
     b'<html lang="en"><head><title>Sign in</title></head>'
@@ -107,6 +119,12 @@ def test_classify_elsevier_full_text_envelope() -> None:
     assert classify(_ELSEVIER) is Format.ELSEVIER_XML
 
 
+def test_classify_elsevier_without_xml_declaration() -> None:
+    # The live ScienceDirect API omits the XML declaration; the root
+    # element alone classifies it.
+    assert classify(_ELSEVIER_NO_DECL) is Format.ELSEVIER_XML
+
+
 def test_classify_paywall_html_returns_none() -> None:
     # Adversarial: paywall HTML body served at a `.pdf` URL.
     assert classify(_PAYWALL_HTML) is None
@@ -123,10 +141,11 @@ def test_classify_unknown_xml_root_returns_none() -> None:
     assert classify(_OTHER_XML_ROOT) is None
 
 
-def test_classify_xml_without_declaration_rejected() -> None:
-    # The XML declaration is required: it discriminates against scraped
-    # HTML fragments that happen to start with `<article>`.
-    assert classify(b'<article></article>') is None
+def test_classify_xml_without_declaration_accepted() -> None:
+    # The XML declaration is optional in XML 1.0 and the ScienceDirect
+    # full-text API omits it; the first opening tag is the discriminator.
+    assert classify(b'<article></article>') is Format.JATS_XML
+    assert classify(b'<full-text-retrieval-response/>') is Format.ELSEVIER_XML
 
 
 def test_classify_empty_buffer() -> None:
@@ -170,6 +189,14 @@ def test_verify_elsevier_round_trip(tmp_path: Path) -> None:
     p = tmp_path / 'a.xml'
     p.write_bytes(_ELSEVIER)
     verify(p, expected=Format.ELSEVIER_XML, doi='10.1016/j.neuroimage.2024.01.001')
+
+
+def test_verify_elsevier_without_declaration_round_trip(tmp_path: Path) -> None:
+    # The shape the real ScienceDirect API returns — no XML declaration.
+    # Regression: this used to raise MalformedArtifactError.
+    p = tmp_path / 'a.xml'
+    p.write_bytes(_ELSEVIER_NO_DECL)
+    verify(p, expected=Format.ELSEVIER_XML, doi='10.1016/j.mri.2026.110656')
 
 
 def test_verify_pdf_expected_but_html_raises(tmp_path: Path) -> None:

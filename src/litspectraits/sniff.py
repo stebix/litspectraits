@@ -11,19 +11,26 @@ Recognized formats
 
 - :attr:`~litspectraits.manifest.Format.PDF` — strict ``%PDF-`` prefix
   at byte 0.
-- :attr:`~litspectraits.manifest.Format.JATS_XML` — XML declaration
-  followed by an ``<article>`` root element (after stripping XML PIs,
-  comments, and DOCTYPE).
-- :attr:`~litspectraits.manifest.Format.ELSEVIER_XML` — XML declaration
-  followed by a ``<full-text-retrieval-response>`` root element, same
-  preamble treatment.
+- :attr:`~litspectraits.manifest.Format.JATS_XML` — first opening tag is
+  ``<article>`` (after stripping any XML declaration, PIs, comments, and
+  DOCTYPE).
+- :attr:`~litspectraits.manifest.Format.ELSEVIER_XML` — first opening
+  tag is ``<full-text-retrieval-response>``, same preamble treatment.
 
-The classifier is intentionally root-element-based, not text-match.
-``<?xml`` alone is not sufficient (XHTML uses one) and a bare
-``<article`` substring would misclassify HTML pages that happen to
-contain that token. The first opening tag, after preamble stripping,
-is the strong signal — namespaced roots (``<jats:article>``) collapse
-to their local name so they still match.
+The classifier is root-element-based, not text-match: the first opening
+tag, after stripping the preamble (XML declaration / PIs / comments /
+DOCTYPE), is the discriminator — namespaced roots (``<jats:article>``)
+collapse to their local name so they still match. A leading ``<?xml``
+declaration is *not* required: it is no signal in either direction
+(every XML dialect — XHTML included — may carry one, and the
+ScienceDirect full-text API omits it entirely), and a bare ``<article``
+substring elsewhere in the bytes is irrelevant because only the first
+tag is read. The real adversaries in the ingest path are full HTML
+documents (paywall / login / error pages — root ``<html>`` ⇒ no match)
+and empty bodies (no tag ⇒ no match); a hand-crafted bare ``<article>``
+fragment is not something a publisher TDM API or a sideloaded file hands
+us, and the JATS / Elsevier ``lxml`` parses downstream are the next gate
+regardless.
 
 Notes
 -----
@@ -49,9 +56,10 @@ from litspectraits.manifest import Format
 _SNIFF_WINDOW: Final = 4096
 _PDF_MAGIC: Final = b'%PDF-'
 
-# Order matters: PIs first (they share the ``<?`` prefix with nothing else
-# we strip), then comments, then DOCTYPE — DOCTYPE may immediately follow
-# either of the prior two and we want it gone before the first-tag scan.
+# Order matters: the XML declaration and any processing instructions first
+# (all ``<?...?>``-shaped — the declaration, when present, is stripped here
+# too), then comments, then DOCTYPE — DOCTYPE may immediately follow either
+# of the prior two and we want it gone before the first-tag scan.
 _PI_RE: Final = re.compile(rb'<\?[^?]*\?>', re.DOTALL)
 _COMMENT_RE: Final = re.compile(rb'<!--.*?-->', re.DOTALL)
 _DOCTYPE_RE: Final = re.compile(rb'<!DOCTYPE[^>]*>', re.IGNORECASE | re.DOTALL)
@@ -85,8 +93,6 @@ def classify(head: bytes) -> Format | None:
     window = head[:_SNIFF_WINDOW]
     if window.startswith(_PDF_MAGIC):
         return Format.PDF
-    if not _has_xml_declaration(window):
-        return None
     root = _xml_root_local_name(window)
     if root is None:
         return None
@@ -136,16 +142,9 @@ def _read_head(path: Path) -> bytes:
         return fp.read(_SNIFF_WINDOW)
 
 
-def _has_xml_declaration(window: bytes) -> bool:
-    # Strip a UTF-8 BOM and any leading whitespace before checking for the
-    # XML decl. Real-world JATS/Elsevier responses do not include leading
-    # whitespace, but tolerating it costs nothing and removes a class of
-    # false negatives if a publisher proxy ever rewraps the body.
-    stripped = window.lstrip(b'\xef\xbb\xbf').lstrip()
-    return stripped.startswith(b'<?xml')
-
-
 def _xml_root_local_name(window: bytes) -> str | None:
+    # A UTF-8 BOM or leading whitespace is harmless here: ``_FIRST_TAG_RE``
+    # scans for the first ``<tag``, so anything before it is skipped.
     cleaned = _PI_RE.sub(b'', window)
     cleaned = _COMMENT_RE.sub(b'', cleaned)
     cleaned = _DOCTYPE_RE.sub(b'', cleaned)
