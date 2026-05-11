@@ -611,7 +611,9 @@ async def extract(record: AcquisitionRecord, store: ArtifactStore) -> ExtractRec
 
 - **`extract/pdf.py`** — `docling`. `asyncio.to_thread` (CPU/GPU-bound).
   Output is `result.document.export_to_dict()` written to
-  `documents/<sha>/document.json`.
+  `documents/<sha>/document.json`. Detailed plan — six-stage fail-fast
+  pipeline, `PdfPipelineOptions` config, error taxonomy, sanity
+  thresholds — in `docs/extract-pdf-plan.md`.
 - **`extract/jats.py`** — `lxml`-based parser. Faster, more deterministic,
   GPU-free. Output is a structured dict with sections, paragraphs, tables,
   references. **Richer than docling-on-PDF** because the publisher's
@@ -670,6 +672,11 @@ exit 1 if any configured creds fail smoke test. **Always run `doctor`
 before a batch ingest.**
 
 Doctor never writes to the artifact store. It is a pure read-only diagnostic.
+
+The PDF-extraction plan adds a fourth check section — docling extra +
+model cache + accelerator detection, plus opt-in
+`--download-models` / `--smoke-extract` flags — specified in
+`docs/extract-pdf-plan.md` §8. Lands alongside Step 10.
 
 ## 13. Configuration (`config.py`)
 
@@ -802,9 +809,15 @@ Each step ends green on `pytest`, `ruff check`, `pyright`. Ten commits.
 9. **CLI + doctor.** `cli.py` with `ingest / extract / sideload / doctor /
    show`. `doctor.py` with IP check + per-publisher creds smoke test.
    Golden-output test for the doctor table.
-10. **Extraction.** `extract/{_dispatch,pdf,jats,elsevier}.py`. One
-    real-fixture test per extractor (a tiny synthetic PDF, a small JATS
-    sample, a small Elsevier-XML sample).
+10. **Extraction.** Six-commit sequence `10a`–`10f` covering all three
+    format extractors plus CLI and doctor wiring: 10a bootstrap
+    (errors + `ExtractRecord` + dispatch stubs), 10b PDF, 10c JATS,
+    10d Elsevier, 10e CLI `extract` command, 10f doctor docling
+    extension. Each ends green on `pytest`, `ruff check`, `pyright`;
+    granular checklist in §21 "Step 10 — Extraction." PDF interior
+    spec'd in `docs/extract-pdf-plan.md` (six-stage pipeline, error
+    taxonomy, `doctor` model-preflight extension); JATS + Elsevier
+    governed by §11 alone.
 
 Optional 11: batch ingest CLI flag (`--batch <doi-list.txt>`) plus the
 concurrency story when there's data to test against. The rate-limit bucket
@@ -882,7 +895,7 @@ section, not as a new §20 list.
 Granular checklist that mirrors §17 with file-level resolution. Each step
 should land as one (or a tight few) commits ending green on
 `uv run pytest`, `uv run ruff check`, and `uv run pyright`. Items marked
-`[x]` are done as of 2026-05-10.
+`[x]` are done as of 2026-05-11.
 
 ### Phase 0 — Pre-flight (done)
 
@@ -975,40 +988,40 @@ Open design calls captured in `docs/triage.md` entries M5-1 … M5-5;
 notably M5-1 (CrossRef non-404 errors propagate as raw `httpx.HTTPError`
 pending the Step 7 orchestrator decision).
 
-### Step 6 — Retrievers (§17.6, §7)
+### Step 6 — Retrievers (§17.6, §7, done)
 
-- [ ] `src/litspectraits/retrievers/base.py`: `Retriever` Protocol +
+- [x] `src/litspectraits/retrievers/base.py`: `Retriever` Protocol +
       success-only `RetrievePayload`.
-- [ ] `src/litspectraits/retrievers/_ratelimit.py`: per-publisher token
+- [x] `src/litspectraits/retrievers/_ratelimit.py`: per-publisher token
       bucket using `asyncio.Lock` + monotonic timestamps.
-- [ ] `src/litspectraits/retrievers/wiley.py`: `wiley-tdm` shim,
+- [x] `src/litspectraits/retrievers/wiley.py`: `wiley-tdm` shim,
       scoped `_patched_env` forwarding `WILEY_TDM_TOKEN` →
       `TDM_API_TOKEN`, post-download magic-byte sniff (defense in depth).
-- [ ] `src/litspectraits/retrievers/springer.py`:
+- [x] `src/litspectraits/retrievers/springer.py`:
       `TDMAPI.search(q=f'doi:{doi}', p=1, s=1, is_premium=True)` shim,
       single-record assertion, `save_xml(response, tmp_path)` into our
       `tmp_dir`.
-- [ ] `src/litspectraits/retrievers/elsevier.py`: **raw `httpx`** to
+- [x] `src/litspectraits/retrievers/elsevier.py`: **raw `httpx`** to
       `/content/article/doi/{doi}?view=FULL`, `lxml` entitlement check
       against `<full-text-retrieval-response>`, distinct exits for
       `EntitlementDowngradeError` vs `MissingCredentialError` vs
       `AuthRejectedError`.
-- [ ] `src/litspectraits/retrievers/dispatch.py`: `Publisher → Retriever`
+- [x] `src/litspectraits/retrievers/dispatch.py`: `Publisher → Retriever`
       table.
-- [ ] Per-retriever tests: `MissingCredentialError`, `AuthRejectedError`,
+- [x] Per-retriever tests: `MissingCredentialError`, `AuthRejectedError`,
       success path (Wiley + Springer SDKs monkeypatched; Elsevier via
       `respx`).
-- [ ] `tests/retrievers/test_ratelimit.py`: timing assertion that the
+- [x] `tests/retrievers/test_ratelimit.py`: timing assertion that the
       bucket throttles to its configured rate.
 
-### Step 7 — Ingest orchestrator (§17.7)
+### Step 7 — Ingest orchestrator (§17.7, done)
 
-- [ ] Create `src/litspectraits/ingest.py`: the five-step happy path
+- [x] Create `src/litspectraits/ingest.py`: the five-step happy path
       from §0; DOI bound via `structlog.contextvars` at the top of
       `ingest()`.
-- [ ] Cache-hit short-circuit gated on `--cache-hit-ok` (§10); default
+- [x] Cache-hit short-circuit gated on `--cache-hit-ok` (§10); default
       refetches.
-- [ ] Tests: cache-hit short-circuit fires only when flag set; one
+- [x] Tests: cache-hit short-circuit fires only when flag set; one
       success integration per publisher; one representative loud-failure
       per `IngestError` subclass.
 
@@ -1034,30 +1047,116 @@ path is sha256-keyed, not `(doi, sha256)`-keyed — pre-existing v3
 quirk surfaced by sideload), and S8-5 (sniff-first / idempotency-
 before-CrossRef ordering).
 
-### Step 9 — CLI + doctor (§17.9, §12)
+### Step 9 — CLI + doctor (§17.9, §12, done)
 
-- [ ] Rewrite `src/litspectraits/cli.py`: `ingest`, `extract`,
+- [x] Rewrite `src/litspectraits/cli.py`: `ingest`, `extract`,
       `sideload`, `doctor`, `show` Typer commands; class-specific exit
       codes (§14); Rich error panel on every `IngestError` subclass;
       `--json` outputs for `ingest` and `show`.
-- [ ] Create `src/litspectraits/doctor.py`: egress-IP check via
+- [x] Create `src/litspectraits/doctor.py`: egress-IP check via
       `api.ipify.org`; per-publisher creds smoke test against hard-coded
       OA test DOIs; Rich table render; exit 0 on all-green or no-creds,
       exit 1 on configured-creds-failed.
-- [ ] Golden-output test for the `doctor` table render.
+- [x] Golden-output test for the `doctor` table render.
 
 ### Step 10 — Extraction (§17.10, §11)
 
-- [ ] `src/litspectraits/extract/_dispatch.py`: format → extractor.
-- [ ] `src/litspectraits/extract/pdf.py`: `docling`, `asyncio.to_thread`
-      bridged, writes `documents/<sha>/document.json` + `meta.json`.
-- [ ] `src/litspectraits/extract/jats.py`: `lxml`-based section /
-      paragraph / table / reference parser.
+Six-commit sequence. Each ends green on `uv run pytest`, `uv run ruff
+check`, `uv run pyright`. PDF side is spec'd in detail in
+`docs/extract-pdf-plan.md` (authoritative for `extract/pdf.py` + the
+docling-specific doctor extension; subordinate to this doc). The
+plan-doc's §10 ordering is the interior of 10b plus the PDF slices of
+10a, 10e, and 10f; cross-referenced inline below.
+
+**10a — Extract bootstrap.** No format implementations; everything
+compiles and `_dispatch.py` raises loud `NotImplementedError` on every
+leg.
+
+- [ ] `src/litspectraits/errors.py`: full `ExtractError` taxonomy per
+      `extract-pdf-plan.md` §5 (`DoclingImportError`,
+      `WrongFormatForExtractorError`, `MissingArtifactError`,
+      `DoclingConversionError`, `DoclingDegradedError`,
+      `EmptyDocumentError`, `ParseDegradedError`,
+      `SerializationError`, `IntegrityError`). Context-dict
+      constructors mirroring `IngestError`.
+- [ ] `src/litspectraits/manifest.py`: add `ExtractRecord` frozen
+      struct (`sha`, `extractor`, `extractor_version`, `extracted_at`,
+      `n_*` counters) + cattrs hooks.
+- [ ] `src/litspectraits/extract/__init__.py` +
+      `extract/_dispatch.py`: three-way match on `record.format`; all
+      three legs raise `NotImplementedError`.
+- [ ] Tests: each `ExtractError` instantiates with DOI;
+      `ExtractRecord` JSON round-trip; `_dispatch` raises
+      `NotImplementedError` for each `Format`.
+
+**10b — PDF extractor.** Wires PDF leg of `_dispatch.py`; the biggest
+single piece. Interior order in `extract-pdf-plan.md` §10.
+
+- [ ] `src/litspectraits/extract/pdf.py`: six-stage pipeline
+      (`extract-pdf-plan.md` §3) — preflight → convert → structural
+      sanity → serialize → commit. Lazy `import docling`,
+      `asyncio.to_thread`, `_build_converter()` per
+      `extract-pdf-plan.md` §4 with `do_ocr=False`,
+      `TableFormerMode.ACCURATE`, `do_cell_matching=True`.
+      Module-level `FLOOR_CHARS`, `MIN_TEXT_BLOCKS`, `MIN_PAGES` with
+      one-line "why."
+- [ ] Synthetic 1-page PDF fixture
+      (`tests/fixtures/pdf/synthetic.pdf`: one heading, one paragraph,
+      one 2×2 table).
+- [ ] Tests: happy path writes both files with expected `meta.json`
+      counts; `WrongFormatForExtractorError` on a JATS record;
+      `EmptyDocumentError` on a text-stripped PDF; `IntegrityError` on
+      re-extract without flag; `--reextract` overwrites cleanly.
+
+**10c — JATS extractor.** Wires JATS leg.
+
+- [ ] `src/litspectraits/extract/jats.py`: `lxml`-based parser emitting
+      sections / paragraphs / tables / references dict. No
+      cross-publisher normalization (§11 defers).
+- [ ] Small JATS fixture trimmed to one section + one table + one ref.
+- [ ] Happy-path test: structural counts + spot-checks on section path
+      and table cells.
+
+**10d — Elsevier extractor.** Wires Elsevier leg; `_dispatch.py` now
+fully covered.
+
 - [ ] `src/litspectraits/extract/elsevier.py`: `lxml`-based parser for
-      Elsevier's full-text envelope; emit dict shape similar to JATS so
-      downstream callers stay mostly publisher-agnostic.
-- [ ] One real-fixture test per extractor (synthetic PDF, small JATS
-      sample, small Elsevier-XML sample).
+      `<full-text-retrieval-response>` / `<originalText>` /
+      `<xocs:doc>`. Emit a JATS-shaped dict so downstream stays mostly
+      publisher-agnostic.
+- [ ] Small Elsevier-XML fixture.
+- [ ] Happy-path test mirroring 10c plus a defensive test that a
+      META_ABS envelope (no `<originalText>`) raises — same shape that
+      `EntitlementDowngradeError` rejects upstream, pinned here too as
+      defense-in-depth.
+
+**10e — CLI `extract` command.** Makes the work user-visible
+end-to-end. Lands after 10b/10c/10d so the command works for every
+`Format` from the first commit.
+
+- [ ] `cli.py extract <doi-or-sha> [--reextract]`: look up
+      `AcquisitionRecord` (via `store.find_by_doi` or sha lookup),
+      dispatch through `extract/_dispatch.py`.
+- [ ] Rich error panel per `ExtractError` subclass with class-specific
+      exit codes from `extract-pdf-plan.md` §5 (2 / 4 / 6 / 7).
+- [ ] `--json` output for the resulting `ExtractRecord` (parity with
+      `ingest` / `show`).
+- [ ] Golden-output test for at least one error panel; happy-path CLI
+      smoke against the synthetic fixture.
+
+**10f — Doctor docling extension.** Lands per `extract-pdf-plan.md`
+§8.
+
+- [ ] `doctor.py`: `check_docling_extra`, `check_docling_models`,
+      `check_accelerator`, `maybe_download_models`,
+      `maybe_smoke_extract`.
+- [ ] `cli.py doctor`: `--download-models / --no-download-models`
+      (default off), `--smoke-extract / --no-smoke-extract` (default
+      off).
+- [ ] Extended golden-output test for the doctor table with the new
+      "Component" rows; verify exit-code policy (extra-missing ⇒ exit
+      0; configured + required model missing + no `--download-models`
+      ⇒ exit 1).
 
 ### Step 11 (optional) — Batch ingest
 
