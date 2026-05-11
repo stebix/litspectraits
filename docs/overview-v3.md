@@ -1238,19 +1238,44 @@ now fully covered.
       foreshadows this revisit "after 10d when all three concretes
       exist." Cheap follow-up commit; not blocking 10e / 10f.
 
-**10e — CLI `extract` command.** Makes the work user-visible
-end-to-end. Lands after 10b/10c/10d so the command works for every
-`Format` from the first commit.
+**10e — CLI `extract` command (done).** Makes the work user-visible
+end-to-end; works for every `Format` from the first commit because it
+sits on top of the dispatcher landed in 10a.
 
-- [ ] `cli.py extract <doi-or-sha> [--reextract]`: look up
-      `AcquisitionRecord` (via `store.find_by_doi` or sha lookup),
-      dispatch through `extract/_dispatch.py`.
-- [ ] Rich error panel per `ExtractError` subclass with class-specific
-      exit codes from `extract-pdf-plan.md` §5 (2 / 4 / 6 / 7).
-- [ ] `--json` output for the resulting `ExtractRecord` (parity with
-      `ingest` / `show`).
-- [ ] Golden-output test for at least one error panel; happy-path CLI
-      smoke against the synthetic fixture.
+- [x] `cli.py extract <doi-or-sha> [--reextract] [--json]`: DOI vs sha
+      disambiguation by anchored regex (`^[0-9a-f]{64}$` → sha, else
+      DOI). Sha path goes through `store.read_manifest`; DOI path
+      through `normalize` + `store.find_by_doi`. Sha-not-on-disk and
+      DOI-not-in-index both surface as exit 1 with a one-line "not in
+      local store" hint on stderr — same shape as `litspectraits show`.
+      Invalid DOI exits 2 (mirrors `ingest` / `show`).
+- [x] Rich error panel per `ExtractError` subclass via the generalized
+      `_render_error_panel(exc, *, console, hints)` — same renderer
+      now serves both error trees (they share `.doi` + `.context` and
+      are inheritance-disjoint, so one function with a tree-specific
+      hints dict handles both). Class-specific exit codes from
+      `extract-pdf-plan.md` §5 (2 / 4 / 6 / 7); `MalformedDocumentError`
+      (landed in 10c, post-dating §5's original table) added to the
+      exit-6 bucket alongside `EmptyDocumentError` / `ParseDegradedError`
+      / `SerializationError` since they share the "parsed but
+      structural sanity failed" semantics.
+- [x] `--json` parity with `ingest --json`: emits the unstructured
+      :class:`ExtractRecord` on stdout with `doi` injected at the top
+      level (ExtractRecord itself is keyed by sha to align with
+      `documents/<sha>/`; injecting the doi keeps `jq` pipelines
+      self-contained).
+- [x] Tests (`tests/test_cli.py`, 19 new cases): happy path text +
+      JSON; `--reextract` flag wiring asserted via a captured-kwargs
+      stub; sha-lookup path exercised end-to-end (sha argument →
+      `read_manifest` → dispatcher); missing-DOI and missing-sha both
+      pin exit 1 with a `not in local store` stderr message; invalid
+      DOI exits 2; parametrized exit-code matrix across all ten
+      `ExtractError` subclasses (config = 2, conversion = 4,
+      malformed-output = 6, integrity = 7); golden-output panel for
+      `EmptyDocumentError` pins class-name title + DOI row + context
+      key/values + class-level fallback hint; complementary test pins
+      that per-call `context['hint']` wins over the class default
+      (the contract that lets extractors override hints per call site).
 
 **10f — Doctor docling extension.** Lands per `extract-pdf-plan.md`
 §8.

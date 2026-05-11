@@ -334,7 +334,7 @@ under the entry rather than rewriting history.
 
 ---
 
-## Step 10d — Elsevier extractor (committed TBD, 2026-05-11)
+## Step 10d — Elsevier extractor (committed 999e234, 2026-05-11)
 
 ### E10d-1 — META_ABS rejection uses `MalformedDocumentError`, not `EmptyDocumentError`
 
@@ -446,3 +446,83 @@ under the entry rather than rewriting history.
   `extract/_lxml_helpers.py` (xpath/text helpers) and probably
   `extract/_commit.py` (per-format commit machinery parametrized
   by a `_build_meta` callback).
+
+---
+
+## Step 10e — CLI `extract` command (committed TBD, 2026-05-11)
+
+### E10e-1 — `MalformedDocumentError` exit code is 6 (added to §5 matrix)
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/cli.py` — `_EXTRACT_EXIT_CODES`;
+  cross-ref `docs/extract-pdf-plan.md` §5 (the canonical exit-code
+  table for the extract tree).
+- **Decision:** `MalformedDocumentError` maps to exit 6, sharing the
+  "malformed output" bucket with `EmptyDocumentError`,
+  `ParseDegradedError`, and `SerializationError`. The §5 table
+  predates the 10c commit — when §5 was written the docling-only
+  extractor taxonomy had no malformed-document class. 10c added it
+  for JATS / Elsevier; 10e is the first commit that has to assign an
+  exit code.
+- **Why:** `MalformedDocumentError` fires when "artifact passed
+  magic-byte sniff but failed structural parse" — the artifact
+  reached the extractor but the structure we needed wasn't there.
+  Same semantic shape as `EmptyDocumentError` (parse-time success,
+  structural insufficiency at the next layer). Exit 6 =
+  "malformed-output" is the natural bucket.
+- **Revisit when:** `docs/extract-pdf-plan.md` §5's table should be
+  updated to mention `MalformedDocumentError` explicitly. Single-
+  line doc edit; not blocking on it.
+
+### E10e-2 — Shared `_render_error_panel` across both error trees
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/cli.py` — `_render_error_panel(exc:
+  IngestError | ExtractError, *, console, hints)`.
+- **Decision:** one rendering function, parameterized by a `hints`
+  dict, handles both `IngestError` and `ExtractError` panels. The
+  two trees are inheritance-disjoint and share the
+  `.doi: str` + `.context: dict[str, object]` attribute shape, so
+  the rendering logic is identical. Per-tree hints maps
+  (`_INGEST_HINTS` / `_EXTRACT_HINTS`) are passed at the call site.
+  One `# type: ignore[arg-type]` lives at the dict lookup because
+  pyright can't prove cross-tree disjointness statically.
+- **Why:** the alternative is two near-identical rendering functions
+  (~25 lines each, diverging only on which hints dict they
+  reference). Sharing keeps the panel-format contract in one
+  place — a future "add a Rich emoji prefix per exit-code bucket"
+  change touches one site instead of two. The `# type: ignore` is
+  the trade for the cross-tree dict lookup; alternatives (Protocol,
+  Union dict type) cost more.
+- **Revisit when:** the two trees' panel formats diverge in a
+  non-cosmetic way (e.g. extract panels start carrying a "re-run
+  with" suggestion that ingest panels don't). At that point split
+  the function; until then, the shared one is fine.
+
+### E10e-3 — `MissingArtifactError` exit code is 2 (config bucket), not 1 (store miss)
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/cli.py` —
+  `_EXTRACT_EXIT_CODES[MissingArtifactError] = 2`; cross-ref
+  `docs/extract-pdf-plan.md` §5.
+- **Decision:** the plan-doc §5 table puts `MissingArtifactError`
+  in the config bucket (exit 2) alongside `DoclingImportError` and
+  `WrongFormatForExtractorError`. The CLI follows that. Operator-
+  conceptually it could read as "the store reference is broken"
+  (exit 1, what `show`'s missing-DOI case uses), but we follow the
+  spec.
+- **Why:** §5 is specific. The class fires when the artifact path
+  resolves to a non-existent file — distinct from the "record
+  absent from the index" case the CLI resolver handles upstream
+  (which *does* exit 1 with a `not in local store` message). The
+  `MissingArtifactError` case is "we have a manifest pointing at a
+  file that's gone", typically because the operator wiped the
+  store between ingest and extract; that's a "fix your config /
+  re-run ingest" failure, not a "the index says no" failure. Exit
+  2 reads correctly under that framing.
+- **Revisit when:** never expected — kept for audit. If a
+  downstream pipeline starts branching on exit codes and finds the
+  2-vs-1 split confusing, the right move is making the CLI
+  resolver catch `FileNotFoundError` from `read_manifest` and emit
+  exit 1 with a "manifest exists but artifact is gone" hint,
+  leaving exit 2 for the truly-config-shaped failures.

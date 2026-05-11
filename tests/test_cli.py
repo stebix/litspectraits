@@ -30,18 +30,30 @@ from litspectraits.doctor import (
 )
 from litspectraits.errors import (
     AuthRejectedError,
+    DoclingConversionError,
+    DoclingDegradedError,
+    DoclingImportError,
     DOINotFoundError,
+    EmptyDocumentError,
     EntitlementDowngradeError,
+    ExtractIntegrityError,
     IntegrityError,
     MalformedArtifactError,
+    MalformedDocumentError,
+    MissingArtifactError,
     MissingCredentialError,
+    ParseDegradedError,
     PublisherAPIError,
     RateLimitExhaustedError,
+    SerializationError,
     UnsupportedPublisherError,
+    WrongFormatForExtractorError,
 )
 from litspectraits.manifest import (
     AcquisitionRecord,
     CrossRefMetadata,
+    Extractor,
+    ExtractRecord,
     Format,
     Publisher,
     converter,
@@ -140,9 +152,7 @@ def _patch_ingest(
     monkeypatch.setattr('litspectraits.cli.run_ingest', _async_stub)
 
 
-def _patch_ingest_to_raise(
-    monkeypatch: pytest.MonkeyPatch, exc: BaseException
-) -> None:
+def _patch_ingest_to_raise(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
     async def _async_stub(*args: object, **kwargs: object) -> AcquisitionRecord:
         raise exc
 
@@ -231,9 +241,7 @@ def test_ingest_passes_cache_hit_ok_to_orchestrator(
             2,
         ),
         (
-            lambda doi: MissingCredentialError(
-                doi=doi, publisher='wiley', hint='set token'
-            ),
+            lambda doi: MissingCredentialError(doi=doi, publisher='wiley', hint='set token'),
             2,
         ),
         (
@@ -241,15 +249,11 @@ def test_ingest_passes_cache_hit_ok_to_orchestrator(
             4,
         ),
         (
-            lambda doi: EntitlementDowngradeError(
-                doi=doi, publisher='elsevier', hint='META_ABS'
-            ),
+            lambda doi: EntitlementDowngradeError(doi=doi, publisher='elsevier', hint='META_ABS'),
             4,
         ),
         (
-            lambda doi: RateLimitExhaustedError(
-                doi=doi, publisher='wiley', attempts=3
-            ),
+            lambda doi: RateLimitExhaustedError(doi=doi, publisher='wiley', attempts=3),
             5,
         ),
         (
@@ -292,9 +296,7 @@ def test_ingest_exit_codes_per_error_class(
     assert exc_factory(doi).__class__.__name__ in result.stderr
 
 
-def test_ingest_invalid_doi_exits_2(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ingest_invalid_doi_exits_2(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     # Don't even patch the orchestrator — InvalidDOIError fires inside
     # ``normalize`` long before run_ingest is called.
     result = runner.invoke(app, ['ingest', 'not a doi'])
@@ -316,9 +318,7 @@ def _patch_sideload(
     monkeypatch.setattr('litspectraits.cli.run_sideload', _async_stub)
 
 
-def _patch_sideload_to_raise(
-    monkeypatch: pytest.MonkeyPatch, exc: BaseException
-) -> None:
+def _patch_sideload_to_raise(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
     async def _async_stub(*args: object, **kwargs: object) -> AcquisitionRecord:
         raise exc
 
@@ -527,9 +527,7 @@ def test_sideload_exit_codes_per_error_class(
     assert exc_factory(doi).__class__.__name__ in result.stderr
 
 
-def test_sideload_invalid_doi_exits_2(
-    runner: CliRunner, sideload_pdf: Path
-) -> None:
+def test_sideload_invalid_doi_exits_2(runner: CliRunner, sideload_pdf: Path) -> None:
     """A non-DOI shape is rejected with Invalid DOI panel."""
     result = runner.invoke(
         app,
@@ -539,9 +537,7 @@ def test_sideload_invalid_doi_exits_2(
     assert 'Invalid DOI' in result.stderr
 
 
-def test_sideload_missing_pdf_path_typer_exit(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_sideload_missing_pdf_path_typer_exit(runner: CliRunner, tmp_path: Path) -> None:
     """Typer's path-existence check rejects nonexistent paths before us.
 
     The Typer/Click error message goes to stderr with exit code 2.
@@ -554,9 +550,7 @@ def test_sideload_missing_pdf_path_typer_exit(
     assert result.exit_code == 2
 
 
-def test_sideload_missing_license_flag_typer_exit(
-    runner: CliRunner, sideload_pdf: Path
-) -> None:
+def test_sideload_missing_license_flag_typer_exit(runner: CliRunner, sideload_pdf: Path) -> None:
     """``--license`` is mandatory; Typer rejects when omitted."""
     result = runner.invoke(
         app,
@@ -570,9 +564,7 @@ def test_sideload_missing_license_flag_typer_exit(
 # ---------------------------------------------------------------------------
 
 
-def test_show_text_mode_renders_record_when_present(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_show_text_mode_renders_record_when_present(runner: CliRunner, tmp_path: Path) -> None:
     record = _example_record()
     store = ArtifactStore(tmp_path)
     # Plant the manifest + index entry directly so show() finds them.
@@ -599,9 +591,7 @@ def test_show_text_mode_renders_record_when_present(
     assert record.sha256 in result.stdout
 
 
-def test_show_json_mode_emits_record_payload(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_show_json_mode_emits_record_payload(runner: CliRunner, tmp_path: Path) -> None:
     record = _example_record()
     store = ArtifactStore(tmp_path)
     store.manifest_path(record.sha256).parent.mkdir(parents=True, exist_ok=True)
@@ -651,9 +641,7 @@ def test_show_invalid_doi_exits_2(runner: CliRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_doctor_all_green_exits_0(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_doctor_all_green_exits_0(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     report = DoctorReport(
         ip_check=IPCheck(
             status=IPStatus.OK,
@@ -777,9 +765,7 @@ def smoke_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root.mkdir()
 
     def _scoped() -> Path:
-        return Path(
-            _real_tempfile.mkdtemp(prefix='litspectraits-smoke-', dir=str(root))
-        )
+        return Path(_real_tempfile.mkdtemp(prefix='litspectraits-smoke-', dir=str(root)))
 
     monkeypatch.setattr('litspectraits.cli._make_smoke_dir', _scoped)
     return root
@@ -896,3 +882,323 @@ def test_smoke_invalid_doi_exits_2_and_preserves_tempdir(
     remaining = _smoke_dirs(smoke_root)
     assert len(remaining) == 1
     assert 'preserved smoke data_dir for inspection' in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# extract
+# ---------------------------------------------------------------------------
+
+
+def _example_extract_record(*, sha256: str = 'a' * 64) -> ExtractRecord:
+    return ExtractRecord(
+        sha256=sha256,
+        extractor=Extractor.DOCLING,
+        extractor_version='docling 2.0.0',
+        extracted_at=datetime(2026, 5, 11, 13, 0, 0, tzinfo=UTC),
+        n_text_blocks=217,
+        n_section_headers=9,
+        n_tables=4,
+        n_figures=5,
+        char_count=38421,
+        n_pages=12,
+    )
+
+
+def _plant_record(record: AcquisitionRecord, *, store: ArtifactStore) -> None:
+    """Plant the manifest + index entry so the CLI can look the record up.
+
+    Mirrors what the show tests do: write the manifest JSON and append
+    the by-doi index line. The artifact bytes themselves are not needed —
+    the CLI's extract command never reads them; the (mocked) dispatcher
+    does, and we mock at the dispatcher boundary.
+    """
+    store.manifest_path(record.sha256).parent.mkdir(parents=True, exist_ok=True)
+    store.manifest_path(record.sha256).write_text(
+        json.dumps(converter.unstructure(record), indent=2)
+    )
+    with store.index_path.open('a', encoding='utf-8') as fp:
+        fp.write(
+            json.dumps(
+                {
+                    'doi': record.doi,
+                    'sha256': record.sha256,
+                    'format': record.format.value,
+                    'added_at': '2026-05-10T12:00:00+00:00',
+                }
+            )
+            + '\n'
+        )
+
+
+def _patch_extract(
+    monkeypatch: pytest.MonkeyPatch, behaviour: Callable[..., ExtractRecord]
+) -> None:
+    """Replace ``cli``-bound ``run_extract`` with an async stub."""
+
+    async def _async_stub(*args: object, **kwargs: object) -> ExtractRecord:
+        return behaviour(*args, **kwargs)
+
+    monkeypatch.setattr('litspectraits.cli.run_extract', _async_stub)
+
+
+def _patch_extract_to_raise(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
+    async def _async_stub(*args: object, **kwargs: object) -> ExtractRecord:
+        raise exc
+
+    monkeypatch.setattr('litspectraits.cli.run_extract', _async_stub)
+
+
+def test_extract_text_mode_renders_record_panel(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
+
+    result = runner.invoke(app, ['extract', record.doi])
+    assert result.exit_code == 0
+    # Key fields rendered on stdout via the Rich table.
+    assert record.doi in result.stdout
+    assert extract_record.sha256 in result.stdout
+    assert Extractor.DOCLING.value in result.stdout
+    # Comma-formatted counts (matches the `{n:,}` rendering).
+    assert '38,421' in result.stdout
+
+
+def test_extract_json_mode_emits_machine_readable_payload(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
+
+    result = runner.invoke(app, ['extract', '--json', record.doi])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    # DOI is injected at the top level (parity with `ingest --json`).
+    assert payload['doi'] == record.doi
+    # Stripping the injected DOI must leave a clean ExtractRecord payload.
+    payload.pop('doi')
+    assert converter.structure(payload, ExtractRecord) == extract_record
+
+
+def test_extract_passes_reextract_flag_through_dispatch(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin --reextract → run_extract(reextract=True) wiring."""
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    captured: dict[str, object] = {}
+
+    async def _async_stub(*args: object, **kwargs: object) -> ExtractRecord:
+        captured['args'] = args
+        captured['kwargs'] = kwargs
+        return extract_record
+
+    monkeypatch.setattr('litspectraits.cli.run_extract', _async_stub)
+
+    result = runner.invoke(app, ['extract', '--reextract', record.doi])
+    assert result.exit_code == 0
+    assert captured['kwargs'] == {'reextract': True}
+
+
+def test_extract_by_sha256_resolves_via_read_manifest(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 64-char hex argument routes through ``store.read_manifest``, not ``find_by_doi``.
+
+    The fixture record has DOI ``10.1002/mrm.27973`` but we pass only the
+    sha — verifying the regex-driven dispatch by checking the CLI still
+    succeeds even though no DOI was given.
+    """
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
+
+    result = runner.invoke(app, ['extract', record.sha256])
+    assert result.exit_code == 0
+    assert record.sha256 in result.stdout
+
+
+def test_extract_missing_doi_exits_1(runner: CliRunner) -> None:
+    """A DOI absent from the local index must exit 1 with a friendly stderr.
+
+    Mirrors ``show``'s contract: no traceback, no Rich error panel — just
+    a one-line "not in local store" hint and the exit code that scripts
+    can branch on.
+    """
+    result = runner.invoke(app, ['extract', '10.1002/never.ingested'])
+    assert result.exit_code == 1
+    assert 'not in local store' in result.stderr
+
+
+def test_extract_missing_sha_exits_1(runner: CliRunner) -> None:
+    """A sha with no manifest on disk surfaces ``FileNotFoundError`` cleanly."""
+    result = runner.invoke(app, ['extract', 'b' * 64])
+    assert result.exit_code == 1
+    assert 'not in local store' in result.stderr
+    assert 'sha256=' in result.stderr
+
+
+def test_extract_invalid_doi_exits_2(runner: CliRunner) -> None:
+    """Non-sha, non-DOI input exits 2 — same shape as ingest/show.
+
+    Spaces in the argument disqualify it from the sha regex (anchored
+    ``^[0-9a-f]{64}$``) so it falls through to ``normalize``, which
+    raises :class:`InvalidDOIError`.
+    """
+    result = runner.invoke(app, ['extract', 'not a doi'])
+    assert result.exit_code == 2
+    assert 'Invalid DOI' in result.stderr
+
+
+@pytest.mark.parametrize(
+    ('exc_factory', 'expected_code'),
+    [
+        # Configuration / dispatch — exit 2.
+        (
+            lambda doi: DoclingImportError(doi=doi, hint='install [extract] extra'),
+            2,
+        ),
+        (
+            lambda doi: WrongFormatForExtractorError(
+                doi=doi, expected='pdf', actual='jats_xml', extractor='docling'
+            ),
+            2,
+        ),
+        (
+            lambda doi: MissingArtifactError(
+                doi=doi, sha256='a' * 64, artifact_path='/gone', hint='re-ingest'
+            ),
+            2,
+        ),
+        # Conversion failures — exit 4.
+        (
+            lambda doi: DoclingConversionError(doi=doi, status='FAILURE'),
+            4,
+        ),
+        (
+            lambda doi: DoclingDegradedError(doi=doi, status='PARTIAL_SUCCESS'),
+            4,
+        ),
+        # Malformed output — exit 6.
+        (
+            lambda doi: EmptyDocumentError(doi=doi, n_text_blocks=0, n_sections=0),
+            6,
+        ),
+        (
+            lambda doi: MalformedDocumentError(doi=doi, hint='META_ABS envelope'),
+            6,
+        ),
+        (
+            lambda doi: ParseDegradedError(doi=doi, char_count=10, floor=400),
+            6,
+        ),
+        (
+            lambda doi: SerializationError(doi=doi, error='unjsonable payload'),
+            6,
+        ),
+        # Integrity — exit 7.
+        (
+            lambda doi: ExtractIntegrityError(
+                doi=doi,
+                sha256='a' * 64,
+                existing_document_sha256='e' * 64,
+                incoming_document_sha256='f' * 64,
+            ),
+            7,
+        ),
+    ],
+)
+def test_extract_exit_codes_per_error_class(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Callable[[str], Exception],
+    expected_code: int,
+) -> None:
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract_to_raise(monkeypatch, exc_factory(record.doi))
+
+    result = runner.invoke(app, ['extract', record.doi])
+    assert result.exit_code == expected_code
+    # Class name appears in the Rich error panel on stderr.
+    assert exc_factory(record.doi).__class__.__name__ in result.stderr
+
+
+def test_extract_error_panel_renders_class_name_doi_and_class_hint(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Golden-output check for the Rich error panel.
+
+    Asserts the four panel invariants:
+
+    1. The exception class name appears in the panel title.
+    2. The DOI is rendered as a key/value row.
+    3. Every context key/value is rendered (excluding ``hint``, which
+       lives in its own row).
+    4. When ``context['hint']`` is absent, the class-level fallback
+       hint from ``_EXTRACT_HINTS`` is rendered instead — so the
+       operator never sees an empty hint row.
+    """
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    exc = EmptyDocumentError(
+        doi=record.doi,
+        n_text_blocks=0,
+        n_sections=0,
+        extractor='docling',
+    )
+    _patch_extract_to_raise(monkeypatch, exc)
+
+    result = runner.invoke(app, ['extract', record.doi])
+    assert result.exit_code == 6
+    # 1: class title.
+    assert 'EmptyDocumentError' in result.stderr
+    # 2: DOI row.
+    assert record.doi in result.stderr
+    # 3: every non-hint context entry.
+    assert 'n_text_blocks' in result.stderr
+    assert 'n_sections' in result.stderr
+    assert 'extractor' in result.stderr
+    # 4: class-level fallback hint (matches ``_EXTRACT_HINTS[EmptyDocumentError]``).
+    assert 'scanned PDF served without OCR' in result.stderr
+
+
+def test_extract_error_panel_uses_context_hint_when_present(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-call ``context['hint']`` wins over the class default.
+
+    This is the contract that lets retrievers / extractors override the
+    operator hint per call site (e.g. the JATS bodyless hint is
+    different from the PDF empty-OCR hint, both of which surface as
+    :class:`EmptyDocumentError`).
+    """
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    exc = EmptyDocumentError(
+        doi=record.doi,
+        n_text_blocks=0,
+        n_sections=2,
+        hint='custom per-call hint about a JATS bodyless envelope',
+    )
+    _patch_extract_to_raise(monkeypatch, exc)
+
+    result = runner.invoke(app, ['extract', record.doi])
+    assert result.exit_code == 6
+    assert 'custom per-call hint about a JATS bodyless envelope' in result.stderr
+    # The class-default hint must not also be rendered.
+    assert 'scanned PDF served without OCR' not in result.stderr
