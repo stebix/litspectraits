@@ -43,6 +43,26 @@ class Publisher(StrEnum):
     SPRINGER_NATURE = 'springer_nature'
 
 
+class Extractor(StrEnum):
+    """Extraction implementation identifier (§11, ``extract-pdf-plan.md`` §6).
+
+    One-to-one with :class:`Format` today:
+
+    - :attr:`DOCLING` ↔ :attr:`Format.PDF`
+    - :attr:`JATS` ↔ :attr:`Format.JATS_XML`
+    - :attr:`ELSEVIER` ↔ :attr:`Format.ELSEVIER_XML`
+
+    Recorded explicitly on :class:`ExtractRecord` (rather than derived from
+    ``format`` at read time) so a future PDF-extractor swap — e.g.
+    docling → some alternative — only changes this value, leaving the
+    schema shape and the ``documents/<sha>/`` layout untouched.
+    """
+
+    DOCLING = 'docling'
+    JATS = 'jats'
+    ELSEVIER = 'elsevier'
+
+
 @frozen
 class CrossRefMetadata:
     """CrossRef-derived bibliographic metadata for a DOI (§6).
@@ -170,6 +190,62 @@ class AcquisitionRecord:
     byte_size: int
     origin: Literal['auto', 'manual']
     manual_provenance: ManualProvenance | None
+
+
+@frozen
+class ExtractRecord:
+    """In-memory result of a successful extraction (§11, ``extract-pdf-plan.md`` §7).
+
+    Returned by :func:`litspectraits.extract.extract` and the per-format
+    extractors. The persisted form is ``documents/<sha>/meta.json`` next to
+    the canonical ``document.json``; this record itself is not separately
+    serialized (no ``manifests/...extract.json`` file). Round-tripping it
+    through :data:`converter` is supported and used by tests to pin the
+    schema shape.
+
+    Attributes
+    ----------
+    sha256 : str
+        SHA-256 of the *source* artifact, matching
+        :attr:`AcquisitionRecord.sha256`. The directory ``documents/<sha>/``
+        is keyed on this value, so extract outputs co-locate with the
+        artifact they describe.
+    extractor : Extractor
+    extractor_version : str
+        Free-form version string for the underlying implementation library
+        (e.g. ``'docling 2.x.y'``). Mirrors :attr:`AcquisitionRecord.sdk_version`
+        in shape and intent.
+    extracted_at : datetime
+        Tz-aware UTC timestamp of the commit. Producers must pass
+        ``datetime.now(tz=UTC)``; the converter does not coerce naive
+        datetimes (same invariant as :class:`AcquisitionRecord.fetched_at`).
+    n_text_blocks : int
+    n_section_headers : int
+        May legitimately be zero for review articles and short
+        communications with flat structure
+        (``extract-pdf-plan.md`` §3 stage 3).
+    n_tables : int
+    n_figures : int
+    char_count : int
+        Total characters across all text blocks. The threshold for
+        :class:`~litspectraits.errors.ParseDegradedError` is checked
+        against this value during PDF extraction.
+    n_pages : int | None
+        Page count for PDF; ``None`` for JATS and Elsevier XML, which
+        carry no page concept post-typesetting. The asymmetry is encoded
+        in the type rather than papered over with ``0``.
+    """
+
+    sha256: str
+    extractor: Extractor
+    extractor_version: str
+    extracted_at: datetime
+    n_text_blocks: int
+    n_section_headers: int
+    n_tables: int
+    n_figures: int
+    char_count: int
+    n_pages: int | None
 
 
 def _build_converter() -> Converter:

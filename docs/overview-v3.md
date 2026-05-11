@@ -1072,22 +1072,38 @@ plan-doc's §10 ordering is the interior of 10b plus the PDF slices of
 compiles and `_dispatch.py` raises loud `NotImplementedError` on every
 leg.
 
-- [ ] `src/litspectraits/errors.py`: full `ExtractError` taxonomy per
+- [x] `src/litspectraits/errors.py`: full `ExtractError` taxonomy per
       `extract-pdf-plan.md` §5 (`DoclingImportError`,
       `WrongFormatForExtractorError`, `MissingArtifactError`,
       `DoclingConversionError`, `DoclingDegradedError`,
       `EmptyDocumentError`, `ParseDegradedError`,
-      `SerializationError`, `IntegrityError`). Context-dict
-      constructors mirroring `IngestError`.
-- [ ] `src/litspectraits/manifest.py`: add `ExtractRecord` frozen
-      struct (`sha`, `extractor`, `extractor_version`, `extracted_at`,
-      `n_*` counters) + cattrs hooks.
-- [ ] `src/litspectraits/extract/__init__.py` +
+      `SerializationError`, `ExtractIntegrityError`). Context-dict
+      constructors mirroring `IngestError`. (`IntegrityError` in the
+      plan-doc became `ExtractIntegrityError` to avoid a collision with
+      the existing ingest-side `IntegrityError`; both error trees stay
+      inheritance-disjoint so CLI panel dispatch pattern-matches each
+      pipeline stage independently.)
+- [x] `src/litspectraits/manifest.py`: add `Extractor` StrEnum
+      (`docling` / `jats` / `elsevier`) and `ExtractRecord` frozen
+      struct (`sha256`, `extractor`, `extractor_version`,
+      `extracted_at`, `n_text_blocks`, `n_section_headers`, `n_tables`,
+      `n_figures`, `char_count`, `n_pages: int | None`). `n_pages` is
+      optional because JATS and Elsevier XML have no page concept. The
+      existing module-level `converter` round-trips it via the same
+      datetime hooks already in place.
+- [x] `src/litspectraits/extract/__init__.py` +
       `extract/_dispatch.py`: three-way match on `record.format`; all
-      three legs raise `NotImplementedError`.
-- [ ] Tests: each `ExtractError` instantiates with DOI;
-      `ExtractRecord` JSON round-trip; `_dispatch` raises
-      `NotImplementedError` for each `Format`.
+      three legs raise `NotImplementedError` with breadcrumbs naming
+      the future step that lands each leg.
+- [x] Tests: each `ExtractError` and `IngestError` subclass
+      instantiates with DOI + context, with cross-tree disjointness
+      pinned by a parametrized `isinstance` check (`tests/test_errors.py`,
+      52 cases). `ExtractRecord` JSON round-trip — PDF (`n_pages` set)
+      and XML (`n_pages=None`) — in `tests/test_manifest.py`. `_dispatch`
+      raises `NotImplementedError` for each `Format` with the named
+      step in the message, plus an exhaustiveness guard against new
+      `Format` values landing without an extractor leg
+      (`tests/extract/test_dispatch.py`).
 
 **10b — PDF extractor.** Wires PDF leg of `_dispatch.py`; the biggest
 single piece. Interior order in `extract-pdf-plan.md` §10.
@@ -1105,8 +1121,9 @@ single piece. Interior order in `extract-pdf-plan.md` §10.
       one 2×2 table).
 - [ ] Tests: happy path writes both files with expected `meta.json`
       counts; `WrongFormatForExtractorError` on a JATS record;
-      `EmptyDocumentError` on a text-stripped PDF; `IntegrityError` on
-      re-extract without flag; `--reextract` overwrites cleanly.
+      `EmptyDocumentError` on a text-stripped PDF;
+      `ExtractIntegrityError` on re-extract without flag;
+      `--reextract` overwrites cleanly.
 
 **10c — JATS extractor.** Wires JATS leg.
 

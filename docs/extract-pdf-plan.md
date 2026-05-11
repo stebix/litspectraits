@@ -146,7 +146,7 @@ ExtractRequest(record: AcquisitionRecord, store: ArtifactStore)
  ▼
 [5. commit]         ── os.replace(tmp_path → documents/<sha>/document.json)
  │                     write meta.json atomically next to it
- │                       ↘ IntegrityError (existing document.json bytes differ AND --reextract not set)
+ │                       ↘ ExtractIntegrityError (existing document.json bytes differ AND --reextract not set)
  │
  ▼
 ExtractRecord
@@ -247,7 +247,7 @@ concurrent extractions on the same sha do not collide on tmp paths
 even if (somehow) two ingests of the same DOI arrive in parallel.
 
 Re-extract semantics: if `documents/<sha>/document.json` already
-exists and the new bytes differ, raise `IntegrityError` unless
+exists and the new bytes differ, raise `ExtractIntegrityError` unless
 `--reextract` was passed at the CLI level. The flag is the explicit
 "yes, I know I am overwriting." This mirrors the §3 / §10 stance
 that silent overwrites are never acceptable.
@@ -346,7 +346,7 @@ class ParseDegradedError(ExtractError): ...        # char_count < FLOOR_CHARS
 
 # Commit
 class SerializationError(ExtractError): ...
-class IntegrityError(ExtractError): ...            # existing document.json differs, no --reextract
+class ExtractIntegrityError(ExtractError): ...            # existing document.json differs, no --reextract
 ```
 
 ### Exit codes
@@ -364,7 +364,7 @@ malformed-output, 7 = integrity):
 | `EmptyDocumentError` | 6 |
 | `ParseDegradedError` | 6 |
 | `SerializationError` | 6 |
-| `IntegrityError` | 7 |
+| `ExtractIntegrityError` | 7 |
 
 ## 6. Output shapes
 
@@ -600,7 +600,7 @@ normalisation yet — deferred per §11).
 1. **`errors.py` additions.** Add the full `ExtractError` taxonomy
    from §5 — not just PDF-specific classes, so JATS and Elsevier can
    reuse `MissingArtifactError`, `WrongFormatForExtractorError`,
-   `IntegrityError`, etc. when their commits land. No logic —
+   `ExtractIntegrityError`, etc. when their commits land. No logic —
    context-dict constructors mirroring the `IngestError` shape (DOI +
    context attrs). Tests: each error class instantiates cleanly with
    a DOI; `str(exc)` is useful.
@@ -624,7 +624,7 @@ normalisation yet — deferred per §11).
    (writes both files, `meta.json` has expected counts);
    `WrongFormatForExtractorError` on a JATS record;
    `EmptyDocumentError` via a PDF stripped of text; re-extract
-   overwrite without `--reextract` raises `IntegrityError`; with
+   overwrite without `--reextract` raises `ExtractIntegrityError`; with
    `--reextract` overwrites cleanly.
 
 ### Inside 10e — CLI wiring
@@ -657,7 +657,7 @@ normalisation yet — deferred per §11).
   cross-device reruns (CPU → GPU) may produce different bbox
   numbers in the third decimal. We document this as a known shape
   and accept that re-extraction across heterogeneous machines may
-  flag `IntegrityError` requiring `--reextract`. The append-only
+  flag `ExtractIntegrityError` requiring `--reextract`. The append-only
   measurement model downstream is robust to this — measurements
   carry their `extractor_version` and the agents reconcile.
 - **TableFormer accurate mode is materially slower than fast

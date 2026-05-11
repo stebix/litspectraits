@@ -7,6 +7,8 @@ from pathlib import Path
 from litspectraits.manifest import (
     AcquisitionRecord,
     CrossRefMetadata,
+    Extractor,
+    ExtractRecord,
     Format,
     ManualProvenance,
     Publisher,
@@ -145,3 +147,52 @@ def test_acquisition_record_unstructured_is_json_serializable() -> None:
     text = json.dumps(raw)
     reloaded = json.loads(text)
     assert converter.structure(reloaded, AcquisitionRecord) == record
+
+
+def test_extractor_enum_values_are_canonical_strings() -> None:
+    assert Extractor.DOCLING.value == 'docling'
+    assert Extractor.JATS.value == 'jats'
+    assert Extractor.ELSEVIER.value == 'elsevier'
+
+
+def _extract_record(*, n_pages: int | None) -> ExtractRecord:
+    return ExtractRecord(
+        sha256='c' * 64,
+        extractor=Extractor.DOCLING if n_pages is not None else Extractor.JATS,
+        extractor_version='docling 2.5.0' if n_pages is not None else 'lxml 5.3.0',
+        extracted_at=datetime(2026, 5, 11, 10, 0, 0, tzinfo=UTC),
+        n_text_blocks=217,
+        n_section_headers=9,
+        n_tables=4,
+        n_figures=5,
+        char_count=38421,
+        n_pages=n_pages,
+    )
+
+
+def test_extract_record_pdf_roundtrip_preserves_n_pages() -> None:
+    record = _extract_record(n_pages=12)
+    raw = converter.unstructure(record)
+    assert raw['extractor'] == 'docling'
+    assert raw['n_pages'] == 12
+    assert raw['extracted_at'].startswith('2026-05-11T10:00:00')
+    assert converter.structure(raw, ExtractRecord) == record
+
+
+def test_extract_record_xml_roundtrip_keeps_n_pages_none() -> None:
+    """JATS / Elsevier records have no page concept; ``n_pages`` must
+    round-trip as ``None`` rather than be coerced to ``0``."""
+    record = _extract_record(n_pages=None)
+    raw = converter.unstructure(record)
+    assert raw['extractor'] == 'jats'
+    assert raw['n_pages'] is None
+    assert converter.structure(raw, ExtractRecord) == record
+
+
+def test_extract_record_is_json_serializable() -> None:
+    """``meta.json`` is the persisted form; the unstructured dict must
+    survive ``json.dumps`` / ``json.loads`` without custom encoders."""
+    record = _extract_record(n_pages=12)
+    raw = converter.unstructure(record)
+    reloaded = json.loads(json.dumps(raw))
+    assert converter.structure(reloaded, ExtractRecord) == record
