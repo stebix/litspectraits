@@ -1105,25 +1105,53 @@ leg.
       `Format` values landing without an extractor leg
       (`tests/extract/test_dispatch.py`).
 
-**10b — PDF extractor.** Wires PDF leg of `_dispatch.py`; the biggest
-single piece. Interior order in `extract-pdf-plan.md` §10.
+**10b — PDF extractor (done).** Wires PDF leg of `_dispatch.py`; the
+biggest single piece. Interior order in `extract-pdf-plan.md` §10.
 
-- [ ] `src/litspectraits/extract/pdf.py`: six-stage pipeline
+- [x] `src/litspectraits/extract/pdf.py`: six-stage pipeline
       (`extract-pdf-plan.md` §3) — preflight → convert → structural
-      sanity → serialize → commit. Lazy `import docling`,
-      `asyncio.to_thread`, `_build_converter()` per
-      `extract-pdf-plan.md` §4 with `do_ocr=False`,
-      `TableFormerMode.ACCURATE`, `do_cell_matching=True`.
-      Module-level `FLOOR_CHARS`, `MIN_TEXT_BLOCKS`, `MIN_PAGES` with
-      one-line "why."
+      sanity → serialize → commit. Lazy `import docling` behind
+      `_load_docling`, `asyncio.to_thread` for the conversion call, the
+      `_build_converter()` settings folded inline per
+      `extract-pdf-plan.md` §4 (`do_ocr=False`, `TableFormerMode.ACCURATE`,
+      `do_cell_matching=True`, `AcceleratorDevice.AUTO`). Module-level
+      `FLOOR_CHARS`, `MIN_TEXT_BLOCKS`, `MIN_PAGES` carry the one-line
+      "why" comment the plan-doc asks for. PDF leg of `_dispatch.py`
+      flipped from `NotImplementedError` to `extract_pdf`. The
+      ``meta.json`` ``pipeline.device`` field probes ``torch`` to record
+      the *resolved* accelerator (cuda / mps / cpu) rather than the
+      configured ``'auto'`` so an operator can spot CPU fallback without
+      running doctor.
+- [x] `ArtifactStore.document_dir(sha256)` helper added so the
+      extractor and any future reader share one source of truth for the
+      `documents/<sha256>/` layout. Constructor lazy-creates
+      `documents/` alongside `artifacts/` / `manifests/` / `index/` /
+      `tmp/`.
 - [ ] Synthetic 1-page PDF fixture
       (`tests/fixtures/pdf/synthetic.pdf`: one heading, one paragraph,
-      one 2×2 table).
-- [ ] Tests: happy path writes both files with expected `meta.json`
-      counts; `WrongFormatForExtractorError` on a JATS record;
-      `EmptyDocumentError` on a text-stripped PDF;
-      `ExtractIntegrityError` on re-extract without flag;
-      `--reextract` overwrites cleanly.
+      one 2×2 table). **Deferred to 10f**: with the unit tests faking
+      docling via `_load_docling` (same idiom as the wiley / springer
+      SDK fakes), no real PDF parsing happens in the per-step green-bar
+      gate. The fixture matters once `doctor --smoke-extract` (10f) and
+      Step 12's gated end-to-end smoke run docling for real; landing it
+      now would be dead weight.
+- [x] Tests (`tests/extract/test_pdf.py`, 16 cases): happy path writes
+      both files with the expected `meta.json` counts;
+      `WrongFormatForExtractorError` on a JATS record;
+      `MissingArtifactError` on a record whose artifact_path does not
+      exist; `DoclingImportError` via `sys.modules['docling'] = None`
+      (the only test that exercises the unmocked import code);
+      `DoclingConversionError` on `FAILURE`; `DoclingDegradedError` on
+      `PARTIAL_SUCCESS`; `EmptyDocumentError` on zero text blocks;
+      `ParseDegradedError` below `FLOOR_CHARS`; flat-structure warning
+      via `structlog.testing.capture_logs`; `SerializationError` on both
+      `export_to_dict()` raising and an unjsonable payload;
+      idempotent re-extract with identical bytes leaves both files
+      mtime-stable; `ExtractIntegrityError` on diverging re-extract
+      without `--reextract`; `--reextract` overwrites cleanly.
+      `tests/extract/test_dispatch.py` updated: PDF leg now pinned to
+      route through `extract_pdf` (with positional record/store +
+      keyword `reextract`); JATS / Elsevier breadcrumbs still asserted.
 
 **10c — JATS extractor.** Wires JATS leg.
 

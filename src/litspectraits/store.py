@@ -4,6 +4,7 @@ Layout under :attr:`Settings.data_dir`::
 
     artifacts/{pdf,jats,elsevier}/sha256/<aa>/<sha>.<ext>
     manifests/sha256/<aa>/<sha>.manifest.json
+    documents/<sha256>/{document.json,meta.json}
     index/by_doi.jsonl
     tmp/                   # cleared on init
 
@@ -11,9 +12,16 @@ The format directory under ``artifacts/`` doubles as the disambiguator
 between JATS and Elsevier XML (both ``.xml``); ``<aa>`` is the first two
 hex characters of the sha256 (one-level sharding).
 
+``documents/`` is keyed on the *artifact* sha256 so an extraction always
+co-locates with the bytes it describes. It is intentionally **not** sharded
+— the population is bounded by the artifact population (one extraction per
+artifact, append-only) and one-level-deeper directories already gives
+filesystems an easy enumerate.
+
 Atomic ``os.replace`` from ``tmp/`` to the canonical path is non-negotiable
 (§3): a half-written ``.part`` file must never be visible at the canonical
-location.
+location. Extract outputs follow the same discipline (``extract-pdf-plan.md``
+§3 stage 5).
 """
 
 import json
@@ -69,11 +77,17 @@ class ArtifactStore:
         self.data_dir = data_dir
         self._artifacts_dir = data_dir / 'artifacts'
         self._manifests_dir = data_dir / 'manifests'
+        self._documents_dir = data_dir / 'documents'
         self._index_dir = data_dir / 'index'
         self._tmp_dir = data_dir / 'tmp'
         self._index_path = self._index_dir / _INDEX_FILENAME
 
-        for path in (self._artifacts_dir, self._manifests_dir, self._index_dir):
+        for path in (
+            self._artifacts_dir,
+            self._manifests_dir,
+            self._documents_dir,
+            self._index_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
         self._reset_tmp()
@@ -109,6 +123,15 @@ class ArtifactStore:
         """Absolute path of the manifest JSON for ``sha256``."""
         shard = sha256[:_SHARD_PREFIX_LEN]
         return self._manifests_dir / 'sha256' / shard / f'{sha256}.manifest.json'
+
+    def document_dir(self, sha256: str) -> Path:
+        """Absolute path of the per-artifact extract output directory.
+
+        The directory itself is not created here — extractors lazy-create
+        it on commit so a query for an un-extracted artifact does not
+        leave an empty dir behind.
+        """
+        return self._documents_dir / sha256
 
     def commit(self, *, src: Path, record: AcquisitionRecord) -> Path:
         """Atomically install ``src`` and persist ``record``.

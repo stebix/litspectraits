@@ -1,14 +1,14 @@
-"""Tests for :mod:`litspectraits.extract._dispatch` (step 10a bootstrap).
+"""Tests for :mod:`litspectraits.extract._dispatch`.
 
 The dispatcher itself does very little — it only routes on
-:attr:`AcquisitionRecord.format`. Until 10b/10c/10d land their leaf
-extractors, every leg raises :class:`NotImplementedError`. These tests
-pin that wiring so a future commit that swaps in a real extractor can do
-so one format at a time without breaking the others.
+:attr:`AcquisitionRecord.format`. Step 10a stubbed every leg as
+:class:`NotImplementedError` with operator-visible breadcrumbs; step 10b
+wired the PDF leg through to :func:`~litspectraits.extract.pdf.extract_pdf`
+so the JATS / Elsevier breadcrumbs are the only ones still asserted here.
 
-The asserted message text is part of the contract because step 10a
-intentionally leaves operator-visible breadcrumbs naming the future step
-that will land each leg ('lands in step 10b', etc.).
+The asserted breadcrumb text is part of the contract — operators reading
+``litspectraits extract`` against an XML record should see the
+"lands in step 10c/10d" hint.
 """
 
 from datetime import UTC, datetime
@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+import litspectraits.extract._dispatch as dispatch_mod
+from litspectraits.errors import MissingArtifactError
 from litspectraits.extract import extract
 from litspectraits.manifest import (
     AcquisitionRecord,
@@ -64,12 +66,11 @@ def store(tmp_path: Path) -> ArtifactStore:
 @pytest.mark.parametrize(
     ('fmt', 'publisher', 'expected_step'),
     [
-        (Format.PDF, Publisher.WILEY, '10b'),
         (Format.JATS_XML, Publisher.SPRINGER_NATURE, '10c'),
         (Format.ELSEVIER_XML, Publisher.ELSEVIER, '10d'),
     ],
 )
-async def test_dispatch_raises_not_implemented_per_format(
+async def test_xml_branches_still_raise_not_implemented(
     fmt: Format, publisher: Publisher, expected_step: str, store: ArtifactStore
 ) -> None:
     record = _acquisition_record(fmt=fmt, publisher=publisher)
@@ -78,17 +79,60 @@ async def test_dispatch_raises_not_implemented_per_format(
     assert expected_step in str(excinfo.value)
 
 
-async def test_dispatch_accepts_reextract_kwarg(store: ArtifactStore) -> None:
-    """``reextract`` is the only keyword arg the dispatch exposes today.
+async def test_pdf_branch_routes_through_extract_pdf(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PDF leg is wired (step 10b); pin the call shape so the dispatch
+    contract (positional record + store, keyword reextract) does not drift.
+    """
+    captured: dict[str, object] = {}
 
-    The leaf extractors will consume it in 10b/c/d. Pinning the keyword
-    here means a future signature drift (e.g. renaming to
-    ``--overwrite``) is caught at the dispatch layer rather than per
-    extractor.
+    async def _fake_extract_pdf(
+        record: AcquisitionRecord, store: ArtifactStore, *, reextract: bool = False
+    ) -> object:
+        captured['record'] = record
+        captured['store'] = store
+        captured['reextract'] = reextract
+        return 'sentinel-extract-record'
+
+    monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fake_extract_pdf)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+    result = await extract(record, store, reextract=True)
+    assert result == 'sentinel-extract-record'
+    assert captured['record'] is record
+    assert captured['store'] is store
+    assert captured['reextract'] is True
+
+
+async def test_pdf_branch_default_reextract_is_false(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_extract_pdf(
+        record: AcquisitionRecord, store: ArtifactStore, *, reextract: bool = False
+    ) -> object:
+        captured['reextract'] = reextract
+        return None
+
+    monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fake_extract_pdf)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+    await extract(record, store)
+    assert captured['reextract'] is False
+
+
+async def test_pdf_branch_propagates_missing_artifact_error(
+    store: ArtifactStore,
+) -> None:
+    """End-to-end: dispatch → real ``extract_pdf`` → preflight error.
+
+    Picks the cheapest preflight failure (the artifact path under
+    ``store.data_dir`` does not exist) so the dispatch wiring is exercised
+    against the real PDF extractor without needing docling.
     """
     record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
-    with pytest.raises(NotImplementedError):
-        await extract(record, store, reextract=True)
+    with pytest.raises(MissingArtifactError):
+        await extract(record, store)
 
 
 def test_dispatch_branches_cover_every_format() -> None:
