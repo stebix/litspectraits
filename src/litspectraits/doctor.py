@@ -1,6 +1,7 @@
-"""Operator preflight diagnostic (``docs/overview-v3.md`` §12).
+"""Operator preflight diagnostic (``docs/overview-v3.md`` §12,
+``docs/extract-pdf-plan.md`` §8).
 
-Two checks, both read-only:
+Three checks, all read-only by default:
 
 1. **Egress IP** — GET ``https://api.ipify.org/?format=json``. Compared
    against ``Settings.expected_egress_cidrs``: empty allow-list → warn
@@ -15,6 +16,15 @@ Two checks, both read-only:
    :class:`AuthRejectedError`, :class:`EntitlementDowngradeError`, etc.
    The staged file is discarded on success — doctor never touches the
    real artifact store.
+3. **Extract components** (``extract-pdf-plan.md`` §8) — probe the
+   ``[extract]`` extra, the docling model cache, and the accelerator
+   ``AcceleratorDevice.AUTO`` will resolve to. Two opt-ins ride on top
+   of this section: ``--download-models`` runs
+   :func:`docling.utils.model_downloader.download_models` for the
+   required layout + TableFormer weights, and ``--smoke-extract`` runs
+   a live docling conversion against the packaged synthetic fixture.
+   Both side-effects are off by default — plain ``doctor`` stays
+   read-only and network-free for the extract section.
 
 Doctor is split into a pure :func:`run_doctor` returning a
 :class:`DoctorReport` value object and a separate :func:`render` that
@@ -22,20 +32,23 @@ emits the Rich table. The split keeps the table render trivially
 golden-testable and makes ``doctor`` re-usable from non-CLI contexts
 (e.g. a future scheduled health-check).
 
-Exit-code semantics live in :mod:`litspectraits.cli` per §12: exit 0
-when every configured credential smoke-tested green (or no credentials
-configured at all); exit 1 when any configured credential failed its
-smoke test. The IP allow-list is observability-only — even a definite
-mismatch never flips the exit code on its own. Rationale: an operator
-running doctor from a laptop with the VPN down still wants to see the
-per-publisher rows.
+Exit-code semantics live in :mod:`litspectraits.cli` per §12 +
+``extract-pdf-plan.md`` §8: exit 0 when every configured credential
+smoke-tested green (or no credentials configured) and every *required*
+extract component is present (or the extra itself is not installed);
+exit 1 otherwise. The IP allow-list is observability-only — even a
+definite mismatch never flips the exit code on its own. Rationale: an
+operator running doctor from a laptop with the VPN down still wants to
+see the per-publisher rows.
 """
 
 import asyncio
 import ipaddress
 import tempfile
+import time
 from collections.abc import Iterable
 from enum import StrEnum
+from importlib import metadata, resources
 from pathlib import Path
 from typing import Final
 
@@ -43,6 +56,7 @@ import httpx
 import structlog
 from attrs import frozen
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from litspectraits._smoke_dois import SMOKE_DOI
@@ -50,11 +64,18 @@ from litspectraits.config import Settings
 from litspectraits.errors import (
     AuthRejectedError,
     EntitlementDowngradeError,
+    ExtractError,
     IngestError,
     MissingCredentialError,
 )
-from litspectraits.manifest import CrossRefMetadata, Publisher
+from litspectraits.manifest import (
+    AcquisitionRecord,
+    CrossRefMetadata,
+    Format,
+    Publisher,
+)
 from litspectraits.retrievers.dispatch import retriever_for
+from litspectraits.store import ArtifactStore
 
 _IPIFY_URL: Final = 'https://api.ipify.org/'
 
@@ -87,6 +108,28 @@ class CredStatus(StrEnum):
     OTHER_FAILURE = 'other_failure'
 
 
+class ExtractStatus(StrEnum):
+    """Per-component status row for the extract section.
+
+    Heterogeneous on purpose: the device-name labels (``CUDA``/``MPS``/
+    ``CPU``) double as both status and display label so the
+    accelerator row reads naturally in the rendered table without a
+    second status→label mapping. Required-vs-optional semantics are
+    encoded on the row, not in the status itself — ``OFF`` means
+    "deliberately disabled" (e.g. OCR), while ``MISSING`` means "we
+    asked for it and it's not there" (e.g. layout weights).
+    """
+
+    OK = 'ok'
+    NOT_INSTALLED = 'not_installed'
+    MISSING = 'missing'
+    OFF = 'off'
+    CUDA = 'cuda'
+    MPS = 'mps'
+    CPU = 'cpu'
+    SKIPPED = 'skipped'
+
+
 @frozen
 class IPCheck:
     """Outcome of the egress-IP probe."""
@@ -108,25 +151,69 @@ class CredCheck:
 
 
 @frozen
+class ExtractComponentCheck:
+    """One row in the extract-section table (``extract-pdf-plan.md`` §8).
+
+    ``required`` is the displayed string ('yes' / 'no' / 'auto'); the
+    boolean intent lives in :attr:`is_required` so the exit-code
+    decision is a single attribute lookup without re-parsing the
+    display string.
+    """
+
+    component: str
+    required: str
+    is_required: bool
+    status: ExtractStatus
+    detail: str
+
+
+@frozen
+class ExtractReport:
+    """Aggregate of the extract-section rows.
+
+    :attr:`has_required_failure` is the contract for the CLI's exit-code
+    logic: True when the ``[extract]`` extra **is** installed and at
+    least one required component (layout model, TableFormer, opted-in
+    smoke convert) is missing or failed. False when the extra is not
+    installed at all — the extract section is opt-in
+    (``extract-pdf-plan.md`` §8 "exit code unaffected").
+    """
+
+    components: tuple[ExtractComponentCheck, ...]
+    has_required_failure: bool
+
+
+@frozen
 class DoctorReport:
-    """Aggregate report (one IP probe + one row per publisher).
+    """Aggregate report (IP probe + per-publisher rows + extract section).
 
     ``ok`` is the contract for the CLI's exit-code logic: True when no
     *configured* credential failed (status in ``OK`` or
-    ``NOT_CONFIGURED``); False otherwise. The IP check is excluded from
-    ``ok`` per the §12 rationale (allow-list mismatches are
-    observability-only).
+    ``NOT_CONFIGURED``) and no *required* extract component is missing;
+    False otherwise. The IP check is excluded from ``ok`` per the §12
+    rationale (allow-list mismatches are observability-only).
+
+    :attr:`extract_check` defaults to ``None`` to preserve callers that
+    construct a :class:`DoctorReport` without exercising the extract
+    section (the existing test layer; future non-CLI consumers can
+    follow the same pattern). :func:`run_doctor` always populates it
+    when invoked through the CLI.
     """
 
     ip_check: IPCheck
     cred_checks: tuple[CredCheck, ...]
+    extract_check: ExtractReport | None = None
 
     @property
     def ok(self) -> bool:
-        return all(
+        creds_ok = all(
             check.status in (CredStatus.OK, CredStatus.NOT_CONFIGURED)
             for check in self.cred_checks
         )
+        extract_ok = (
+            self.extract_check is None or not self.extract_check.has_required_failure
+        )
+        return creds_ok and extract_ok
 
 
 # ---------------------------------------------------------------------------
@@ -134,18 +221,55 @@ class DoctorReport:
 # ---------------------------------------------------------------------------
 
 
-async def run_doctor(*, settings: Settings, client: httpx.AsyncClient) -> DoctorReport:
-    """Execute both preflight checks and return a :class:`DoctorReport`.
+async def run_doctor(
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    download_models: bool = False,
+    smoke_extract: bool = False,
+    fixture_path: Path | None = None,
+) -> DoctorReport:
+    """Execute every preflight check and return a :class:`DoctorReport`.
 
     Network calls happen here (ipify + one publisher smoke fetch per
-    configured credential). Pure-data return value; rendering is
+    configured credential, plus optional model downloads when
+    ``download_models=True``). Pure-data return value; rendering is
     :func:`render`'s job.
+
+    Parameters
+    ----------
+    settings, client
+        Standard handles threaded through from the CLI.
+    download_models : bool, default False
+        Opt-in: when set, run
+        :func:`docling.utils.model_downloader.download_models` for the
+        required layout + TableFormer weights before reporting model
+        presence. A multi-GB download — never the default
+        (``extract-pdf-plan.md`` §8).
+    smoke_extract : bool, default False
+        Opt-in: when set, run a live docling conversion against
+        ``fixture_path`` (defaulting to the packaged synthetic PDF)
+        and report wall-clock + verbatim docling error on failure.
+    fixture_path : Path, optional
+        Override for the smoke-convert input. Tests use this to point
+        at synthetic fixtures; operators normally rely on the packaged
+        default.
     """
-    ip_check, cred_checks = await asyncio.gather(
+    ip_check, cred_checks, extract_check = await asyncio.gather(
         _check_egress_ip(client=client, settings=settings),
         _check_all_publishers(client=client, settings=settings),
+        _check_extract_section(
+            settings=settings,
+            download_models=download_models,
+            smoke_extract=smoke_extract,
+            fixture_path=fixture_path,
+        ),
     )
-    return DoctorReport(ip_check=ip_check, cred_checks=cred_checks)
+    return DoctorReport(
+        ip_check=ip_check,
+        cred_checks=cred_checks,
+        extract_check=extract_check,
+    )
 
 
 async def _check_egress_ip(*, client: httpx.AsyncClient, settings: Settings) -> IPCheck:
@@ -296,7 +420,7 @@ async def _smoke_fetch(
         )
 
 
-def _summarize(exc: IngestError) -> str:
+def _summarize(exc: IngestError | ExtractError) -> str:
     """Compact one-line error summary for the table cell.
 
     Renders the most useful context fields if present; otherwise falls
@@ -309,6 +433,445 @@ def _summarize(exc: IngestError) -> str:
         if value is not None:
             return f'{type(exc).__name__}: {key}={value}'
     return type(exc).__name__
+
+
+# ---------------------------------------------------------------------------
+# Extract section (``extract-pdf-plan.md`` §8)
+# ---------------------------------------------------------------------------
+#
+# Five row producers and one orchestrator. Each row producer returns a
+# single :class:`ExtractComponentCheck` (or a list, in the case of the
+# model-presence check which emits one row per required model). All
+# docling / torch imports are local to the function bodies so an
+# operator without the ``[extract]`` extra installed can still run
+# ``doctor`` without seeing a stray ``ImportError`` in the traceback.
+
+# Component labels mirror the ``extract-pdf-plan.md`` §8 mock table
+# verbatim — operators grep these strings.
+_COMPONENT_EXTRA: Final = 'docling[extract]'
+_COMPONENT_LAYOUT: Final = 'layout model'
+_COMPONENT_TABLEFORMER: Final = 'TableFormer'
+_COMPONENT_ACCEL: Final = 'accelerator'
+_COMPONENT_OCR: Final = 'OCR engines'
+_COMPONENT_SMOKE: Final = 'smoke convert'
+
+# Packaged fixture used by ``doctor --smoke-extract``. Lives under
+# ``src/litspectraits/_fixtures/`` (not ``tests/``) so the bytes ship in
+# the wheel and a pip-installed operator can still run the smoke convert
+# without checking out the repo.
+_FIXTURE_PACKAGE: Final = 'litspectraits._fixtures'
+_FIXTURE_FILENAME: Final = 'synthetic.pdf'
+
+
+async def _check_extract_section(
+    *,
+    settings: Settings,
+    download_models: bool,
+    smoke_extract: bool,
+    fixture_path: Path | None,
+) -> ExtractReport:
+    """Orchestrate the §8 checks; return a single :class:`ExtractReport`.
+
+    Short-circuits when the ``[extract]`` extra isn't installed: only
+    the extra-row is emitted, ``has_required_failure`` stays False
+    (extra is opt-in), and ``--download-models`` / ``--smoke-extract``
+    are silently no-ops on that path. Operators who explicitly asked
+    for those flags get a deterministic "you need the extra first"
+    table row rather than a stray :class:`ImportError`.
+
+    Model-presence checks run before the optional download so the
+    initial state is recorded; after a successful download we re-probe
+    so the final table reflects on-disk truth, not the pre-download
+    state.
+    """
+    extra_row = _check_docling_extra()
+    if extra_row.status is ExtractStatus.NOT_INSTALLED:
+        rows: list[ExtractComponentCheck] = [extra_row]
+        if download_models or smoke_extract:
+            rows.append(
+                ExtractComponentCheck(
+                    component=_COMPONENT_SMOKE if smoke_extract else _COMPONENT_LAYOUT,
+                    required='no',
+                    is_required=False,
+                    status=ExtractStatus.SKIPPED,
+                    detail='skipped — [extract] extra not installed',
+                )
+            )
+        return ExtractReport(components=tuple(rows), has_required_failure=False)
+
+    if download_models:
+        # Synchronous, multi-GB I/O; off the event loop.
+        await asyncio.to_thread(_maybe_download_models, force=False)
+
+    model_rows = _check_docling_models()
+    accel_row = _check_accelerator()
+    ocr_row = _check_ocr_engines()
+
+    rows = [extra_row, *model_rows, accel_row, ocr_row]
+
+    if smoke_extract:
+        resolved_fixture = fixture_path or _packaged_fixture_path()
+        smoke_row = await _maybe_smoke_extract(
+            fixture_path=resolved_fixture, settings=settings
+        )
+        rows.append(smoke_row)
+
+    has_required_failure = any(
+        row.is_required and row.status is not ExtractStatus.OK for row in rows
+    )
+    return ExtractReport(components=tuple(rows), has_required_failure=has_required_failure)
+
+
+def _check_docling_extra() -> ExtractComponentCheck:
+    """Probe whether ``[extract]`` is installed; report version on hit."""
+    try:
+        import docling  # noqa: F401  pyright: ignore[reportMissingImports]
+    except ImportError:
+        return ExtractComponentCheck(
+            component=_COMPONENT_EXTRA,
+            required='yes',
+            is_required=False,  # extra is opt-in per §8
+            status=ExtractStatus.NOT_INSTALLED,
+            detail='install with `uv sync --extra extract`',
+        )
+    try:
+        version = metadata.version('docling')
+    except metadata.PackageNotFoundError:  # pragma: no cover — defensive
+        version = 'unknown'
+    return ExtractComponentCheck(
+        component=_COMPONENT_EXTRA,
+        required='yes',
+        is_required=True,
+        status=ExtractStatus.OK,
+        detail=f'docling {version}',
+    )
+
+
+def _check_docling_models() -> list[ExtractComponentCheck]:
+    """Probe the docling model cache for layout + TableFormer presence.
+
+    Existence-and-non-emptiness rather than per-file fingerprinting —
+    docling's HF snapshot layout shifts across releases, and "directory
+    exists with at least one file" is the strongest invariant we can
+    assert without coupling ourselves to a particular weight filename
+    that the next minor bump will rename.
+    """
+    models_root, layout_folder, tableformer_folder = _docling_model_dirs()
+    layout_dir = models_root / layout_folder
+    tableformer_dir = models_root / tableformer_folder
+    return [
+        _model_row(
+            component=_COMPONENT_LAYOUT,
+            cache_dir=layout_dir,
+            ok_hint=f'cached at {layout_dir}',
+            missing_hint=f'missing at {layout_dir} — `litspectraits doctor --download-models`',
+        ),
+        _model_row(
+            component=_COMPONENT_TABLEFORMER,
+            cache_dir=tableformer_dir,
+            ok_hint='accurate mode loaded',
+            missing_hint=(
+                f'missing at {tableformer_dir} — `litspectraits doctor --download-models`'
+            ),
+        ),
+    ]
+
+
+def _model_row(
+    *, component: str, cache_dir: Path, ok_hint: str, missing_hint: str
+) -> ExtractComponentCheck:
+    if cache_dir.is_dir() and any(cache_dir.iterdir()):
+        return ExtractComponentCheck(
+            component=component,
+            required='yes',
+            is_required=True,
+            status=ExtractStatus.OK,
+            detail=ok_hint,
+        )
+    return ExtractComponentCheck(
+        component=component,
+        required='yes',
+        is_required=True,
+        status=ExtractStatus.MISSING,
+        detail=missing_hint,
+    )
+
+
+def _docling_model_dirs() -> tuple[Path, str, str]:
+    """Resolve ``(models_root, layout_folder, tableformer_folder)``.
+
+    Pulls the values from docling's own public-ish APIs rather than
+    hardcoding paths: ``settings.cache_dir / 'models'`` for the root,
+    ``LayoutOptions().model_spec.model_repo_folder`` for layout, and
+    ``TableStructureModel._model_repo_folder`` for TableFormer. The
+    TableFormer accessor is dunder-private inside docling but stable
+    across the 2.x line; we accept that fragility in exchange for not
+    string-duplicating ``'docling-project--docling-models'`` here.
+    """
+    from docling.datamodel.pipeline_options import (  # pyright: ignore[reportMissingImports]
+        LayoutOptions,
+    )
+    from docling.datamodel.settings import (  # pyright: ignore[reportMissingImports]
+        settings as docling_settings,
+    )
+
+    # ``TableStructureModel`` is re-exported into ``model_downloader`` but
+    # pyright flags that as a private-import; we go via the canonical path
+    # and accept that this still depends on the dunder-private folder
+    # attribute, which is stable across the 2.x line. Hardcoding the
+    # string ``'docling-project--docling-models'`` would also work — same
+    # value, no import — but tying it to the symbol means the next
+    # docling bump that renames the repo folder surfaces as an
+    # AttributeError here rather than a silent "models all missing" gate.
+    from docling.models.stages.table_structure.table_structure_model import (  # pyright: ignore[reportMissingImports]
+        TableStructureModel,
+    )
+
+    models_root = Path(docling_settings.cache_dir) / 'models'
+    layout_folder = str(LayoutOptions().model_spec.model_repo_folder)
+    tableformer_folder = str(TableStructureModel._model_repo_folder)
+    return models_root, layout_folder, tableformer_folder
+
+
+def _check_accelerator() -> ExtractComponentCheck:
+    """Probe what ``AcceleratorDevice.AUTO`` will resolve to at extract time.
+
+    Mirrors :func:`litspectraits.extract.pdf._resolve_accelerator_label`
+    by intent but adds a GPU-name hint on CUDA. CPU fallback is
+    deliberately *not* flagged as a required failure — academic-PDF
+    extraction is correct on CPU, only slow.
+    """
+    try:
+        import torch  # pyright: ignore[reportMissingImports]
+    except ImportError:  # pragma: no cover — torch is a docling transitive
+        return ExtractComponentCheck(
+            component=_COMPONENT_ACCEL,
+            required='auto',
+            is_required=False,
+            status=ExtractStatus.CPU,
+            detail='torch not importable; auto will fall back to cpu',
+        )
+    if torch.cuda.is_available():
+        try:
+            name = str(torch.cuda.get_device_name(0))
+        except Exception:  # pragma: no cover — defensive
+            name = 'CUDA device'
+        return ExtractComponentCheck(
+            component=_COMPONENT_ACCEL,
+            required='auto',
+            is_required=False,
+            status=ExtractStatus.CUDA,
+            detail=name,
+        )
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return ExtractComponentCheck(
+            component=_COMPONENT_ACCEL,
+            required='auto',
+            is_required=False,
+            status=ExtractStatus.MPS,
+            detail='Apple Silicon GPU',
+        )
+    return ExtractComponentCheck(
+        component=_COMPONENT_ACCEL,
+        required='auto',
+        is_required=False,
+        status=ExtractStatus.CPU,
+        detail='cpu-only — extraction will be materially slower',
+    )
+
+
+def _check_ocr_engines() -> ExtractComponentCheck:
+    """Static row: v3 pipeline keeps ``do_ocr=False`` so OCR is off.
+
+    Reported as ``OFF`` rather than ``MISSING`` so an operator doesn't
+    chase a phantom "OCR engines not installed" warning when the v3
+    default pipeline doesn't need them (``extract-pdf-plan.md`` §8).
+    """
+    return ExtractComponentCheck(
+        component=_COMPONENT_OCR,
+        required='no',
+        is_required=False,
+        status=ExtractStatus.OFF,
+        detail='do_ocr=False (v3 default; scanned PDFs surface as EmptyDocumentError)',
+    )
+
+
+def _maybe_download_models(*, force: bool) -> None:
+    """Run docling's downloader for the required v3 weights.
+
+    Synchronous; the caller dispatches via :func:`asyncio.to_thread`.
+    Matches the ``with_*`` switches from ``extract-pdf-plan.md`` §8:
+    layout + TableFormer on, everything optional off. ``with_rapidocr``
+    is *not* part of the plan-doc enumeration but defaults to True in
+    docling 2.93 — we pin it False so a doctor run with
+    ``--download-models`` doesn't quietly pull an OCR engine we never
+    use (``extract-pdf-plan.md`` §8 "Required vs optional models").
+    """
+    from docling.utils.model_downloader import (  # pyright: ignore[reportMissingImports]
+        download_models,
+    )
+
+    _logger.info('downloading docling models (layout + tableformer)')
+    download_models(
+        force=force,
+        progress=False,
+        with_layout=True,
+        with_tableformer=True,
+        with_tableformer_v2=False,
+        with_code_formula=False,
+        with_picture_classifier=False,
+        with_smolvlm=False,
+        with_granitedocling=False,
+        with_granitedocling_mlx=False,
+        with_smoldocling=False,
+        with_smoldocling_mlx=False,
+        with_granite_vision=False,
+        with_granite_chart_extraction=False,
+        with_granite_chart_extraction_v4=False,
+        with_rapidocr=False,
+        with_easyocr=False,
+    )
+
+
+async def _maybe_smoke_extract(
+    *, fixture_path: Path, settings: Settings
+) -> ExtractComponentCheck:
+    """Run a live docling conversion against ``fixture_path``; time it.
+
+    Stages the fixture into a throwaway tempdir so doctor remains
+    read-only with respect to the operator's real ``data_dir``. The
+    fixture is sniffed, hashed, written into an
+    :class:`AcquisitionRecord`, and run through
+    :func:`litspectraits.extract.extract_pdf` exactly as the production
+    extractor would. Any :class:`ExtractError` is captured and folded
+    into the row's status / detail; we never let it propagate, because
+    the surrounding ``doctor`` invocation must finish rendering the
+    other rows.
+    """
+    if not fixture_path.is_file():
+        return ExtractComponentCheck(
+            component=_COMPONENT_SMOKE,
+            required='no',
+            is_required=False,
+            status=ExtractStatus.MISSING,
+            detail=f'fixture not found: {fixture_path}',
+        )
+
+    # Local import keeps the docling dependency optional at module load.
+    from litspectraits.extract.pdf import extract_pdf
+
+    with tempfile.TemporaryDirectory(prefix='litspectraits-doctor-smoke-') as td_str:
+        td = Path(td_str)
+        store = ArtifactStore(td)
+        record = _stage_fixture_for_smoke(fixture_path=fixture_path, store=store)
+        start = time.monotonic()
+        try:
+            await extract_pdf(record, store, reextract=False)
+        except ExtractError as exc:
+            return ExtractComponentCheck(
+                component=_COMPONENT_SMOKE,
+                required='no' if not _smoke_required(settings) else 'yes',
+                is_required=False,
+                status=ExtractStatus.MISSING,
+                detail=_summarize(exc),
+            )
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return ExtractComponentCheck(
+            component=_COMPONENT_SMOKE,
+            required='no',
+            is_required=False,
+            status=ExtractStatus.OK,
+            detail=f'{elapsed_ms} ms ({fixture_path.name})',
+        )
+
+
+def _smoke_required(settings: Settings) -> bool:
+    """Reserved hook: ``--smoke-extract`` is informational today.
+
+    Returning False keeps the smoke row out of the exit-code calculus —
+    a slow CPU machine that takes 30 s on synthetic.pdf is still
+    "doctor green." If we ever want to gate releases on the smoke
+    convert succeeding (CI), flip this on a future Settings flag.
+    """
+    del settings
+    return False
+
+
+_SMOKE_DOI: Final = '10.0/doctor-smoke'
+
+
+def _stage_fixture_for_smoke(
+    *, fixture_path: Path, store: ArtifactStore
+) -> AcquisitionRecord:
+    """Copy the fixture into a throwaway store and synthesize a manifest.
+
+    Doctor's smoke-convert needs an :class:`AcquisitionRecord` to feed
+    :func:`extract_pdf`, but we deliberately don't run the full ingest
+    pipeline (no DOI, no CrossRef, no publisher dispatch). The store
+    handle is a real :class:`ArtifactStore` pointed at a tempdir, so
+    nothing about this leaks into the operator's actual ``data_dir``.
+
+    A synthetic DOI prefix (``10.0/``) keeps the fixture-derived
+    manifest out of the polite-pool publisher tables and makes the
+    intent self-evident in any leaked log line.
+    """
+    import hashlib
+    from datetime import UTC, datetime
+
+    from litspectraits.manifest import RetrievePayload
+
+    body = fixture_path.read_bytes()
+    sha256 = hashlib.sha256(body).hexdigest()
+    tmp_path = store.tmp_dir / f'{sha256}.pdf'
+    tmp_path.write_bytes(body)
+    payload = RetrievePayload(
+        sha256=sha256,
+        byte_size=len(body),
+        tmp_path=tmp_path,
+        format=Format.PDF,
+        fetched_url=f'file://{fixture_path}',
+        sdk_version='doctor-smoke',
+    )
+    meta = CrossRefMetadata(
+        doi=_SMOKE_DOI,
+        publisher_str='',
+        title='doctor synthetic fixture',
+        authors=(),
+        year=None,
+        type=None,
+        license=None,
+    )
+    record = AcquisitionRecord(
+        doi=_SMOKE_DOI,
+        sha256=sha256,
+        artifact_path=store.artifact_relpath(sha256, Format.PDF),
+        format=Format.PDF,
+        publisher=Publisher.WILEY,
+        metadata=meta,
+        fetched_url=payload.fetched_url,
+        fetched_at=datetime.now(tz=UTC),
+        fetcher_version='doctor',
+        sdk_version=payload.sdk_version,
+        byte_size=payload.byte_size,
+        origin='auto',
+        manual_provenance=None,
+    )
+    store.commit(src=tmp_path, record=record)
+    return record
+
+
+def _packaged_fixture_path() -> Path:
+    """Resolve the fixture path bundled inside the package.
+
+    Returns the canonical on-disk path via :mod:`importlib.resources`
+    so the call works both from a source checkout and from a
+    pip-installed wheel.
+    """
+    # `as_file` returns a context manager only for zipped resources;
+    # for filesystem packages the underlying Traversable already maps
+    # to a real path. `_fixtures/` lives next to the .py modules in the
+    # wheel layout, so the .files() lookup yields a Path directly.
+    return Path(str(resources.files(_FIXTURE_PACKAGE).joinpath(_FIXTURE_FILENAME)))
 
 
 # ---------------------------------------------------------------------------
@@ -332,16 +895,40 @@ _CRED_STATUS_LABEL: Final[dict[CredStatus, str]] = {
 }
 
 
+# Extract-component status labels intentionally mirror the StrEnum value
+# (with the one underscore replacement). Keeping it explicit rather than
+# a generic ``replace('_', ' ')`` means a future enum addition surfaces
+# as a KeyError in the renderer instead of silently producing a
+# half-formatted label.
+_EXTRACT_STATUS_LABEL: Final[dict[ExtractStatus, str]] = {
+    ExtractStatus.OK: 'ok',
+    ExtractStatus.NOT_INSTALLED: 'not installed',
+    ExtractStatus.MISSING: 'missing',
+    ExtractStatus.OFF: 'off',
+    ExtractStatus.CUDA: 'cuda',
+    ExtractStatus.MPS: 'mps',
+    ExtractStatus.CPU: 'cpu',
+    ExtractStatus.SKIPPED: 'skipped',
+}
+
+
 def render(report: DoctorReport, *, console: Console) -> None:
-    """Render ``report`` as two Rich tables (IP, then per-publisher).
+    """Render ``report`` as Rich tables (IP, publisher, extract).
 
     No styling beyond column / header — keeping the rendering plain so
     the golden-output test in ``test_doctor.py`` does not have to model
     ANSI escape sequences. The CLI layer applies colour separately if
     desired (e.g. coloured row backgrounds keyed off ``status``).
+
+    The extract table is only rendered when ``report.extract_check`` is
+    populated. Callers that construct a :class:`DoctorReport` manually
+    (today, only the tests) can omit it and get the original two-table
+    output.
     """
     console.print(_render_ip_table(report.ip_check))
     console.print(_render_cred_table(report.cred_checks))
+    if report.extract_check is not None:
+        console.print(_render_extract_table(report.extract_check))
 
 
 def _render_ip_table(check: IPCheck) -> Table:
@@ -372,5 +959,26 @@ def _render_cred_table(checks: tuple[CredCheck, ...]) -> Table:
             check.smoke_doi,
             _CRED_STATUS_LABEL[check.status],
             check.detail,
+        )
+    return table
+
+
+def _render_extract_table(report: ExtractReport) -> Table:
+    # Component / detail cells contain ``[extract]`` and other strings
+    # that Rich would otherwise parse as markup tags; escape so the
+    # literal characters render. Required/Status columns are enum-derived
+    # and bracket-free, but we escape uniformly to keep the call site
+    # simple.
+    table = Table(title='Extract components', show_header=True, header_style='bold')
+    table.add_column('Component', no_wrap=True)
+    table.add_column('Required', no_wrap=True)
+    table.add_column('Status', no_wrap=True)
+    table.add_column('Hint')
+    for row in report.components:
+        table.add_row(
+            rich_escape(row.component),
+            rich_escape(row.required),
+            rich_escape(_EXTRACT_STATUS_LABEL[row.status]),
+            rich_escape(row.detail),
         )
     return table

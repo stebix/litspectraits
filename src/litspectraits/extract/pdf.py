@@ -247,13 +247,15 @@ def _load_docling(*, doi: str) -> _DoclingAdapter:
     is exercised by patching ``sys.modules['docling'] = None``.
     """
     try:
+        from docling.datamodel.accelerator_options import (  # pyright: ignore[reportMissingImports]
+            AcceleratorDevice,
+            AcceleratorOptions,
+        )
         from docling.datamodel.base_models import (  # pyright: ignore[reportMissingImports]
             ConversionStatus,
             InputFormat,
         )
         from docling.datamodel.pipeline_options import (  # pyright: ignore[reportMissingImports]
-            AcceleratorDevice,
-            AcceleratorOptions,
             PdfPipelineOptions,
             TableFormerMode,
             TableStructureOptions,

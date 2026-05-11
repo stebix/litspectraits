@@ -27,6 +27,9 @@ from litspectraits.doctor import (
     CredCheck,
     CredStatus,
     DoctorReport,
+    ExtractComponentCheck,
+    ExtractReport,
+    ExtractStatus,
     IPCheck,
     IPStatus,
     render,
@@ -134,6 +137,27 @@ def _mock_ipify(respx_mock: MockRouter, *, ip: str = '203.0.113.5') -> None:
     respx_mock.get('https://api.ipify.org/').mock(
         return_value=httpx.Response(200, json={'ip': ip})
     )
+
+
+@pytest.fixture(autouse=True)
+def mute_extract_section(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default-mute the extract section for the existing IP/cred tests.
+
+    These tests pre-date the §8 extract section and only assert on IP +
+    publisher rows; without this mute they would fail on any dev machine
+    where the docling model cache isn't populated. Tests that *do*
+    exercise the extract section opt out with
+    ``@pytest.mark.extract_real`` so they see the unmuted module.
+    """
+    if request.node.get_closest_marker('extract_real') is not None:
+        return
+
+    async def _no_op(**_kwargs: object) -> ExtractReport:
+        return ExtractReport(components=(), has_required_failure=False)
+
+    monkeypatch.setattr('litspectraits.doctor._check_extract_section', _no_op)
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +592,539 @@ def test_doctor_report_ok_property_logic() -> None:
         ip_check=base_ip, cred_checks=(not_configured, auth_rejected, ok)
     )
     assert report_with_failure.ok is False
+
+
+# ---------------------------------------------------------------------------
+# Extract section (``extract-pdf-plan.md`` §8)
+# ---------------------------------------------------------------------------
+#
+# Two layers, mirroring the IP/cred split above:
+#
+# - Probe-level unit tests for ``_check_docling_extra``,
+#   ``_check_docling_models``, ``_check_accelerator``,
+#   ``_check_ocr_engines``, ``_check_extract_section``: each one stubs
+#   the underlying docling/torch surface so the test does not depend on
+#   real model weights being downloaded.
+# - End-to-end exit-code policy: a full ``run_doctor`` invocation with a
+#   stubbed ``_check_extract_section`` asserts that
+#   ``DoctorReport.ok`` reflects required-failure semantics correctly.
+#
+# A handful of tests bypass the autouse ``mute_extract_section`` fixture
+# by re-monkeypatching ``_check_extract_section`` (or the lower-level
+# probes) — the autouse mute is a default, not a hard floor.
+
+
+def _ok_extract_components(*, with_smoke: bool = False) -> tuple[ExtractComponentCheck, ...]:
+    components = [
+        ExtractComponentCheck(
+            component='docling[extract]',
+            required='yes',
+            is_required=True,
+            status=ExtractStatus.OK,
+            detail='docling 2.93.0',
+        ),
+        ExtractComponentCheck(
+            component='layout model',
+            required='yes',
+            is_required=True,
+            status=ExtractStatus.OK,
+            detail='cached at /tmp/models/layout',
+        ),
+        ExtractComponentCheck(
+            component='TableFormer',
+            required='yes',
+            is_required=True,
+            status=ExtractStatus.OK,
+            detail='accurate mode loaded',
+        ),
+        ExtractComponentCheck(
+            component='accelerator',
+            required='auto',
+            is_required=False,
+            status=ExtractStatus.CUDA,
+            detail='NVIDIA A100',
+        ),
+        ExtractComponentCheck(
+            component='OCR engines',
+            required='no',
+            is_required=False,
+            status=ExtractStatus.OFF,
+            detail='do_ocr=False',
+        ),
+    ]
+    if with_smoke:
+        components.append(
+            ExtractComponentCheck(
+                component='smoke convert',
+                required='no',
+                is_required=False,
+                status=ExtractStatus.OK,
+                detail='318 ms (synthetic.pdf)',
+            )
+        )
+    return tuple(components)
+
+
+def test_check_docling_extra_returns_ok_when_importable() -> None:
+    """The dev venv has ``[extract]`` installed; probe must report OK."""
+    from litspectraits.doctor import _check_docling_extra
+
+    row = _check_docling_extra()
+    assert row.status is ExtractStatus.OK
+    assert row.is_required is True
+    assert row.detail.startswith('docling ')
+
+
+def test_check_docling_extra_returns_not_installed_when_import_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting ``sys.modules['docling'] = None`` triggers the ImportError path.
+
+    Same idiom used in ``test_pdf.py``'s docling-not-installed test —
+    the only way to reach the import-error branch without uninstalling
+    the package from the venv.
+    """
+    import sys
+
+    from litspectraits.doctor import _check_docling_extra
+
+    monkeypatch.setitem(sys.modules, 'docling', None)
+    row = _check_docling_extra()
+    assert row.status is ExtractStatus.NOT_INSTALLED
+    assert row.is_required is False  # extra is opt-in; missing extra ≠ failure
+    assert 'uv sync --extra extract' in row.detail
+
+
+def test_check_docling_models_missing_when_cache_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty model cache surfaces both required rows as MISSING."""
+    from litspectraits.doctor import _check_docling_models
+
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+    )
+    rows = _check_docling_models()
+    assert len(rows) == 2
+    assert all(row.status is ExtractStatus.MISSING for row in rows)
+    assert all(row.is_required for row in rows)
+    assert any('--download-models' in row.detail for row in rows)
+
+
+def test_check_docling_models_ok_when_cache_populated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each model dir with at least one file → OK row.
+
+    Doesn't assert specific weight filenames — the contract is
+    "directory exists and is non-empty," matching the docstring on
+    ``_docling_model_dirs``.
+    """
+    from litspectraits.doctor import _check_docling_models
+
+    models_root = tmp_path / 'models'
+    layout_dir = models_root / 'layout-folder'
+    tableformer_dir = models_root / 'tableformer-folder'
+    layout_dir.mkdir(parents=True)
+    tableformer_dir.mkdir(parents=True)
+    (layout_dir / 'model.safetensors').write_bytes(b'fake')
+    (tableformer_dir / 'config.json').write_text('{}')
+
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (models_root, 'layout-folder', 'tableformer-folder'),
+    )
+    rows = _check_docling_models()
+    assert {row.component for row in rows} == {'layout model', 'TableFormer'}
+    assert all(row.status is ExtractStatus.OK for row in rows)
+
+
+def test_check_accelerator_reports_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ``torch.cuda.is_available`` is True we record CUDA + device name."""
+    import sys
+    import types
+
+    from litspectraits.doctor import _check_accelerator
+
+    fake_torch = types.ModuleType('torch')
+    fake_cuda = types.ModuleType('torch.cuda')
+    fake_cuda.is_available = lambda: True  # type: ignore[attr-defined]
+    fake_cuda.get_device_name = lambda _idx: 'NVIDIA Test GPU'  # type: ignore[attr-defined]
+    fake_torch.cuda = fake_cuda  # type: ignore[attr-defined]
+    fake_backends = types.ModuleType('torch.backends')
+    fake_torch.backends = fake_backends  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setitem(sys.modules, 'torch.cuda', fake_cuda)
+    monkeypatch.setitem(sys.modules, 'torch.backends', fake_backends)
+
+    row = _check_accelerator()
+    assert row.status is ExtractStatus.CUDA
+    assert row.detail == 'NVIDIA Test GPU'
+    assert row.is_required is False  # accelerator never fails the gate
+
+
+def test_check_accelerator_falls_back_to_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No CUDA + no MPS → CPU row; the gate stays green either way."""
+    import sys
+    import types
+
+    from litspectraits.doctor import _check_accelerator
+
+    fake_torch = types.ModuleType('torch')
+    fake_cuda = types.ModuleType('torch.cuda')
+    fake_cuda.is_available = lambda: False  # type: ignore[attr-defined]
+    fake_backends = types.ModuleType('torch.backends')
+    # No ``mps`` attribute → ``hasattr(torch.backends, 'mps')`` is False
+    # and the CPU fallback fires.
+    fake_torch.cuda = fake_cuda  # type: ignore[attr-defined]
+    fake_torch.backends = fake_backends  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setitem(sys.modules, 'torch.cuda', fake_cuda)
+    monkeypatch.setitem(sys.modules, 'torch.backends', fake_backends)
+
+    row = _check_accelerator()
+    assert row.status is ExtractStatus.CPU
+    assert row.is_required is False
+    assert 'cpu-only' in row.detail
+
+
+def test_check_ocr_engines_is_always_off() -> None:
+    """OCR is permanently off in v3; row is informational only."""
+    from litspectraits.doctor import _check_ocr_engines
+
+    row = _check_ocr_engines()
+    assert row.status is ExtractStatus.OFF
+    assert row.is_required is False
+    assert row.required == 'no'
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_short_circuits_when_extra_missing(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``[extract]`` extra → single row; ``has_required_failure`` stays False.
+
+    Pins the §8 exit-code policy verbatim: "exit 0 if the extra is not
+    installed; the section is rendered as a single greyed row noting
+    the install hint, exit code unaffected."
+    """
+    import sys
+
+    from litspectraits.doctor import _check_extract_section
+
+    monkeypatch.setitem(sys.modules, 'docling', None)
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=False,
+        smoke_extract=False,
+        fixture_path=None,
+    )
+    assert report.has_required_failure is False
+    assert len(report.components) == 1
+    assert report.components[0].component == 'docling[extract]'
+    assert report.components[0].status is ExtractStatus.NOT_INSTALLED
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_flags_required_failure_when_model_missing(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extra installed + required model missing + no ``--download-models`` ⇒ fail.
+
+    Pins the second leg of the §8 exit-code policy: "exit 1 if the
+    extra is installed AND a required model is missing AND
+    ``--download-models`` was not requested."
+    """
+    from litspectraits.doctor import _check_extract_section
+
+    # Empty model cache.
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+    )
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=False,
+        smoke_extract=False,
+        fixture_path=None,
+    )
+    assert report.has_required_failure is True
+    components = {row.component: row for row in report.components}
+    assert components['layout model'].status is ExtractStatus.MISSING
+    assert components['TableFormer'].status is ExtractStatus.MISSING
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_clears_when_models_present(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Populating the cache flips both rows to OK; ``has_required_failure`` False."""
+    from litspectraits.doctor import _check_extract_section
+
+    layout_dir = tmp_path / 'models' / 'layout-folder'
+    tableformer_dir = tmp_path / 'models' / 'tableformer-folder'
+    layout_dir.mkdir(parents=True)
+    tableformer_dir.mkdir(parents=True)
+    (layout_dir / 'model.safetensors').write_bytes(b'fake')
+    (tableformer_dir / 'config.json').write_text('{}')
+
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+    )
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=False,
+        smoke_extract=False,
+        fixture_path=None,
+    )
+    assert report.has_required_failure is False
+    components = {row.component: row for row in report.components}
+    assert components['layout model'].status is ExtractStatus.OK
+    assert components['TableFormer'].status is ExtractStatus.OK
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_runs_download_when_flagged(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``download_models=True`` invokes the downloader once, then re-probes.
+
+    Stubs ``_maybe_download_models`` to populate the cache so the
+    post-download presence check flips to OK without actually pulling
+    docling weights.
+    """
+    from litspectraits.doctor import _check_extract_section
+
+    models_root = tmp_path / 'models'
+    layout_dir = models_root / 'layout-folder'
+    tableformer_dir = models_root / 'tableformer-folder'
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (models_root, 'layout-folder', 'tableformer-folder'),
+    )
+
+    download_calls: list[bool] = []
+
+    def _fake_download(*, force: bool) -> None:
+        download_calls.append(force)
+        layout_dir.mkdir(parents=True)
+        tableformer_dir.mkdir(parents=True)
+        (layout_dir / 'model.safetensors').write_bytes(b'fake')
+        (tableformer_dir / 'config.json').write_text('{}')
+
+    monkeypatch.setattr('litspectraits.doctor._maybe_download_models', _fake_download)
+
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=True,
+        smoke_extract=False,
+        fixture_path=None,
+    )
+    assert download_calls == [False]  # force=False per §8
+    assert report.has_required_failure is False
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_runs_smoke_when_flagged(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``smoke_extract=True`` calls ``extract_pdf`` against the staged fixture.
+
+    Stubs ``extract_pdf`` so we don't depend on docling models being
+    downloaded; asserts that the fixture flowed through ``ArtifactStore``
+    and that the resulting row is OK.
+    """
+    from litspectraits.doctor import _check_extract_section
+
+    # Make models present so the required gate stays green.
+    layout_dir = tmp_path / 'models' / 'layout-folder'
+    tableformer_dir = tmp_path / 'models' / 'tableformer-folder'
+    layout_dir.mkdir(parents=True)
+    tableformer_dir.mkdir(parents=True)
+    (layout_dir / 'model.safetensors').write_bytes(b'fake')
+    (tableformer_dir / 'config.json').write_text('{}')
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+    )
+
+    fixture_path = tmp_path / 'synthetic.pdf'
+    fixture_path.write_bytes(b'%PDF-1.4\n%fake bytes for smoke wiring')
+
+    called: list[str] = []
+
+    async def _fake_extract_pdf(record, _store, *, reextract: bool) -> None:
+        called.append(record.doi)
+        del reextract
+
+    monkeypatch.setattr('litspectraits.extract.pdf.extract_pdf', _fake_extract_pdf)
+
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=False,
+        smoke_extract=True,
+        fixture_path=fixture_path,
+    )
+    assert called == ['10.0/doctor-smoke']
+    smoke_row = next(
+        (row for row in report.components if row.component == 'smoke convert'), None
+    )
+    assert smoke_row is not None
+    assert smoke_row.status is ExtractStatus.OK
+    assert smoke_row.detail.endswith('(synthetic.pdf)')
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_smoke_missing_fixture_returns_missing_row(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pointing ``--smoke-extract`` at a non-existent path surfaces a MISSING row.
+
+    Stays in the optional/informational bucket — does not flip the
+    required-failure gate (smoke is opt-in).
+    """
+    from litspectraits.doctor import _check_extract_section
+
+    layout_dir = tmp_path / 'models' / 'layout-folder'
+    tableformer_dir = tmp_path / 'models' / 'tableformer-folder'
+    layout_dir.mkdir(parents=True)
+    tableformer_dir.mkdir(parents=True)
+    (layout_dir / 'x').write_bytes(b'.')
+    (tableformer_dir / 'x').write_bytes(b'.')
+    monkeypatch.setattr(
+        'litspectraits.doctor._docling_model_dirs',
+        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+    )
+
+    report = await _check_extract_section(
+        settings=settings,
+        download_models=False,
+        smoke_extract=True,
+        fixture_path=tmp_path / 'does-not-exist.pdf',
+    )
+    smoke_row = next(
+        (row for row in report.components if row.component == 'smoke convert'), None
+    )
+    assert smoke_row is not None
+    assert smoke_row.status is ExtractStatus.MISSING
+    assert 'fixture not found' in smoke_row.detail
+    assert report.has_required_failure is False
+
+
+def test_doctor_report_ok_false_when_extract_required_failure() -> None:
+    """``ok`` folds extract required-failure into the boolean."""
+    base_ip = IPCheck(
+        status=IPStatus.UNCONFIGURED,
+        ip='203.0.113.1',
+        expected_cidrs=(),
+        error=None,
+    )
+    cred_ok = CredCheck(
+        publisher=Publisher.WILEY,
+        status=CredStatus.NOT_CONFIGURED,
+        smoke_doi=SMOKE_DOI[Publisher.WILEY],
+        detail='no credential set',
+    )
+    extract_failed = ExtractReport(
+        components=(
+            ExtractComponentCheck(
+                component='layout model',
+                required='yes',
+                is_required=True,
+                status=ExtractStatus.MISSING,
+                detail='missing',
+            ),
+        ),
+        has_required_failure=True,
+    )
+    report = DoctorReport(
+        ip_check=base_ip,
+        cred_checks=(cred_ok,),
+        extract_check=extract_failed,
+    )
+    assert report.ok is False
+
+
+def test_doctor_report_ok_true_when_extract_required_failure_false() -> None:
+    """``ok`` stays True when extract has only optional issues."""
+    base_ip = IPCheck(
+        status=IPStatus.UNCONFIGURED,
+        ip='203.0.113.1',
+        expected_cidrs=(),
+        error=None,
+    )
+    cred_ok = CredCheck(
+        publisher=Publisher.WILEY,
+        status=CredStatus.NOT_CONFIGURED,
+        smoke_doi=SMOKE_DOI[Publisher.WILEY],
+        detail='no credential set',
+    )
+    extract = ExtractReport(
+        components=_ok_extract_components(),
+        has_required_failure=False,
+    )
+    report = DoctorReport(
+        ip_check=base_ip,
+        cred_checks=(cred_ok,),
+        extract_check=extract,
+    )
+    assert report.ok is True
+
+
+def test_render_doctor_report_with_extract_section() -> None:
+    """Golden-output rows for the third table.
+
+    Pins: the table title, every column header, each component label,
+    each ``required`` cell, each rendered status, and the hint snippets
+    in the detail column. Width-stable (``width=120``, no color).
+    """
+    report = DoctorReport(
+        ip_check=IPCheck(
+            status=IPStatus.OK,
+            ip='132.187.7.42',
+            expected_cidrs=('132.187.0.0/16',),
+            error=None,
+        ),
+        cred_checks=(
+            CredCheck(
+                publisher=Publisher.WILEY,
+                status=CredStatus.OK,
+                smoke_doi=SMOKE_DOI[Publisher.WILEY],
+                detail='fetched ok',
+            ),
+        ),
+        extract_check=ExtractReport(
+            components=_ok_extract_components(with_smoke=True),
+            has_required_failure=False,
+        ),
+    )
+    output = _capture(report)
+    # Section title + columns
+    assert 'Extract components' in output
+    assert 'Component' in output
+    assert 'Required' in output
+    assert 'Hint' in output
+    # Every component row renders
+    for component in (
+        'docling[extract]',
+        'layout model',
+        'TableFormer',
+        'accelerator',
+        'OCR engines',
+        'smoke convert',
+    ):
+        assert component in output, component
+    # Status labels per StrEnum value
+    for label in ('ok', 'cuda', 'off'):
+        assert label in output, label
+    # ``Required`` cell variants
+    assert 'auto' in output  # accelerator row
+    # Hint snippets
+    assert 'docling 2.93.0' in output
+    assert 'accurate mode loaded' in output
+    assert 'do_ocr=False' in output
 
 
 # ---------------------------------------------------------------------------

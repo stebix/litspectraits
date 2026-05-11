@@ -617,19 +617,55 @@ def _render_extract_record_panel(
 
 
 @app.command(name='doctor')
-def cmd_doctor() -> None:
-    """Operator preflight — egress IP + per-publisher credential smoke test."""
+def cmd_doctor(
+    download_models: bool = typer.Option(
+        False,
+        '--download-models/--no-download-models',
+        help=(
+            'Pull docling layout + TableFormer weights if missing. '
+            'Multi-GB; off by default — operator must opt in explicitly.'
+        ),
+    ),
+    smoke_extract: bool = typer.Option(
+        False,
+        '--smoke-extract/--no-smoke-extract',
+        help=(
+            'Run a live docling conversion against the packaged synthetic PDF. '
+            'Off by default to keep `doctor` from spinning up the layout model.'
+        ),
+    ),
+) -> None:
+    """Operator preflight — egress IP, publisher creds, extract components.
+
+    Plain ``doctor`` is read-only and network-free for the extract
+    section (``extract-pdf-plan.md`` §8). The two flags above are the
+    only paths that trigger model downloads or actual docling work; both
+    are off by default so a routine doctor run stays cheap.
+    """
     settings = _load_settings()
     out_console = _stdout_console()
-    report = asyncio.run(_run_doctor(settings=settings))
+    report = asyncio.run(
+        _run_doctor(
+            settings=settings,
+            download_models=download_models,
+            smoke_extract=smoke_extract,
+        )
+    )
     render_doctor_report(report, console=out_console)
     if not report.ok:
         raise typer.Exit(1)
 
 
-async def _run_doctor(*, settings: Settings):
+async def _run_doctor(
+    *, settings: Settings, download_models: bool, smoke_extract: bool
+):
     async with http_client(settings) as client:
-        return await run_doctor(settings=settings, client=client)
+        return await run_doctor(
+            settings=settings,
+            client=client,
+            download_models=download_models,
+            smoke_extract=smoke_extract,
+        )
 
 
 # ---------------------------------------------------------------------------

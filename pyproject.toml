@@ -72,3 +72,6 @@ include = ['src', 'tests']
 [tool.pytest.ini_options]
 asyncio_mode = 'auto'
 testpaths = ['tests']
+markers = [
+    "extract_real: opt out of the default doctor extract-section mute (tests/test_doctor.py)",
+]

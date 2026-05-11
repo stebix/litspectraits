@@ -1127,14 +1127,13 @@ biggest single piece. Interior order in `extract-pdf-plan.md` §10.
       `documents/<sha256>/` layout. Constructor lazy-creates
       `documents/` alongside `artifacts/` / `manifests/` / `index/` /
       `tmp/`.
-- [ ] Synthetic 1-page PDF fixture
-      (`tests/fixtures/pdf/synthetic.pdf`: one heading, one paragraph,
-      one 2×2 table). **Deferred to 10f**: with the unit tests faking
-      docling via `_load_docling` (same idiom as the wiley / springer
-      SDK fakes), no real PDF parsing happens in the per-step green-bar
-      gate. The fixture matters once `doctor --smoke-extract` (10f) and
-      Step 12's gated end-to-end smoke run docling for real; landing it
-      now would be dead weight.
+- [x] Synthetic 1-page PDF fixture
+      (`src/litspectraits/_fixtures/synthetic.pdf`: one heading, one
+      paragraph, one 2×2 table; **moved out of `tests/`** in 10f so the
+      bytes ship in the wheel and a pip-installed operator can still run
+      `doctor --smoke-extract`). Generated once via reportlab; the
+      generator script lives in `/tmp` and is not committed (reportlab
+      is not part of `[dev]`).
 - [x] Tests (`tests/extract/test_pdf.py`, 16 cases): happy path writes
       both files with the expected `meta.json` counts;
       `WrongFormatForExtractorError` on a JATS record;
@@ -1277,19 +1276,60 @@ sits on top of the dispatcher landed in 10a.
       that per-call `context['hint']` wins over the class default
       (the contract that lets extractors override hints per call site).
 
-**10f — Doctor docling extension.** Lands per `extract-pdf-plan.md`
-§8.
+**10f — Doctor docling extension (done).** Lands per
+`extract-pdf-plan.md` §8.
 
-- [ ] `doctor.py`: `check_docling_extra`, `check_docling_models`,
-      `check_accelerator`, `maybe_download_models`,
-      `maybe_smoke_extract`.
-- [ ] `cli.py doctor`: `--download-models / --no-download-models`
+- [x] `doctor.py`: `_check_docling_extra`, `_check_docling_models`
+      (layout + TableFormer), `_check_accelerator`, `_check_ocr_engines`,
+      `_maybe_download_models`, `_maybe_smoke_extract`, all dispatched
+      from a new `_check_extract_section` orchestrator. New value
+      objects (`ExtractStatus`, `ExtractComponentCheck`,
+      `ExtractReport`) follow the IPCheck / CredCheck shape; the
+      existing `DoctorReport.ok` property folds `has_required_failure`
+      into the exit-code boolean. `_docling_model_dirs` reads the
+      cache root from `docling.datamodel.settings` and the per-model
+      folder names from `LayoutOptions().model_spec.model_repo_folder`
+      and `TableStructureModel._model_repo_folder` rather than
+      hardcoding strings — the next docling rename surfaces as an
+      AttributeError, not a silent "models all missing." Component /
+      detail cells are passed through `rich.markup.escape` so
+      `docling[extract]` renders verbatim instead of being parsed as
+      a `[extract]…[/extract]` markup tag.
+- [x] `cli.py doctor`: `--download-models / --no-download-models`
       (default off), `--smoke-extract / --no-smoke-extract` (default
-      off).
-- [ ] Extended golden-output test for the doctor table with the new
-      "Component" rows; verify exit-code policy (extra-missing ⇒ exit
-      0; configured + required model missing + no `--download-models`
-      ⇒ exit 1).
+      off). Plain `litspectraits doctor` stays network-free for the
+      extract section — both side-effects (model downloads, live
+      docling conversion) require an explicit opt-in.
+- [x] Synthetic fixture relocated to
+      `src/litspectraits/_fixtures/synthetic.pdf` (see 10b's bullet)
+      so `--smoke-extract` works from a pip-installed wheel; loaded
+      via `importlib.resources` from the new
+      `_packaged_fixture_path()` helper.
+- [x] `tests/test_doctor.py` (16 new cases, 31 total): probe-level
+      unit tests for every check function (`_check_docling_extra`
+      OK / NOT_INSTALLED, `_check_docling_models` MISSING / OK,
+      `_check_accelerator` CUDA / CPU, `_check_ocr_engines` OFF);
+      `_check_extract_section` exit-code policy pinned in three
+      variants (extra-missing → not a required failure;
+      models-missing → required failure; models-present → green);
+      `--download-models` invokes the downloader once with
+      `force=False` then re-probes; `--smoke-extract` stages the
+      fixture through ArtifactStore and calls `extract_pdf` (stubbed
+      so the test does not depend on docling weights);
+      missing-fixture path returns a `MISSING` smoke row without
+      flipping the gate. Golden-output test pins the third table
+      title, column headers, all six component labels, status labels
+      (`ok`, `cuda`, `off`), and hint snippets. The existing IP/cred
+      tests default-mute the extract section via an autouse fixture
+      keyed off `@pytest.mark.extract_real` so the new tests opt back
+      into the real probes; the `extract_real` marker is registered
+      in `pyproject.toml`.
+- [x] Pre-existing docling-2.93 drift in `extract/pdf.py` (the
+      `AcceleratorDevice` / `AcceleratorOptions` private-import
+      warnings) fixed in the same commit by sourcing them from
+      `docling.datamodel.accelerator_options` rather than the
+      `pipeline_options` re-export. Cleaner than carrying the
+      diagnostic across the 10f gate.
 
 ### Step 11 (optional) — Batch ingest
 
