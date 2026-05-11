@@ -1,12 +1,8 @@
 """Tests for :mod:`litspectraits.extract._dispatch`.
 
 The dispatcher itself does very little — it only routes on
-:attr:`AcquisitionRecord.format`. PDF (step 10b) and JATS (step 10c) are
-wired; only the Elsevier breadcrumb is still asserted here, until 10d.
-
-The asserted breadcrumb text is part of the contract — operators reading
-``litspectraits extract`` against an Elsevier record should see the
-"lands in step 10d" hint.
+:attr:`AcquisitionRecord.format`. All three legs are now wired (PDF
+step 10b, JATS step 10c, Elsevier step 10d).
 """
 
 from datetime import UTC, datetime
@@ -61,20 +57,12 @@ def store(tmp_path: Path) -> ArtifactStore:
     return ArtifactStore(data_dir=tmp_path)
 
 
-async def test_elsevier_branch_still_raises_not_implemented(
-    store: ArtifactStore,
-) -> None:
-    record = _acquisition_record(fmt=Format.ELSEVIER_XML, publisher=Publisher.ELSEVIER)
-    with pytest.raises(NotImplementedError) as excinfo:
-        await extract(record, store)
-    assert '10d' in str(excinfo.value)
-
-
 @pytest.mark.parametrize(
     ('fmt', 'publisher', 'fake_attr'),
     [
         (Format.PDF, Publisher.WILEY, 'extract_pdf'),
         (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats'),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier'),
     ],
 )
 async def test_branch_routes_through_leaf_extractor(
@@ -109,6 +97,7 @@ async def test_branch_routes_through_leaf_extractor(
     [
         (Format.PDF, Publisher.WILEY, 'extract_pdf'),
         (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats'),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier'),
     ],
 )
 async def test_branch_default_reextract_is_false(
@@ -137,6 +126,7 @@ async def test_branch_default_reextract_is_false(
     [
         (Format.PDF, Publisher.WILEY),
         (Format.JATS_XML, Publisher.SPRINGER_NATURE),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER),
     ],
 )
 async def test_branch_propagates_missing_artifact_error(
@@ -146,7 +136,7 @@ async def test_branch_propagates_missing_artifact_error(
 
     Picks the cheapest preflight failure (the artifact path under
     ``store.data_dir`` does not exist) so the dispatch wiring is exercised
-    against the real leaf without needing docling or a JATS fixture.
+    against the real leaf without needing docling or an XML fixture.
     """
     record = _acquisition_record(fmt=fmt, publisher=publisher)
     with pytest.raises(MissingArtifactError):

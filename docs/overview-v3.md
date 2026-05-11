@@ -1195,18 +1195,48 @@ biggest single piece. Interior order in `extract-pdf-plan.md` §10.
       through and missing-artifact pins across both PDF and JATS;
       Elsevier branch breadcrumb still asserted.
 
-**10d — Elsevier extractor.** Wires Elsevier leg; `_dispatch.py` now
-fully covered.
+**10d — Elsevier extractor (done).** Wires Elsevier leg; `_dispatch.py`
+now fully covered.
 
-- [ ] `src/litspectraits/extract/elsevier.py`: `lxml`-based parser for
-      `<full-text-retrieval-response>` / `<originalText>` /
-      `<xocs:doc>`. Emit a JATS-shaped dict so downstream stays mostly
-      publisher-agnostic.
-- [ ] Small Elsevier-XML fixture.
-- [ ] Happy-path test mirroring 10c plus a defensive test that a
-      META_ABS envelope (no `<originalText>`) raises — same shape that
-      `EntitlementDowngradeError` rejects upstream, pinned here too as
-      defense-in-depth.
+- [x] `src/litspectraits/extract/elsevier.py`: `lxml`-based five-stage
+      pipeline (preflight → parse → META_ABS guard → walk → serialize →
+      commit) emitting the same JATS-flavored dict shape as
+      `extract/jats.py` so downstream readers stay publisher-agnostic.
+      Common Element Pool (CEP) markup is the canonical input: walks
+      `<ce:section>` / `<ce:para>` / `<ce:cross-ref>` and projects
+      CALS `<row>` / `<entry>` tables (rowspan from `morerows`,
+      colspan best-effort from `namest` / `nameend`). References pull
+      authors / title / source / year / DOI out of `<sb:reference>` and
+      `<ce:source-text>`. **Known limitation**: a JATS-via-Elsevier
+      artifact (where `<originalText>` wraps a real `<article>` body)
+      surfaces as `EmptyDocumentError` rather than auto-routing through
+      `extract_jats`; the right re-route lands when we observe one on
+      real corpus data.
+- [x] Inline byte-literal fixtures in `tests/extract/test_elsevier.py`
+      (same hermetic style as `tests/extract/test_jats.py`).
+- [x] Tests (`tests/extract/test_elsevier.py`, 11 cases): preflight
+      `WrongFormatForExtractorError` + `MissingArtifactError`; parse
+      `MalformedDocumentError` on broken XML and on non-`<full-text-
+      retrieval-response>` root; defensive `MalformedDocumentError` on a
+      META_ABS envelope (no `<originalText>` and no `<xocs:doc>`) with a
+      META_ABS-named hint — same shape that `EntitlementDowngradeError`
+      rejects upstream, pinned here as defense-in-depth; walker
+      `EmptyDocumentError` on an `<originalText>` body with no
+      paragraphs; `SerializationError` via the same monkeypatched
+      `_walk` idiom as the JATS tests; happy path with structural
+      counts + section path / CALS cell projection / xref `refid → rid`
+      remap / reference structured-field spot checks; idempotent
+      re-extract; `ExtractIntegrityError` on diverging re-extract;
+      `--reextract` overwrites cleanly. `tests/extract/test_dispatch.py`
+      now parametrizes leaf-routes-through and missing-artifact pins
+      across all three formats; the 10d `NotImplementedError`
+      breadcrumb test is gone.
+- [ ] **Follow-up (out of 10d scope)**: consolidate the duplicated
+      `_commit` / `_atomic_write` / `_file_sha256` / lxml xpath helpers
+      across `extract/jats.py` and `extract/elsevier.py` into a shared
+      `extract/_lxml_helpers.py`. The JATS module-level docstring
+      foreshadows this revisit "after 10d when all three concretes
+      exist." Cheap follow-up commit; not blocking 10e / 10f.
 
 **10e — CLI `extract` command.** Makes the work user-visible
 end-to-end. Lands after 10b/10c/10d so the command works for every

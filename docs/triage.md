@@ -331,3 +331,118 @@ under the entry rather than rewriting history.
   reaches `commit` without passing `verify` at the orchestrator).
 - **Revisit when:** never expected — the ordering is constrained by
   the failure model.
+
+---
+
+## Step 10d — Elsevier extractor (committed TBD, 2026-05-11)
+
+### E10d-1 — META_ABS rejection uses `MalformedDocumentError`, not `EmptyDocumentError`
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/elsevier.py` —
+  `_assert_has_full_text()`; covered by
+  `tests/extract/test_elsevier.py::test_meta_abs_envelope_raises_malformed_document_error`;
+  cross-ref `docs/overview-v3.md` §10d.
+- **Decision:** an Elsevier envelope without `<originalText>` *and*
+  without `<xocs:doc>` raises `MalformedDocumentError` with a
+  META_ABS-named hint. The same condition is rejected by the Elsevier
+  retriever as `EntitlementDowngradeError` upstream; the extract-side
+  taxonomy has no entitlement class, so we map it to the
+  structurally-closest member.
+- **Why:** the META_ABS shape is structurally valid XML (root tag is
+  correct, the envelope parses) — not a parse failure in the lxml
+  sense. But the absence of the full-text subtree is a *structural*
+  failure for our purposes: the artifact lacks the piece we depend
+  on. `EmptyDocumentError`'s hint frames the failure around OCR /
+  scanned PDFs / stub envelopes; surfacing META_ABS through that
+  class would mislead the operator. `MalformedDocumentError`'s hint
+  can explicitly name "META_ABS abstract-only response" and point at
+  re-ingesting to validate entitlement.
+- **Revisit when:** a third Elsevier failure mode appears where the
+  envelope is also "structurally valid but incomplete" (e.g. a future
+  preview-only tier). At that point introduce a dedicated
+  `EntitlementDowngradeAtExtractError` rather than overloading
+  `MalformedDocumentError` further.
+
+### E10d-2 — Elsevier extractor handles CEP markup only
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/elsevier.py` — module
+  docstring + `_extract_sections()`; cross-ref `docs/overview-v3.md`
+  §11.
+- **Decision:** the walker targets Common Element Pool (CEP) markup
+  exclusively — `<ce:section>`, `<ce:para>`, `<ce:cross-ref>`,
+  `<ce:table>` with CALS rows/entries, `<ce:bib-reference>` with
+  `<sb:reference>` substructure. A JATS-via-Elsevier artifact (where
+  `<originalText>` wraps a true `<article>` body in the JATS
+  namespace) parses fine but yields zero `<section>` descendants and
+  surfaces as `EmptyDocumentError`.
+- **Why:** §11 says "internal mapper produces a dict shape similar
+  to `jats.py`", which constrains the *output* — not that one
+  extractor must handle both markup variants. Real ScienceDirect
+  responses for the v3 corpus (MRI literature, mostly
+  journal-articles) use CEP. Auto-routing JATS-via-Elsevier into
+  `extract_jats` would require the dispatcher to peek into the
+  artifact body, breaking the format-keyed dispatch invariant.
+- **Revisit when:** we observe a JATS-via-Elsevier artifact surface
+  as `EmptyDocumentError` in real corpus data. The fix at that
+  point is one of: (a) a JATS-namespace branch inside
+  `extract_elsevier` that re-routes to a shared `_walk_jats`, or
+  (b) a separate extractor that the dispatcher chooses based on
+  the namespace *inside* `<originalText>`, not the artifact format
+  alone. Not worth designing speculatively.
+
+### E10d-3 — CALS column spans are heuristic (parsed from trailing digits)
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/elsevier.py` —
+  `_cals_colspan()`, `_COL_DIGIT_RE`.
+- **Decision:** real CEP tables encode column spans via
+  `namest="col1" nameend="col3"` on the cell, where `col1` / `col3`
+  reference earlier `<colspec colname="col1"/>` elements. We
+  approximate by parsing trailing digits from the `namest` /
+  `nameend` values — works for the common `col<N>` convention,
+  degrades to `colspan=1` for opaque colspec names. Row spans
+  (`morerows`) are exact.
+- **Why:** properly resolving the colspec map adds a non-trivial
+  table-build step (read `<colspec>` children, build a name→index
+  map, project each row through it) for a payoff only visible on
+  spanning cells in real ScienceDirect tables. The current
+  heuristic's worst case is "underreport span", never "lie about
+  content" — a downstream normaliser can detect spans that look
+  wrong if it cares. Synthetic-fixture tests pass through the
+  `colspan=1` default; the heuristic is only exercised on real
+  CEP.
+- **Revisit when:** the agent triad's table normaliser starts
+  producing measurably wrong outputs for spanning cells, or an
+  Elsevier sample uses non-`col<N>` colspec names that the
+  heuristic misses entirely. Fix is a ~20-line
+  `_build_colspec_map(tgroup)` helper at that point.
+
+### E10d-4 — `_commit` / `_atomic_write` / lxml helpers duplicated rather than abstracted
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/elsevier.py` —
+  bottom-of-module helpers (mirrored in `src/litspectraits/extract/jats.py`);
+  cross-ref `docs/overview-v3.md` §21 step 10d follow-up.
+- **Decision:** the per-format commit machinery (`_commit`,
+  `_build_extract_record`, `_build_meta`, `_atomic_write`,
+  `_file_sha256`) and the lxml xpath helpers (`_local_findall`,
+  `_first_child`, `_first_descendant`, `_all_descendants`,
+  `_first_child_text`, `_first_descendant_text`, `_full_text`,
+  `_ancestor_section_path`) are duplicated verbatim between
+  `extract/jats.py` and `extract/elsevier.py`. PDF
+  (`extract/pdf.py`) carries its own commit machinery because its
+  `meta.json` shape differs (carries the `pipeline` block + `n_pages`).
+- **Why:** the JATS module's docstring (landed in 10c) explicitly
+  foreshadowed consolidation "after 10d when all three concretes
+  exist". Doing the consolidation as part of 10d would have widened
+  the commit beyond the spec's scope. Two duplicated ~60-line
+  blocks is readable; abstracting prematurely would invert the
+  dependency (jats and elsevier both depending on a shim) without
+  a third caller forcing the move.
+- **Revisit when:** before landing 10f. Cheap follow-up commit;
+  not blocking other 10e / 10f work. The consolidation target is
+  `extract/_lxml_helpers.py` (xpath/text helpers) and probably
+  `extract/_commit.py` (per-format commit machinery parametrized
+  by a `_build_meta` callback).
