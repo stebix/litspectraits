@@ -242,10 +242,12 @@ async def test_insttoken_omitted_when_unset(
     settings_only_key = Settings(
         contact_email=settings.contact_email,
         data_dir=settings.data_dir,
+        docling_model_cache_dir=settings.docling_model_cache_dir,
         http_timeout_s=settings.http_timeout_s,
         log_format=settings.log_format,
         wiley_tdm_token=None,
-        springer_api_key=None,
+        springer_oa_api_key=None,
+        springer_tdm_api_key=None,
         elsevier_api_key='only-key',
         elsevier_insttoken=None,
         rate_limit_wiley=settings.rate_limit_wiley,

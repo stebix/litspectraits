@@ -76,11 +76,16 @@ async def test_branch_routes_through_leaf_extractor(
     captured: dict[str, object] = {}
 
     async def _fake_leaf(
-        record: AcquisitionRecord, store: ArtifactStore, *, reextract: bool = False
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
     ) -> object:
         captured['record'] = record
         captured['store'] = store
         captured['reextract'] = reextract
+        captured['model_cache_dir'] = model_cache_dir
         return f'sentinel-{fake_attr}'
 
     monkeypatch.setattr(dispatch_mod, fake_attr, _fake_leaf)
@@ -110,8 +115,13 @@ async def test_branch_default_reextract_is_false(
     captured: dict[str, object] = {}
 
     async def _fake_leaf(
-        record: AcquisitionRecord, store: ArtifactStore, *, reextract: bool = False
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
     ) -> object:
+        del model_cache_dir
         captured['reextract'] = reextract
         return None
 
@@ -119,6 +129,34 @@ async def test_branch_default_reextract_is_false(
     record = _acquisition_record(fmt=fmt, publisher=publisher)
     await extract(record, store)
     assert captured['reextract'] is False
+
+
+async def test_pdf_branch_forwards_model_cache_dir(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The PDF leg forwards ``model_cache_dir`` to ``extract_pdf``.
+
+    The XML legs carry no model, so the kwarg is intentionally only
+    threaded into :func:`~litspectraits.extract.pdf.extract_pdf`.
+    """
+    captured: dict[str, object] = {}
+
+    async def _fake_extract_pdf(
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
+    ) -> object:
+        del record, store, reextract
+        captured['model_cache_dir'] = model_cache_dir
+        return None
+
+    monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fake_extract_pdf)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+    weights_dir = tmp_path / 'docling-weights'
+    await extract(record, store, model_cache_dir=weights_dir)
+    assert captured['model_cache_dir'] == weights_dir
 
 
 @pytest.mark.parametrize(

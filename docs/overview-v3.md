@@ -281,6 +281,7 @@ class MissingCredentialError(IngestError): ...     # required token unset AND IP
 # Publisher-side
 class AuthRejectedError(IngestError): ...          # 401/403 from publisher
 class EntitlementDowngradeError(IngestError): ...  # Elsevier returned META_ABS instead of FULL
+class NotOpenAccessError(IngestError): ...         # Springer OA tier returned zero records for a real DOI
 class RateLimitExhaustedError(IngestError): ...    # 429 after retries
 class PublisherAPIError(IngestError): ...          # 5xx, malformed response, SDK exception
 
@@ -412,38 +413,86 @@ see bytes). One extra read of the file — negligible for typical PDFs.
 
 ### 7.2 Springer Nature (`retrievers/springer.py`)
 
+**Two tiers, picked by which key is set; presence of the TDM key is the
+switch.** TDM wins when both are present (strictly larger corpus); the
+OA path is the fallback for operators who only hold a free
+developer-portal key. The retriever decides up front — it does **not**
+fall back from TDM to OA on a 401/403. A loud failure is preferable to
+silently degrading the corpus.
+
+| Tier | Key env var | Endpoint | Coverage |
+| --- | --- | --- | --- |
+| Premium TDM | `SPRINGER_TDM_API_KEY` | `https://spdi.public.springernature.app/xmldata/jats` (via `springernature-api-client`'s `TDMAPI`) | OA + subscription content |
+| Open Access | `SPRINGER_OA_API_KEY` | `https://api.springernature.com/openaccess/jats` (direct `httpx`) | OA content only |
+
+Both tiers stage JATS XML rooted at `<article>` — the OA path unwraps
+the wrapping `<response>`/`<records>` envelope via `lxml` before
+staging, so the artifact on disk is structurally identical regardless
+of which tier produced it. The JATS extractor (Step 10c) does not need
+to know which tier was used.
+
+**TDM tier (`_fetch_tdm`)**
+
 - **SDK:** `springernature-api-client` (PyPI, actively maintained;
   upstream `springernature/springernature_api_client`).
   Import `from springernature_api_client import tdm`.
-- **Endpoint:** `https://api.springernature.com/...` (lib-managed).
-- **Auth:** `api_key` query parameter — `SPRINGER_API_KEY` env. **No
-  IP-only fallback** — the key is required.
-- **Format:** JATS XML.
-- **Rate limit:** per-minute quota (premium tier higher); default 5 req/s
-  conservative.
-- **SDK call:** the TDM SDK is **query-based**, not DOI-keyed. There is no
-  `fetch_by_doi` method. Per-DOI retrieval is a one-record search:
+- **Auth:** `api_key` query parameter sourced from
+  `SPRINGER_TDM_API_KEY`. The TDM endpoint requires a Full-Text licence —
+  a standard developer-portal key **will not work here** and a 403 from
+  this path surfaces as `AuthRejectedError` with a hint pointing at the
+  OA fallback.
+- **SDK call:** the TDM SDK is query-based, not DOI-keyed:
   ```python
-  client = tdm.TDMAPI(api_key=settings.springer_api_key)
+  client = tdm.TDMAPI(api_key=settings.springer_tdm_api_key)
   response = client.search(q=f'doi:{doi}', p=1, s=1,
                            fetch_all=False, is_premium=True)
   ```
-  `is_premium=True` is **mandatory** — the non-premium endpoint returns
-  metadata only; only the premium tier returns the JATS XML payload. Assert
-  exactly one record came back; zero or multiple hits → `PublisherAPIError`
-  (zero = DOI not in the Springer Nature corpus despite a Springer prefix;
-  >1 = defensive — should not happen for a `doi:` query).
-- **Bytes handling:** route the payload through our `tmp_dir` rather than
-  the SDK's default path. The SDK's `save_xml(response, path)` accepts a
-  caller-supplied destination — pass `tmp_dir / 'fetch-<rand>.part'`. Hash
-  + sniff happen post-write, same pattern as the Wiley shim.
-- **Magic-byte sniff:** read first 4 KiB; require `<?xml` declaration plus
-  `<article` (or JATS namespace marker) within that prefix. HTML wrappers
-  fail this and raise `MalformedArtifactError`.
-- **Failure translation:** SDK exceptions for missing key / 401 →
-  `MissingCredentialError` / `AuthRejectedError`; 403 (e.g. premium tier
-  not on this key) → `AuthRejectedError`; 5xx or malformed →
-  `PublisherAPIError`.
+  Assert exactly one `<article>` came back; zero / >1 → `PublisherAPIError`.
+- **Bytes handling:** the SDK's `save_xml` is unsuitable (pretty-prints
+  via minidom; mangles namespaced JATS; swallows formatter exceptions).
+  We bypass it and write the raw response bytes to
+  `tmp_dir / 'springer-<rand>.xml.part'` ourselves. Hash + sniff happen
+  post-write, same pattern as the Wiley shim.
+
+**Open Access tier (`_fetch_oa`)**
+
+- **No SDK** — the SDK's `OpenAccessAPI` only exposes a JSON helper.
+  We talk to the API directly with our `httpx.AsyncClient` (same shape
+  as `retrievers/elsevier.py`).
+- **Call shape:**
+  ```python
+  params = {'q': f'doi:{doi}',          # bare term — NOT openaccess:true-filtered
+            'p': '1', 's': '1',
+            'api_key': settings.springer_oa_api_key}
+  resp = await client.get('https://api.springernature.com/openaccess/jats',
+                          params=params,
+                          headers={'Accept': 'application/xml'})
+  ```
+  **Do not** AND in an `openaccess:true` term, even though the
+  `dev.springernature.com` examples show it: the `openaccess:` *filter
+  operator* is itself a premium feature and a free dev-portal key gets
+  `403 "Access to this resource is restricted. This is a premium
+  feature."` The `/openaccess/jats` endpoint is already OA-scoped, so a
+  non-OA DOI just returns zero records (→ `NotOpenAccessError`) — the
+  filter would be redundant even if it were allowed.
+- **Envelope shape:** the OA endpoint wraps records in
+  `<response>`/`<records>`. The retriever locates the single `<article>`
+  via `lxml`'s `.//*[local-name()='article']`, re-serializes that
+  subtree with a fresh XML declaration, and stages only that. Zero
+  articles → `NotOpenAccessError`; 2+ → `PublisherAPIError`.
+- **Failure translation:** 401 / 403 → `AuthRejectedError`;
+  429 → `RateLimitExhaustedError`; ≥400 otherwise → `PublisherAPIError`;
+  HTML / non-XML body → `MalformedArtifactError` via the sniff (defence
+  in depth: lxml-parse failure also raises `PublisherAPIError` before
+  the sniff is reached).
+
+**Shared**
+
+- **Format:** JATS XML (sniff requires `<?xml` declaration + `<article>`
+  root after preamble stripping).
+- **Rate limit:** per-minute quota; default 5 req/s conservative.
+- **`MissingCredentialError`** is raised when *neither* key is set; the
+  hint names both env vars.
 
 ### 7.3 Elsevier (`retrievers/elsevier.py`)
 
@@ -684,10 +733,12 @@ model cache + accelerator detection, plus opt-in
 |-----|---------|---------|
 | `LITSPECTRAITS_CONTACT_EMAIL` | mailto for CrossRef polite pool, manifests | **required** — fail at startup |
 | `LITSPECTRAITS_DATA_DIR` | store root | `platformdirs.user_data_dir('litspectraits')` |
+| `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR` | docling model-weights dir (passed as `PdfPipelineOptions.artifacts_path`; also where `doctor --download-models` writes) | unset → docling default `settings.cache_dir / 'models'` (`~/.cache/docling/models`) |
 | `LITSPECTRAITS_LOG_FORMAT` | `rich` / `json` | `rich` |
 | `LITSPECTRAITS_HTTP_TIMEOUT_S` | per-request timeout (CrossRef + doctor IP check) | `30` |
 | `WILEY_TDM_TOKEN` | Wiley token (consumed by `wiley-tdm` lib) | unset → `wiley` retriever raises `MissingCredentialError` unless IP-based auth succeeds |
-| `SPRINGER_API_KEY` | Springer Nature TDM API key | unset → `springer` retriever raises `MissingCredentialError` |
+| `SPRINGER_OA_API_KEY` | Springer Nature **Open Access tier** API key (dev-portal key, free; routes through `api.springernature.com/openaccess/jats`) | unset → if `SPRINGER_TDM_API_KEY` is also unset, `springer` retriever raises `MissingCredentialError` |
+| `SPRINGER_TDM_API_KEY` | Springer Nature **premium TDM tier** API key (full-text licence; routes through `spdi.public.springernature.app/xmldata/jats`). Wins over `SPRINGER_OA_API_KEY` when both are set. | unset → fall back to OA tier (or `MissingCredentialError` if neither key is set) |
 | `ELSEVIER_API_KEY` | Elsevier ScienceDirect API key | unset → `elsevier` retriever raises `MissingCredentialError` |
 | `ELSEVIER_INSTTOKEN` | Elsevier institutional token (optional) | unset → only OA-tier titles accessible |
 | `LITSPECTRAITS_RATE_LIMIT_WILEY` | Wiley rate limit override (req/s) | `3.0` |
@@ -698,7 +749,7 @@ model cache + accelerator detection, plus opt-in
 The publisher tokens use the bare names that match each SDK's documented
 env vars where applicable: `TDM_API_TOKEN` for Wiley is internal to the
 lib (forwarded from `WILEY_TDM_TOKEN` via a scoped env context, §7.1);
-`SPRINGER_API_KEY` matches the SDK's example. `ELSEVIER_API_KEY` and
+`SPRINGER_OA_API_KEY` matches the SDK's example. `ELSEVIER_API_KEY` and
 `ELSEVIER_INSTTOKEN` follow the `X-ELS-*` header naming used in
 Elsevier's API docs — there is no SDK to match (§7.3). Less translation
 surface, fewer foot-guns.
@@ -723,6 +774,11 @@ and silent fallback".
   paywall-HTML-as-PDF, error-page-as-XML.
 - **Hash collision against existing artifact differing in bytes** →
   `IntegrityError`, exit 7. Never silently overwrite.
+- **Springer DOI not open-access** (OA tier configured, premium TDM
+  tier not) → `NotOpenAccessError`, exit 8. The credential is valid, the
+  DOI is real — the content is just not in the OA corpus. Recourse is
+  to acquire a TDM licence (`SPRINGER_TDM_API_KEY`) or `sideload` an
+  institutionally-licensed PDF (§7.2).
 - **Sideload of non-PDF** → `MalformedArtifactError`, exit 6.
 - **`docling` import or model download failure** → propagate verbatim. Don't
   catch.
@@ -915,7 +971,7 @@ should land as one (or a tight few) commits ending green on
       Pins: `wiley-tdm>=1.0` (only release), `springernature-api-client>=0.0.9`
       (latest; SDK never reached 1.0), `docling>=2.0`, `lxml>=5.3`.
 - [x] Rewrite `src/litspectraits/config.py`: drop `crossref_tdm_token`;
-      add `wiley_tdm_token`, `springer_api_key`, `elsevier_api_key`,
+      add `wiley_tdm_token`, `springer_oa_api_key`, `elsevier_api_key`,
       `elsevier_insttoken`, three `rate_limit_*` overrides,
       `expected_egress_cidrs`. Float-and-CIDR parsing helpers fail loudly
       on bad input via `MissingConfigError`.

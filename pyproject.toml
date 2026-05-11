@@ -20,7 +20,11 @@ dependencies = [
 [project.optional-dependencies]
 wiley = ['wiley-tdm>=1.0']
 springer = ['springernature-api-client>=0.0.9']
-extract = ['docling>=2.0']
+# torch / torchvision are pulled in transitively by docling-ibm-models, but
+# they are listed here explicitly so the `[tool.uv.sources]` pin to the
+# CUDA-12.6 wheel index takes effect — uv only honours `sources` for direct
+# dependencies. Version bounds mirror docling-ibm-models' own constraints.
+extract = ['docling>=2.0', 'torch>=2.2.2,<3', 'torchvision<1']
 all = [
     'litspectraits[wiley,springer,extract]',
 ]
@@ -44,6 +48,22 @@ build-backend = 'hatchling.build'
 
 [tool.hatch.build.targets.wheel]
 packages = ['src/litspectraits']
+
+# torch/torchvision arrive transitively via docling-ibm-models. The default
+# PyPI wheel is the +cu130 build (CUDA 13.0), which needs an NVIDIA driver
+# >= ~580; our boxes run 550.x (CUDA 12.4 ceiling), so it silently falls back
+# to CPU. Pin the CUDA-12.6 build instead — same torch version, runs on a
+# 12.x driver via CUDA minor-version compatibility. Bump this index when the
+# driver baseline moves. `explicit = true` keeps the index scoped to the two
+# packages below.
+[[tool.uv.index]]
+name = 'pytorch-cu126'
+url = 'https://download.pytorch.org/whl/cu126'
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = 'pytorch-cu126' }]
+torchvision = [{ index = 'pytorch-cu126' }]
 
 [tool.ruff]
 line-length = 99

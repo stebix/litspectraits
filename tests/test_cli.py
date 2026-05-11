@@ -100,7 +100,7 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv('COLUMNS', '200')
     for var in (
         'WILEY_TDM_TOKEN',
-        'SPRINGER_API_KEY',
+        'SPRINGER_OA_API_KEY',
         'ELSEVIER_API_KEY',
         'ELSEVIER_INSTTOKEN',
         'LITSPECTRAITS_EXPECTED_EGRESS_CIDRS',
@@ -1005,7 +1005,9 @@ def test_extract_passes_reextract_flag_through_dispatch(
 
     result = runner.invoke(app, ['extract', '--reextract', record.doi])
     assert result.exit_code == 0
-    assert captured['kwargs'] == {'reextract': True}
+    # ``model_cache_dir`` rides along from Settings (None unless
+    # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR is set).
+    assert captured['kwargs'] == {'reextract': True, 'model_cache_dir': None}
 
 
 def test_extract_by_sha256_resolves_via_read_manifest(

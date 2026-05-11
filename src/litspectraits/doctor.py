@@ -18,8 +18,13 @@ Three checks, all read-only by default:
    real artifact store.
 3. **Extract components** (``extract-pdf-plan.md`` §8) — probe the
    ``[extract]`` extra, the docling model cache, and the accelerator
-   ``AcceleratorDevice.AUTO`` will resolve to. Two opt-ins ride on top
-   of this section: ``--download-models`` runs
+   ``AcceleratorDevice.AUTO`` will resolve to. The model-cache location
+   honors ``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``
+   (:attr:`~litspectraits.config.Settings.docling_model_cache_dir`) —
+   when set, it is both the directory probed for weights and the
+   ``output_dir`` ``--download-models`` writes to; otherwise docling's
+   own ``~/.cache/docling/models`` applies. Two opt-ins ride on top of
+   this section: ``--download-models`` runs
    :func:`docling.utils.model_downloader.download_models` for the
    required layout + TableFormer weights, and ``--smoke-extract`` runs
    a live docling conversion against the packaged synthetic fixture.
@@ -67,6 +72,7 @@ from litspectraits.errors import (
     ExtractError,
     IngestError,
     MissingCredentialError,
+    NotOpenAccessError,
 )
 from litspectraits.manifest import (
     AcquisitionRecord,
@@ -98,13 +104,22 @@ class IPStatus(StrEnum):
 
 
 class CredStatus(StrEnum):
-    """Per-publisher credential smoke-test result."""
+    """Per-publisher credential smoke-test result.
+
+    ``NOT_OPEN_ACCESS`` is Springer-specific: the operator's
+    ``SPRINGER_OA_API_KEY`` is valid but the smoke DOI is not open-access,
+    so the Open Access tier cannot serve it. Carved out from
+    ``OTHER_FAILURE`` because the recourse ("get a TDM licence or
+    sideload") is materially different — see
+    :class:`~litspectraits.errors.NotOpenAccessError`.
+    """
 
     NOT_CONFIGURED = 'not_configured'
     OK = 'ok'
     MISSING_CREDENTIAL = 'missing_credential'
     AUTH_REJECTED = 'auth_rejected'
     ENTITLEMENT_DOWNGRADE = 'entitlement_downgrade'
+    NOT_OPEN_ACCESS = 'not_open_access'
     OTHER_FAILURE = 'other_failure'
 
 
@@ -354,6 +369,13 @@ async def _check_one_publisher(
             smoke_doi=smoke_doi,
             detail=_summarize(exc),
         )
+    except NotOpenAccessError as exc:
+        return CredCheck(
+            publisher=publisher,
+            status=CredStatus.NOT_OPEN_ACCESS,
+            smoke_doi=smoke_doi,
+            detail=_summarize(exc),
+        )
     except IngestError as exc:
         return CredCheck(
             publisher=publisher,
@@ -374,7 +396,10 @@ def _has_credential(publisher: Publisher, settings: Settings) -> bool:
         case Publisher.WILEY:
             return bool(settings.wiley_tdm_token)
         case Publisher.SPRINGER_NATURE:
-            return bool(settings.springer_api_key)
+            # Either tier counts as "configured" — the retriever picks
+            # which one to exercise (TDM if its key is set, otherwise
+            # the dev-portal Open Access tier).
+            return bool(settings.springer_tdm_api_key or settings.springer_oa_api_key)
         case Publisher.ELSEVIER:
             return bool(settings.elsevier_api_key)
 
@@ -484,6 +509,7 @@ async def _check_extract_section(
     so the final table reflects on-disk truth, not the pre-download
     state.
     """
+    model_cache_dir = settings.docling_model_cache_dir
     extra_row = _check_docling_extra()
     if extra_row.status is ExtractStatus.NOT_INSTALLED:
         rows: list[ExtractComponentCheck] = [extra_row]
@@ -501,9 +527,11 @@ async def _check_extract_section(
 
     if download_models:
         # Synchronous, multi-GB I/O; off the event loop.
-        await asyncio.to_thread(_maybe_download_models, force=False)
+        await asyncio.to_thread(
+            _maybe_download_models, force=False, model_cache_dir=model_cache_dir
+        )
 
-    model_rows = _check_docling_models()
+    model_rows = _check_docling_models(model_cache_dir=model_cache_dir)
     accel_row = _check_accelerator()
     ocr_row = _check_ocr_engines()
 
@@ -547,7 +575,7 @@ def _check_docling_extra() -> ExtractComponentCheck:
     )
 
 
-def _check_docling_models() -> list[ExtractComponentCheck]:
+def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractComponentCheck]:
     """Probe the docling model cache for layout + TableFormer presence.
 
     Existence-and-non-emptiness rather than per-file fingerprinting —
@@ -555,8 +583,17 @@ def _check_docling_models() -> list[ExtractComponentCheck]:
     exists with at least one file" is the strongest invariant we can
     assert without coupling ourselves to a particular weight filename
     that the next minor bump will rename.
+
+    Parameters
+    ----------
+    model_cache_dir : pathlib.Path | None
+        Override for the weights directory
+        (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``); ``None`` falls back to
+        docling's own ``~/.cache/docling/models``.
     """
-    models_root, layout_folder, tableformer_folder = _docling_model_dirs()
+    models_root, layout_folder, tableformer_folder = _docling_model_dirs(
+        model_cache_dir=model_cache_dir
+    )
     layout_dir = models_root / layout_folder
     tableformer_dir = models_root / tableformer_folder
     return [
@@ -597,16 +634,21 @@ def _model_row(
     )
 
 
-def _docling_model_dirs() -> tuple[Path, str, str]:
+def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str]:
     """Resolve ``(models_root, layout_folder, tableformer_folder)``.
 
-    Pulls the values from docling's own public-ish APIs rather than
-    hardcoding paths: ``settings.cache_dir / 'models'`` for the root,
-    ``LayoutOptions().model_spec.model_repo_folder`` for layout, and
-    ``TableStructureModel._model_repo_folder`` for TableFormer. The
-    TableFormer accessor is dunder-private inside docling but stable
+    Pulls the folder names from docling's own public-ish APIs rather than
+    hardcoding paths: ``LayoutOptions().model_spec.model_repo_folder`` for
+    layout and ``TableStructureModel._model_repo_folder`` for TableFormer.
+    The TableFormer accessor is dunder-private inside docling but stable
     across the 2.x line; we accept that fragility in exchange for not
     string-duplicating ``'docling-project--docling-models'`` here.
+
+    The root is ``model_cache_dir`` when set
+    (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`` — the same value the
+    extractor passes as ``PdfPipelineOptions.artifacts_path`` and
+    ``--download-models`` writes to), otherwise docling's default
+    ``settings.cache_dir / 'models'`` (``~/.cache/docling/models``).
     """
     from docling.datamodel.pipeline_options import (  # pyright: ignore[reportMissingImports]
         LayoutOptions,
@@ -627,7 +669,10 @@ def _docling_model_dirs() -> tuple[Path, str, str]:
         TableStructureModel,
     )
 
-    models_root = Path(docling_settings.cache_dir) / 'models'
+    if model_cache_dir is not None:
+        models_root = model_cache_dir
+    else:
+        models_root = Path(docling_settings.cache_dir) / 'models'
     layout_folder = str(LayoutOptions().model_spec.model_repo_folder)
     tableformer_folder = str(TableStructureModel._model_repo_folder)
     return models_root, layout_folder, tableformer_folder
@@ -696,7 +741,7 @@ def _check_ocr_engines() -> ExtractComponentCheck:
     )
 
 
-def _maybe_download_models(*, force: bool) -> None:
+def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) -> None:
     """Run docling's downloader for the required v3 weights.
 
     Synchronous; the caller dispatches via :func:`asyncio.to_thread`.
@@ -706,13 +751,20 @@ def _maybe_download_models(*, force: bool) -> None:
     docling 2.93 — we pin it False so a doctor run with
     ``--download-models`` doesn't quietly pull an OCR engine we never
     use (``extract-pdf-plan.md`` §8 "Required vs optional models").
+
+    ``model_cache_dir`` (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``) is the
+    weights directory; passing ``None`` leaves docling on its default
+    ``settings.cache_dir / 'models'`` — matching what
+    :func:`_docling_model_dirs` then probes and what
+    :func:`litspectraits.extract.pdf.extract_pdf` reads from.
     """
     from docling.utils.model_downloader import (  # pyright: ignore[reportMissingImports]
         download_models,
     )
 
-    _logger.info('downloading docling models (layout + tableformer)')
+    _logger.info('downloading docling models (layout + tableformer)', output_dir=model_cache_dir)
     download_models(
+        output_dir=model_cache_dir,
         force=force,
         progress=False,
         with_layout=True,
@@ -766,7 +818,12 @@ async def _maybe_smoke_extract(
         record = _stage_fixture_for_smoke(fixture_path=fixture_path, store=store)
         start = time.monotonic()
         try:
-            await extract_pdf(record, store, reextract=False)
+            await extract_pdf(
+                record,
+                store,
+                reextract=False,
+                model_cache_dir=settings.docling_model_cache_dir,
+            )
         except ExtractError as exc:
             return ExtractComponentCheck(
                 component=_COMPONENT_SMOKE,
@@ -891,6 +948,7 @@ _CRED_STATUS_LABEL: Final[dict[CredStatus, str]] = {
     CredStatus.MISSING_CREDENTIAL: 'missing credential',
     CredStatus.AUTH_REJECTED: 'auth rejected',
     CredStatus.ENTITLEMENT_DOWNGRADE: 'entitlement downgrade',
+    CredStatus.NOT_OPEN_ACCESS: 'not open-access',
     CredStatus.OTHER_FAILURE: 'other failure',
 }
 

@@ -111,6 +111,7 @@ async def extract_pdf(
     store: ArtifactStore,
     *,
     reextract: bool = False,
+    model_cache_dir: Path | None = None,
 ) -> ExtractRecord:
     """Convert a PDF artifact to ``documents/<sha>/document.json`` + ``meta.json``.
 
@@ -141,6 +142,12 @@ async def extract_pdf(
         raises :class:`~litspectraits.errors.ExtractIntegrityError` —
         silent overwrites are never acceptable (``overview-v3.md`` §3, §10;
         ``extract-pdf-plan.md`` §3 stage 5).
+    model_cache_dir : pathlib.Path | None, default None
+        Directory holding the docling model weights. ``None`` leaves docling
+        on its default cache (``~/.cache/docling/models``); when set it is
+        forwarded as ``PdfPipelineOptions.artifacts_path``. Sourced from
+        :attr:`~litspectraits.config.Settings.docling_model_cache_dir`
+        (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``).
 
     Returns
     -------
@@ -179,7 +186,7 @@ async def extract_pdf(
     """
     artifact_path = _preflight(record=record, store=store)
 
-    sdk = _load_docling(doi=record.doi)
+    sdk = _load_docling(doi=record.doi, model_cache_dir=model_cache_dir)
     convert_result = await asyncio.to_thread(sdk.converter.convert, artifact_path)
     _check_conversion_status(doi=record.doi, result=convert_result, status_cls=sdk.status_cls)
 
@@ -235,13 +242,23 @@ def _preflight(*, record: AcquisitionRecord, store: ArtifactStore) -> Path:
 # Stage 2 — convert -----------------------------------------------------------
 
 
-def _load_docling(*, doi: str) -> _DoclingAdapter:
+def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingAdapter:
     """Lazy-import docling and build a converter with our academic-PDF settings.
 
     Matches ``extract-pdf-plan.md`` §4 verbatim: ``do_ocr=False``,
     ``TableFormerMode.ACCURATE``, ``do_cell_matching=True``,
     ``AcceleratorDevice.AUTO``. See the plan-doc for the rationale on
     each switch.
+
+    Parameters
+    ----------
+    doi : str
+        Bound onto any :class:`~litspectraits.errors.DoclingImportError`.
+    model_cache_dir : pathlib.Path | None, default None
+        When set, forwarded as ``PdfPipelineOptions.artifacts_path`` so
+        docling resolves the layout + TableFormer weights from this
+        directory instead of ``~/.cache/docling/models``. ``None`` keeps
+        docling's default lookup.
 
     Tests bypass this by monkeypatching the symbol; the import-error path
     is exercised by patching ``sys.modules['docling'] = None``.
@@ -284,6 +301,10 @@ def _load_docling(*, doi: str) -> _DoclingAdapter:
         accelerator_options=AcceleratorOptions(
             device=AcceleratorDevice.AUTO,
         ),
+        # ``None`` keeps docling's own ``~/.cache/docling/models`` lookup;
+        # a path (from ``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``) points it
+        # at an out-of-tree weights directory, decoupled from ``data_dir``.
+        artifacts_path=model_cache_dir,
     )
     converter = DocumentConverter(
         format_options={

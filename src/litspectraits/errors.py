@@ -90,6 +90,25 @@ class EntitlementDowngradeError(IngestError):
     """
 
 
+class NotOpenAccessError(IngestError):
+    """Springer Open Access tier returned zero records for a real DOI.
+
+    Raised by the Springer retriever's OA path when
+    ``api.springernature.com/openaccess/jats`` answers 200 with a body
+    containing no ``<article>`` element for a DOI we know exists (it
+    passed the CrossRef metadata lookup upstream). The DOI is real but
+    not open-access — the operator needs the premium TDM tier
+    (``SPRINGER_TDM_API_KEY``) to retrieve it, or must sideload an
+    institutionally-licensed PDF.
+
+    Distinct from :class:`PublisherAPIError` so the CLI panel hint can
+    point at the *recourse* (acquire TDM tier, or sideload) rather than
+    leaving the operator wondering whether their key is broken.
+    Distinct from :class:`AuthRejectedError` because the credential is
+    valid — only its content scope is too narrow.
+    """
+
+
 class RateLimitExhaustedError(IngestError):
     """Publisher returned 429 after the retriever's bounded retry chain."""
 

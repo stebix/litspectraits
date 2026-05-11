@@ -64,6 +64,14 @@ class Settings:
         the operator on manual sideloads.
     data_dir : pathlib.Path
         Root for ``artifacts/``, ``manifests/``, ``index/`` and ``tmp/``.
+    docling_model_cache_dir : pathlib.Path | None
+        Directory holding the docling model weights (the layout + TableFormer
+        repo folders). ``None`` (the default) leaves docling on its own cache
+        location — ``docling.datamodel.settings.settings.cache_dir / 'models'``,
+        i.e. ``~/.cache/docling/models``. When set, the PDF extractor passes
+        it as ``PdfPipelineOptions.artifacts_path`` and ``doctor
+        --download-models`` writes there, so this knob is fully independent of
+        :attr:`data_dir`.
     http_timeout_s : float
         Per-request timeout in seconds for first-party HTTP calls (CrossRef,
         ``doctor`` IP check, Elsevier retriever). Publisher SDKs (Wiley,
@@ -76,8 +84,20 @@ class Settings:
         Wiley retriever falls back to IP-based auth (Würzburg egress); it
         raises :class:`~litspectraits.errors.MissingCredentialError` if
         that path also fails.
-    springer_api_key : str | None
-        Springer Nature TDM API key. Required — there is no IP fallback.
+    springer_oa_api_key : str | None
+        Springer Nature **Open Access tier** API key — a standard
+        developer-portal key (free, ``dev.springernature.com``). Used by
+        the Springer retriever to fetch JATS XML from
+        ``api.springernature.com/openaccess/jats`` for open-access DOIs.
+        Either this **or** :attr:`springer_tdm_api_key` must be set; if
+        both are present the retriever prefers the TDM tier.
+    springer_tdm_api_key : str | None
+        Springer Nature **premium TDM tier** API key — issued under a
+        Full-Text / TDM licence (``datasolutions.springernature.com``).
+        When set, the Springer retriever uses the premium endpoint
+        ``spdi.public.springernature.app/xmldata/jats``, which covers
+        both open-access and subscription-only Springer Nature content.
+        No IP fallback.
     elsevier_api_key : str | None
         Elsevier ScienceDirect API key (sent as ``X-ELS-APIKey``). Required.
     elsevier_insttoken : str | None
@@ -96,10 +116,12 @@ class Settings:
 
     contact_email: str
     data_dir: Path
+    docling_model_cache_dir: Path | None
     http_timeout_s: float
     log_format: str
     wiley_tdm_token: str | None
-    springer_api_key: str | None
+    springer_oa_api_key: str | None
+    springer_tdm_api_key: str | None
     elsevier_api_key: str | None
     elsevier_insttoken: str | None
     rate_limit_wiley: float
@@ -125,13 +147,17 @@ class Settings:
             )
         data_dir_raw = os.environ.get('LITSPECTRAITS_DATA_DIR')
         data_dir = Path(data_dir_raw) if data_dir_raw else Path(user_data_dir(_APP_NAME))
+        model_cache_raw = os.environ.get('LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR')
+        docling_model_cache_dir = Path(model_cache_raw) if model_cache_raw else None
         return cls(
             contact_email=os.environ['LITSPECTRAITS_CONTACT_EMAIL'],
             data_dir=data_dir,
+            docling_model_cache_dir=docling_model_cache_dir,
             http_timeout_s=_parse_float('LITSPECTRAITS_HTTP_TIMEOUT_S', _DEFAULT_HTTP_TIMEOUT_S),
             log_format=os.environ.get('LITSPECTRAITS_LOG_FORMAT', 'rich'),
             wiley_tdm_token=os.environ.get('WILEY_TDM_TOKEN') or None,
-            springer_api_key=os.environ.get('SPRINGER_API_KEY') or None,
+            springer_oa_api_key=os.environ.get('SPRINGER_OA_API_KEY') or None,
+            springer_tdm_api_key=os.environ.get('SPRINGER_TDM_API_KEY') or None,
             elsevier_api_key=os.environ.get('ELSEVIER_API_KEY') or None,
             elsevier_insttoken=os.environ.get('ELSEVIER_INSTTOKEN') or None,
             rate_limit_wiley=_parse_float(

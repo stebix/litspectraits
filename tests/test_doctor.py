@@ -703,9 +703,9 @@ def test_check_docling_models_missing_when_cache_empty(
 
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+        lambda **_: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
     )
-    rows = _check_docling_models()
+    rows = _check_docling_models(model_cache_dir=None)
     assert len(rows) == 2
     assert all(row.status is ExtractStatus.MISSING for row in rows)
     assert all(row.is_required for row in rows)
@@ -733,9 +733,9 @@ def test_check_docling_models_ok_when_cache_populated(
 
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (models_root, 'layout-folder', 'tableformer-folder'),
+        lambda **_: (models_root, 'layout-folder', 'tableformer-folder'),
     )
-    rows = _check_docling_models()
+    rows = _check_docling_models(model_cache_dir=None)
     assert {row.component for row in rows} == {'layout model', 'TableFormer'}
     assert all(row.status is ExtractStatus.OK for row in rows)
 
@@ -841,7 +841,7 @@ async def test_check_extract_section_flags_required_failure_when_model_missing(
     # Empty model cache.
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+        lambda **_: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
     )
     report = await _check_extract_section(
         settings=settings,
@@ -871,7 +871,7 @@ async def test_check_extract_section_clears_when_models_present(
 
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+        lambda **_: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
     )
     report = await _check_extract_section(
         settings=settings,
@@ -902,12 +902,13 @@ async def test_check_extract_section_runs_download_when_flagged(
     tableformer_dir = models_root / 'tableformer-folder'
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (models_root, 'layout-folder', 'tableformer-folder'),
+        lambda **_: (models_root, 'layout-folder', 'tableformer-folder'),
     )
 
     download_calls: list[bool] = []
 
-    def _fake_download(*, force: bool) -> None:
+    def _fake_download(*, force: bool, model_cache_dir: Path | None = None) -> None:
+        del model_cache_dir
         download_calls.append(force)
         layout_dir.mkdir(parents=True)
         tableformer_dir.mkdir(parents=True)
@@ -947,7 +948,7 @@ async def test_check_extract_section_runs_smoke_when_flagged(
     (tableformer_dir / 'config.json').write_text('{}')
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+        lambda **_: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
     )
 
     fixture_path = tmp_path / 'synthetic.pdf'
@@ -955,9 +956,11 @@ async def test_check_extract_section_runs_smoke_when_flagged(
 
     called: list[str] = []
 
-    async def _fake_extract_pdf(record, _store, *, reextract: bool) -> None:
+    async def _fake_extract_pdf(
+        record, _store, *, reextract: bool, model_cache_dir: Path | None = None
+    ) -> None:
         called.append(record.doi)
-        del reextract
+        del reextract, model_cache_dir
 
     monkeypatch.setattr('litspectraits.extract.pdf.extract_pdf', _fake_extract_pdf)
 
@@ -995,7 +998,7 @@ async def test_check_extract_section_smoke_missing_fixture_returns_missing_row(
     (tableformer_dir / 'x').write_bytes(b'.')
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
-        lambda: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
+        lambda **_: (tmp_path / 'models', 'layout-folder', 'tableformer-folder'),
     )
 
     report = await _check_extract_section(

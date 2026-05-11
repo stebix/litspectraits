@@ -72,6 +72,7 @@ from litspectraits.errors import (
     MalformedDocumentError,
     MissingArtifactError,
     MissingCredentialError,
+    NotOpenAccessError,
     ParseDegradedError,
     PublisherAPIError,
     RateLimitExhaustedError,
@@ -116,6 +117,11 @@ _INGEST_EXIT_CODES: Final[dict[type[IngestError], int]] = {
     PublisherAPIError: 5,
     MalformedArtifactError: 6,
     IntegrityError: 7,
+    # 8 is the next free slot; reserved for the Springer-OA "DOI is real
+    # but not open-access" failure. Distinct from AuthRejectedError (key
+    # is valid, just too narrow in scope) and from PublisherAPIError
+    # (no fault on Springer's side — the response was well-formed).
+    NotOpenAccessError: 8,
 }
 
 
@@ -160,6 +166,11 @@ _INGEST_HINTS: Final[dict[type[IngestError], str]] = {
     ),
     EntitlementDowngradeError: (
         'Elsevier returned META_ABS — request a full-text title or run from an entitled IP'
+    ),
+    NotOpenAccessError: (
+        'DOI exists but is not open-access; '
+        'set SPRINGER_TDM_API_KEY (premium TDM licence) for the full Springer corpus, '
+        'or `litspectraits sideload <doi> <pdf>` an institutionally-licensed copy'
     ),
     RateLimitExhaustedError: 'publisher 429d after retries; back off and retry later',
     PublisherAPIError: 'publisher 5xx or malformed response; rerun and escalate if persistent',
@@ -534,7 +545,9 @@ async def _run_extract(*, target: str, reextract: bool, json_output: bool) -> No
     record = _resolve_extract_target(target=target, store=store, err_console=err_console)
 
     try:
-        extract_record = await run_extract(record, store, reextract=reextract)
+        extract_record = await run_extract(
+            record, store, reextract=reextract, model_cache_dir=settings.docling_model_cache_dir
+        )
     except ExtractError as exc:
         _render_error_panel(exc, console=err_console, hints=_EXTRACT_HINTS)
         raise typer.Exit(_EXTRACT_EXIT_CODES.get(type(exc), 1)) from exc

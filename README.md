@@ -66,6 +66,7 @@ credentials are checked lazily by the corresponding retriever and raise
 | --------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
 | `LITSPECTRAITS_CONTACT_EMAIL`           | Polite-pool mailto for CrossRef + sideload operator                      | **required**                       |
 | `LITSPECTRAITS_DATA_DIR`                | Root for `artifacts/`, `manifests/`, `index/`, `tmp/`                    | `~/.local/share/litspectraits`     |
+| `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR` | Docling model-weights dir (PDF extractor `artifacts_path`; `doctor --download-models` target) | unset → `~/.cache/docling/models`  |
 | `LITSPECTRAITS_HTTP_TIMEOUT_S`          | Per-request timeout for first-party HTTP (CrossRef, Elsevier, doctor)    | `30`                               |
 | `LITSPECTRAITS_LOG_FORMAT`              | `rich` (human) or `json` (aggregation)                                   | `rich`                             |
 | `LITSPECTRAITS_RATE_LIMIT_WILEY`        | Wiley retriever ceiling (req/s)                                          | `3`                                |

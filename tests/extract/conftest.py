@@ -179,7 +179,8 @@ def fake_docling(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDocling]:
     )
     load_calls: list[str] = []
 
-    def _fake_load(*, doi: str) -> _DoclingAdapter:
+    def _fake_load(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingAdapter:
+        del model_cache_dir  # the fake adapter ignores the weights location
         load_calls.append(doi)
         return adapter
 

@@ -15,11 +15,18 @@ Selection criteria
 Each DOI must satisfy three properties:
 
 1. **Open access** — entitlement-free so doctor's smoke test passes from
-   any IP that holds a valid TDM credential. A non-OA DOI here makes
-   doctor false-fail on entitlement (Elsevier ``META_ABS``) or
-   ``AuthRejectedError`` (Wiley / Springer) for operators outside the
-   Würzburg allow-list — exactly the *failures* doctor is meant to
-   detect, but for the wrong reason.
+   any IP that holds a valid publisher credential, on either tier of
+   each publisher's API. A non-OA DOI here makes doctor false-fail on
+   entitlement (Elsevier ``META_ABS``, Springer ``NotOpenAccessError``
+   under the OA tier) or ``AuthRejectedError`` (Wiley / Springer TDM
+   tier) for operators outside the Würzburg allow-list — exactly the
+   *failures* doctor is meant to detect, but for the wrong reason.
+
+   For Springer specifically: the OA tier (``SPRINGER_OA_API_KEY``) and
+   the premium TDM tier (``SPRINGER_TDM_API_KEY``) must both be able to
+   serve the chosen DOI. OA imposes the stricter constraint (only OA
+   content is reachable), so pick the DOI to satisfy that — the TDM
+   tier will then trivially cover it too.
 2. **Stable** — published in a journal whose DOIs are not regularly
    redirected or withdrawn. BMC / Heliyon back-catalog typically holds.
 3. **Inside the publisher's TDM corpus** — for Springer Nature this
@@ -46,17 +53,17 @@ from typing import Final
 from litspectraits.manifest import Publisher
 
 SMOKE_DOI: Final[dict[Publisher, str]] = {
-    # TODO: verify — pick a Wiley OA Open journal (Wiley OnlineLibrary
-    # surfaces these as "Open Access — published under a CC BY licence").
-    # Hindawi-portfolio titles migrated to Wiley TDM are good candidates.
-    Publisher.WILEY: '10.1002/advs.202002917',
-    # TODO: verify — BMC titles (10.1186/...) are Springer-Nature OA by
-    # default and live in the premium TDM corpus.
-    Publisher.SPRINGER_NATURE: '10.1186/s12880-024-01211-w',
-    # TODO: verify — Heliyon (10.1016/j.heliyon...) is Elsevier's gold-OA
-    # title; ``view=FULL`` returns the populated ``<originalText>`` for
-    # OA papers without an institutional token.
-    Publisher.ELSEVIER: '10.1016/j.heliyon.2024.e26000',
+   # 2026-05-11: hand picked very recent OA paper
+   # Rosette MRF from Seiberlich group
+   Publisher.WILEY: '10.1002/mrm.70299',
+
+   # 2026-05-11: hand picked very recent OA paper
+   # MAGMA UTE paper from Nan Yin
+   Publisher.SPRINGER_NATURE: '10.1007/s10334-026-01362-7',
+
+   # 2026-05-11: hand picked very recent OA paper
+   # Image quality assessment by Saher Saeed
+   Publisher.ELSEVIER: '10.1016/j.mri.2026.110656',
 }
 """DOI smoke-test registry, keyed by :class:`~litspectraits.manifest.Publisher`.
 

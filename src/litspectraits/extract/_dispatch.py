@@ -8,6 +8,8 @@ load-bearing piece of step 10a — every leaf extractor plugs into a
 dispatcher that already speaks the right error language.
 """
 
+from pathlib import Path
+
 from litspectraits.extract.elsevier import extract_elsevier
 from litspectraits.extract.jats import extract_jats
 from litspectraits.extract.pdf import extract_pdf
@@ -20,6 +22,7 @@ async def extract(
     store: ArtifactStore,
     *,
     reextract: bool = False,
+    model_cache_dir: Path | None = None,
 ) -> ExtractRecord:
     """Dispatch ``record`` to the format-specific extractor.
 
@@ -38,6 +41,10 @@ async def extract(
         ``document.json`` differs from the one we are about to write.
         Surfaces as :class:`~litspectraits.errors.ExtractIntegrityError`
         when ``False`` and bytes differ.
+    model_cache_dir : pathlib.Path | None, default None
+        Docling model-weights directory; only consulted on the
+        :attr:`Format.PDF` leg (the XML extractors carry no model). See
+        :func:`litspectraits.extract.pdf.extract_pdf`.
 
     Returns
     -------
@@ -51,7 +58,9 @@ async def extract(
     """
     match record.format:
         case Format.PDF:
-            return await extract_pdf(record, store, reextract=reextract)
+            return await extract_pdf(
+                record, store, reextract=reextract, model_cache_dir=model_cache_dir
+            )
         case Format.JATS_XML:
             return await extract_jats(record, store, reextract=reextract)
         case Format.ELSEVIER_XML:
