@@ -1230,12 +1230,31 @@ now fully covered.
       now parametrizes leaf-routes-through and missing-artifact pins
       across all three formats; the 10d `NotImplementedError`
       breadcrumb test is gone.
-- [ ] **Follow-up (out of 10d scope)**: consolidate the duplicated
+- [x] **Follow-up (landed post-10f)**: consolidated the duplicated
       `_commit` / `_atomic_write` / `_file_sha256` / lxml xpath helpers
       across `extract/jats.py` and `extract/elsevier.py` into a shared
-      `extract/_lxml_helpers.py`. The JATS module-level docstring
-      foreshadows this revisit "after 10d when all three concretes
-      exist." Cheap follow-up commit; not blocking 10e / 10f.
+      `extract/_lxml_helpers.py`. The new module owns the
+      `LOCAL_NAME_CHILDREN` xpath constant, `DOCUMENT_FILENAME` /
+      `META_FILENAME`, the `Counts` dataclass (both XML extractors had
+      identical shapes), the eight namespace-agnostic xpath / text
+      walkers (`local_findall`, `first_child`, `first_descendant`,
+      `all_descendants`, `first_child_text`, `first_descendant_text`,
+      `full_text`, `ancestor_section_path`), the atomic file IO
+      helpers (`atomic_write`, `file_sha256`), and the
+      `serialize_document` + `commit_document` orchestrators
+      parameterized on the caller's `Extractor` enum +
+      `schema_name` / `schema_version` pair + `structlog` logger. The
+      per-extractor `_build_extract_record` / `_build_meta` functions
+      were folded into `commit_document` as module-private helpers
+      (same shape between the two callers; the only differences were
+      the `Extractor` enum value and schema name/version, both
+      threaded through). `ancestor_section_path` gained a required
+      `section_localname` kwarg — `'sec'` for JATS, `'section'` for
+      Elsevier — so each call site reads as spec. Net: ~73 lines
+      removed across the two extractors, and every helper now has one
+      canonical home. PDF extractor stays untouched; its commit
+      function carries an extra `pipeline` block and real `n_pages`
+      that don't fit the XML contract.
 
 **10e — CLI `extract` command (done).** Makes the work user-visible
 end-to-end; works for every `Format` from the first commit because it

@@ -31,26 +31,32 @@ defence the Elsevier retriever runs (``retrievers/elsevier.py``).
 """
 
 import asyncio
-import hashlib
-import json
-import os
 import re
-import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import structlog
 from lxml import etree
 
 from litspectraits.errors import (
     EmptyDocumentError,
-    ExtractIntegrityError,
     MalformedDocumentError,
     MissingArtifactError,
-    SerializationError,
     WrongFormatForExtractorError,
+)
+from litspectraits.extract._lxml_helpers import (
+    Counts,
+    all_descendants,
+    ancestor_section_path,
+    commit_document,
+    first_child,
+    first_child_text,
+    first_descendant,
+    first_descendant_text,
+    full_text,
+    local_findall,
+    serialize_document,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -61,9 +67,6 @@ from litspectraits.store import ArtifactStore
 SCHEMA_NAME: Final = 'litspectraits-jats-extract'
 SCHEMA_VERSION: Final = '1'
 
-_DOCUMENT_FILENAME: Final = 'document.json'
-_META_FILENAME: Final = 'meta.json'
-
 # Soft-cap on the inline label preserved for an `<xref>` (the visible
 # bracketed citation marker, e.g. "[12]" or "Smith et al., 2019"). Long
 # values almost always indicate the xref wraps a sentence and the label is
@@ -72,28 +75,10 @@ _XREF_LABEL_MAX: Final = 200
 
 _logger: Final = structlog.get_logger('litspectraits.extract.jats')
 
-# Local-name predicates so namespace prefix variants (``jats:sec`` vs ``sec``)
-# both match. ``iterfind`` does not support the local-name() XPath function
-# (its grammar is a strict subset of XPath 1.0), so we use ``xpath()``.
-# ``./`` anchors at the receiver, ``*`` selects all direct children.
-_LOCAL_NAME_CHILDREN: Final = './*[local-name()=$name]'
-
-
-@dataclass(frozen=True)
-class _Counts:
-    """Structural counters tallied during the single document walk."""
-
-    n_text_blocks: int
-    n_section_headers: int
-    n_tables: int
-    n_figures: int
-    n_references: int
-    char_count: int
-
 
 # Accumulator captured once per extraction; mutated by the walkers and
-# frozen into ``_Counts`` at the end. Mutable on purpose — using
-# ``_Counts`` as the working buffer would produce dataclass churn for no
+# frozen into ``Counts`` at the end. Mutable on purpose — using
+# ``Counts`` as the working buffer would produce dataclass churn for no
 # benefit.
 @dataclass
 class _Acc:
@@ -177,13 +162,17 @@ async def extract_jats(
     document['schema_name'] = SCHEMA_NAME
     document['schema_version'] = SCHEMA_VERSION
 
-    body = _serialize_document(doi=record.doi, document=document)
-    return _commit(
+    body = serialize_document(doi=record.doi, document=document, extractor=Extractor.JATS)
+    return commit_document(
         record=record,
         store=store,
         counts=counts,
         body=body,
         reextract=reextract,
+        extractor=Extractor.JATS,
+        schema_name=SCHEMA_NAME,
+        schema_version=SCHEMA_VERSION,
+        logger=_logger,
     )
 
 
@@ -251,11 +240,11 @@ def _parse(*, doi: str, body: bytes) -> etree._Element:
 # Stage 3 — walk --------------------------------------------------------------
 
 
-def _walk(root: etree._Element) -> tuple[dict[str, Any], _Counts]:
+def _walk(root: etree._Element) -> tuple[dict[str, Any], Counts]:
     """Walk the JATS tree once, building the dict and tallying counts."""
     acc = _Acc()
     front = _extract_front(root, acc=acc)
-    body_root = _first_child(root, 'body')
+    body_root = first_child(root, 'body')
     sections = _extract_sections(body_root, acc=acc)
     tables = _extract_tables(body_root, acc=acc)
     figures = _extract_figures(body_root, acc=acc)
@@ -267,7 +256,7 @@ def _walk(root: etree._Element) -> tuple[dict[str, Any], _Counts]:
         'figures': figures,
         'references': references,
     }
-    counts = _Counts(
+    counts = Counts(
         n_text_blocks=acc.text_blocks,
         n_section_headers=acc.section_headers,
         n_tables=acc.tables,
@@ -287,18 +276,18 @@ def _extract_front(root: etree._Element, *, acc: _Acc) -> dict[str, Any]:
     """
     title = None
     abstract: list[str] = []
-    front = _first_child(root, 'front')
+    front = first_child(root, 'front')
     if front is None:
         return {'title': None, 'abstract': None}
-    title_el = _first_descendant(front, 'article-title')
+    title_el = first_descendant(front, 'article-title')
     if title_el is not None:
-        title = _full_text(title_el)
+        title = full_text(title_el)
         acc.chars += len(title)
     # Abstract typically sits under ``<article-meta>``, not directly under
     # ``<front>``; walk the whole subtree so we find it either way.
-    for abstract_el in _all_descendants(front, 'abstract'):
-        for p in _local_findall(abstract_el, 'p'):
-            text = _full_text(p)
+    for abstract_el in all_descendants(front, 'abstract'):
+        for p in local_findall(abstract_el, 'p'):
+            text = full_text(p)
             if text:
                 abstract.append(text)
                 acc.chars += len(text)
@@ -323,8 +312,8 @@ def _extract_sections(body: etree._Element | None, *, acc: _Acc) -> list[dict[st
     def _walk_sec(sec: etree._Element, path: list[str | None]) -> None:
         sec_id = sec.get('id')
         sec_path: list[str | None] = [*path, sec_id]
-        title_el = _first_child(sec, 'title')
-        title = _full_text(title_el) if title_el is not None else ''
+        title_el = first_child(sec, 'title')
+        title = full_text(title_el) if title_el is not None else ''
         if title:
             acc.section_headers += 1
             acc.chars += len(title)
@@ -338,10 +327,10 @@ def _extract_sections(body: etree._Element | None, *, acc: _Acc) -> list[dict[st
                 'blocks': blocks,
             }
         )
-        for child in _local_findall(sec, 'sec'):
+        for child in local_findall(sec, 'sec'):
             _walk_sec(child, sec_path)
 
-    for sec in _local_findall(body, 'sec'):
+    for sec in local_findall(body, 'sec'):
         _walk_sec(sec, [])
     # JATS bodies sometimes carry top-level paragraphs outside any <sec>.
     # Surface them under a synthetic section so the dict shape stays
@@ -388,13 +377,13 @@ def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
     """
     return {
         'type': 'paragraph',
-        'text': _full_text(p),
-        'xrefs': [_xref_descriptor(x) for x in _local_findall(p, 'xref')],
+        'text': full_text(p),
+        'xrefs': [_xref_descriptor(x) for x in local_findall(p, 'xref')],
     }
 
 
 def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
-    label = (_full_text(xref) or '').strip()
+    label = (full_text(xref) or '').strip()
     if len(label) > _XREF_LABEL_MAX:
         label = label[:_XREF_LABEL_MAX]
     return {
@@ -411,7 +400,7 @@ def _extract_tables(body: etree._Element | None, *, acc: _Acc) -> list[dict[str,
     for wrap in body.iter():
         if etree.QName(wrap.tag).localname != 'table-wrap':
             continue
-        table_el = _first_descendant(wrap, 'table')
+        table_el = first_descendant(wrap, 'table')
         if table_el is None:
             continue
         cells = _table_cells(table_el)
@@ -423,9 +412,9 @@ def _extract_tables(body: etree._Element | None, *, acc: _Acc) -> list[dict[str,
         tables.append(
             {
                 'id': wrap.get('id'),
-                'label': _first_child_text(wrap, 'label'),
+                'label': first_child_text(wrap, 'label'),
                 'caption': caption,
-                'section_path': _ancestor_section_path(wrap),
+                'section_path': ancestor_section_path(wrap, section_localname='sec'),
                 'n_rows': n_rows,
                 'n_cols': n_cols,
                 'cells': cells,
@@ -443,7 +432,7 @@ def _table_cells(table: etree._Element) -> list[list[dict[str, Any]]]:
     rendered grid can do that themselves.
     """
     rows_out: list[list[dict[str, Any]]] = []
-    for row in _all_descendants(table, 'tr'):
+    for row in all_descendants(table, 'tr'):
         row_cells: list[dict[str, Any]] = []
         for cell in row:
             local = etree.QName(cell.tag).localname
@@ -451,7 +440,7 @@ def _table_cells(table: etree._Element) -> list[list[dict[str, Any]]]:
                 continue
             row_cells.append(
                 {
-                    'text': _full_text(cell),
+                    'text': full_text(cell),
                     'type': local,
                     'rowspan': _int_attr(cell, 'rowspan', default=1),
                     'colspan': _int_attr(cell, 'colspan', default=1),
@@ -462,12 +451,12 @@ def _table_cells(table: etree._Element) -> list[list[dict[str, Any]]]:
 
 
 def _table_caption_text(wrap: etree._Element) -> str | None:
-    caption = _first_child(wrap, 'caption')
+    caption = first_child(wrap, 'caption')
     if caption is None:
         return None
-    parts = [_full_text(p) for p in _local_findall(caption, 'p')]
+    parts = [full_text(p) for p in local_findall(caption, 'p')]
     text = '\n\n'.join(p for p in parts if p)
-    return text or _full_text(caption) or None
+    return text or full_text(caption) or None
 
 
 def _extract_figures(body: etree._Element | None, *, acc: _Acc) -> list[dict[str, Any]]:
@@ -483,9 +472,9 @@ def _extract_figures(body: etree._Element | None, *, acc: _Acc) -> list[dict[str
         figures.append(
             {
                 'id': fig.get('id'),
-                'label': _first_child_text(fig, 'label'),
+                'label': first_child_text(fig, 'label'),
                 'caption': caption,
-                'section_path': _ancestor_section_path(fig),
+                'section_path': ancestor_section_path(fig, section_localname='sec'),
             }
         )
         acc.figures += 1
@@ -503,11 +492,11 @@ def _extract_references(root: etree._Element, *, acc: _Acc) -> list[dict[str, An
     for ref in root.iter():
         if etree.QName(ref.tag).localname != 'ref':
             continue
-        citation = _first_descendant(ref, 'element-citation')
+        citation = first_descendant(ref, 'element-citation')
         if citation is None:
-            citation = _first_descendant(ref, 'mixed-citation')
+            citation = first_descendant(ref, 'mixed-citation')
         scope = citation if citation is not None else ref
-        raw_text = _full_text(scope).strip()
+        raw_text = full_text(scope).strip()
         raw_text = re.sub(r'\s+', ' ', raw_text)
         if raw_text:
             acc.chars += len(raw_text)
@@ -516,9 +505,9 @@ def _extract_references(root: etree._Element, *, acc: _Acc) -> list[dict[str, An
                 'id': ref.get('id'),
                 'raw_text': raw_text or None,
                 'authors': _ref_authors(scope),
-                'title': _first_descendant_text(scope, 'article-title'),
-                'source': _first_descendant_text(scope, 'source'),
-                'year': _first_descendant_text(scope, 'year'),
+                'title': first_descendant_text(scope, 'article-title'),
+                'source': first_descendant_text(scope, 'source'),
+                'year': first_descendant_text(scope, 'year'),
                 'doi': _ref_doi(scope),
             }
         )
@@ -532,8 +521,8 @@ def _ref_authors(ref: etree._Element) -> list[str]:
     for name in ref.iter():
         if etree.QName(name.tag).localname != 'name':
             continue
-        surname = _first_child_text(name, 'surname')
-        given = _first_child_text(name, 'given-names')
+        surname = first_child_text(name, 'surname')
+        given = first_child_text(name, 'given-names')
         if surname and given:
             authors.append(f'{surname}, {given}')
         elif surname:
@@ -546,96 +535,22 @@ def _ref_doi(ref: etree._Element) -> str | None:
         if etree.QName(pub_id.tag).localname != 'pub-id':
             continue
         if pub_id.get('pub-id-type') == 'doi':
-            text = _full_text(pub_id).strip()
+            text = full_text(pub_id).strip()
             return text or None
     return None
 
 
-# XPath / text helpers --------------------------------------------------------
-
-
-def _local_findall(node: etree._Element | None, name: str) -> list[etree._Element]:
-    """Children with local-name == ``name``, namespace-agnostic.
-
-    The ``$name`` xpath variable means we don't have to escape ``name``
-    for embedding into the expression — keeps the helper safe against
-    accidental injection if a future caller passes user-controlled
-    strings.
-    """
-    if node is None:
-        return []
-    # ``./*[local-name()=$name]`` always yields a node-set, never a scalar,
-    # so the cast is sound; lxml's union return type is the conservative
-    # one for arbitrary xpath expressions.
-    return cast(list[etree._Element], node.xpath(_LOCAL_NAME_CHILDREN, name=name))
-
-
-def _first_child(node: etree._Element | None, name: str) -> etree._Element | None:
-    matches = _local_findall(node, name)
-    return matches[0] if matches else None
-
-
-def _first_descendant(node: etree._Element | None, name: str) -> etree._Element | None:
-    if node is None:
-        return None
-    for child in node.iter():
-        if etree.QName(child.tag).localname == name:
-            return child
-    return None
-
-
-def _all_descendants(node: etree._Element, name: str) -> list[etree._Element]:
-    return [child for child in node.iter() if etree.QName(child.tag).localname == name]
-
-
-def _first_child_text(node: etree._Element | None, name: str) -> str | None:
-    child = _first_child(node, name)
-    if child is None:
-        return None
-    text = _full_text(child).strip()
-    return text or None
-
-
-def _first_descendant_text(node: etree._Element | None, name: str) -> str | None:
-    child = _first_descendant(node, name)
-    if child is None:
-        return None
-    text = _full_text(child).strip()
-    return text or None
-
-
-def _full_text(node: etree._Element | None) -> str:
-    """Concatenated text content of ``node`` and its descendants.
-
-    Whitespace inside the element is preserved as-is — JATS uses
-    significant whitespace inside paragraphs, and collapsing it would
-    make ``[ 12 ]`` indistinguishable from ``[12]`` for downstream
-    citation matching.
-    """
-    if node is None:
-        return ''
-    parts: list[str] = []
-    if node.text:
-        parts.append(node.text)
-    for child in node:
-        parts.append(_full_text(child))
-        if child.tail:
-            parts.append(child.tail)
-    return ''.join(parts)
-
-
-def _ancestor_section_path(node: etree._Element) -> list[str | None]:
-    """Walk up to the first non-section ancestor, recording section ids."""
-    path: list[str | None] = []
-    parent = node.getparent()
-    while parent is not None:
-        if etree.QName(parent.tag).localname == 'sec':
-            path.append(parent.get('id'))
-        parent = parent.getparent()
-    return list(reversed(path))
+# JATS-specific helpers -------------------------------------------------------
 
 
 def _int_attr(node: etree._Element, name: str, *, default: int) -> int:
+    """Parse an integer attribute, falling back to ``default`` on absence / shape error.
+
+    Used to read ``rowspan`` / ``colspan`` off table cells where a
+    malformed value is more likely than a missing one — JATS tables in
+    the wild occasionally carry stray non-integer strings, and a
+    silently-tolerated default beats raising mid-walk.
+    """
     raw = node.get(name)
     if raw is None:
         return default
@@ -643,159 +558,6 @@ def _int_attr(node: etree._Element, name: str, *, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
-
-
-# Stage 4 — serialize ---------------------------------------------------------
-
-
-def _serialize_document(*, doi: str, document: dict[str, Any]) -> bytes:
-    try:
-        text = json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError) as exc:
-        raise SerializationError(
-            doi=doi,
-            extractor=Extractor.JATS.value,
-            hint='extracted document carried a value json.dumps could not encode',
-            error=str(exc),
-        ) from exc
-    return (text + '\n').encode('utf-8')
-
-
-# Stage 5 — commit ------------------------------------------------------------
-
-
-def _commit(
-    *,
-    record: AcquisitionRecord,
-    store: ArtifactStore,
-    counts: _Counts,
-    body: bytes,
-    reextract: bool,
-) -> ExtractRecord:
-    """Atomically install ``document.json`` + ``meta.json``; enforce integrity.
-
-    Decision tree mirrors :func:`litspectraits.extract.pdf._commit` —
-    same idempotency-on-identical-bytes contract. Duplicated rather than
-    extracted to a shared helper because the ``ExtractRecord`` /
-    ``meta.json`` shape differs per-format (no ``pipeline`` block here,
-    ``n_pages=None``); a parameterized abstraction would be more code
-    than the duplication. Revisit after 10d when all three concretes are
-    in hand.
-    """
-    target_dir = store.document_dir(record.sha256)
-    target_doc = target_dir / _DOCUMENT_FILENAME
-    target_meta = target_dir / _META_FILENAME
-
-    new_sha = hashlib.sha256(body).hexdigest()
-    if target_doc.exists():
-        existing_sha = _file_sha256(target_doc)
-        if existing_sha == new_sha:
-            _logger.info(
-                'extract no-op; document.json bytes unchanged',
-                doi=record.doi,
-                sha256=record.sha256,
-                document_sha256=new_sha,
-            )
-            return _build_extract_record(
-                record=record, counts=counts, extracted_at=datetime.now(tz=UTC)
-            )
-        if not reextract:
-            raise ExtractIntegrityError(
-                doi=record.doi,
-                sha256=record.sha256,
-                existing_document_sha256=existing_sha,
-                incoming_document_sha256=new_sha,
-                hint='re-extracted document differs; pass --reextract to overwrite',
-            )
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    extracted_at = datetime.now(tz=UTC)
-    extract_record = _build_extract_record(record=record, counts=counts, extracted_at=extracted_at)
-    meta_payload = _build_meta(record=record, counts=counts, extracted_at=extracted_at)
-    meta_bytes = (json.dumps(meta_payload, indent=2, sort_keys=True) + '\n').encode('utf-8')
-
-    _atomic_write(tmp_dir=store.tmp_dir, target=target_doc, body=body)
-    _atomic_write(tmp_dir=store.tmp_dir, target=target_meta, body=meta_bytes)
-
-    _logger.info(
-        'extract committed',
-        doi=record.doi,
-        sha256=record.sha256,
-        document_sha256=new_sha,
-        n_text_blocks=counts.n_text_blocks,
-        n_section_headers=counts.n_section_headers,
-        n_tables=counts.n_tables,
-        n_figures=counts.n_figures,
-        n_references=counts.n_references,
-        char_count=counts.char_count,
-    )
-    return extract_record
-
-
-def _build_extract_record(
-    *,
-    record: AcquisitionRecord,
-    counts: _Counts,
-    extracted_at: datetime,
-) -> ExtractRecord:
-    return ExtractRecord(
-        sha256=record.sha256,
-        extractor=Extractor.JATS,
-        extractor_version=f'{SCHEMA_NAME}/{SCHEMA_VERSION}',
-        extracted_at=extracted_at,
-        n_text_blocks=counts.n_text_blocks,
-        n_section_headers=counts.n_section_headers,
-        n_tables=counts.n_tables,
-        n_figures=counts.n_figures,
-        char_count=counts.char_count,
-        n_pages=None,
-    )
-
-
-def _build_meta(
-    *,
-    record: AcquisitionRecord,
-    counts: _Counts,
-    extracted_at: datetime,
-) -> dict[str, Any]:
-    """Assemble ``meta.json``.
-
-    No ``pipeline`` block (JATS extraction has no tunable knobs beyond
-    the lxml parser settings, which are hard-wired) and no ``n_pages``
-    (JATS carries no post-typesetting page concept). Symmetric with the
-    PDF ``meta.json`` everywhere else.
-    """
-    return {
-        'extractor': Extractor.JATS.value,
-        'extractor_version': f'{SCHEMA_NAME}/{SCHEMA_VERSION}',
-        'schema_name': SCHEMA_NAME,
-        'schema_version': SCHEMA_VERSION,
-        'format': record.format.value,
-        'source_sha256': record.sha256,
-        'extracted_at': extracted_at.isoformat(),
-        'n_text_blocks': counts.n_text_blocks,
-        'n_section_headers': counts.n_section_headers,
-        'n_tables': counts.n_tables,
-        'n_figures': counts.n_figures,
-        'n_references': counts.n_references,
-        'char_count': counts.char_count,
-    }
-
-
-def _atomic_write(*, tmp_dir: Path, target: Path, body: bytes) -> None:
-    """Stage to ``<tmp_dir>/<rand>.part`` then ``os.replace`` into place."""
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    staging = tmp_dir / f'{target.name}.{secrets.token_hex(8)}.part'
-    staging.write_bytes(body)
-    os.replace(staging, target)
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as fp:
-        while chunk := fp.read(64 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 # Re-export so ``extract/jats.py`` is the obvious place to look for the

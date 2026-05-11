@@ -43,26 +43,32 @@ Two limitations worth knowing about:
 """
 
 import asyncio
-import hashlib
-import json
-import os
 import re
-import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import structlog
 from lxml import etree
 
 from litspectraits.errors import (
     EmptyDocumentError,
-    ExtractIntegrityError,
     MalformedDocumentError,
     MissingArtifactError,
-    SerializationError,
     WrongFormatForExtractorError,
+)
+from litspectraits.extract._lxml_helpers import (
+    Counts,
+    all_descendants,
+    ancestor_section_path,
+    commit_document,
+    first_child,
+    first_child_text,
+    first_descendant,
+    first_descendant_text,
+    full_text,
+    local_findall,
+    serialize_document,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -75,9 +81,6 @@ from litspectraits.store import ArtifactStore
 SCHEMA_NAME: Final = 'litspectraits-elsevier-extract'
 SCHEMA_VERSION: Final = '1'
 
-_DOCUMENT_FILENAME: Final = 'document.json'
-_META_FILENAME: Final = 'meta.json'
-
 # Soft-cap on the inline label preserved for a ``<ce:cross-ref>`` (the
 # visible bracketed citation marker). Same rationale as
 # :data:`litspectraits.extract.jats._XREF_LABEL_MAX`.
@@ -85,26 +88,9 @@ _XREF_LABEL_MAX: Final = 200
 
 _logger: Final = structlog.get_logger('litspectraits.extract.elsevier')
 
-# Local-name predicate so namespace-prefix variants (``ce:section`` vs the
-# default-namespaced ``section``) both match. See
-# :mod:`litspectraits.extract.jats` for the design.
-_LOCAL_NAME_CHILDREN: Final = './*[local-name()=$name]'
-
-
-@dataclass(frozen=True)
-class _Counts:
-    """Structural counters tallied during the single document walk."""
-
-    n_text_blocks: int
-    n_section_headers: int
-    n_tables: int
-    n_figures: int
-    n_references: int
-    char_count: int
-
 
 # Accumulator captured once per extraction; mutated by the walkers and
-# frozen into ``_Counts`` at the end. Same idiom as
+# frozen into ``Counts`` at the end. Same idiom as
 # :class:`litspectraits.extract.jats._Acc`.
 @dataclass
 class _Acc:
@@ -193,13 +179,19 @@ async def extract_elsevier(
     document['schema_name'] = SCHEMA_NAME
     document['schema_version'] = SCHEMA_VERSION
 
-    body = _serialize_document(doi=record.doi, document=document)
-    return _commit(
+    body = serialize_document(
+        doi=record.doi, document=document, extractor=Extractor.ELSEVIER
+    )
+    return commit_document(
         record=record,
         store=store,
         counts=counts,
         body=body,
         reextract=reextract,
+        extractor=Extractor.ELSEVIER,
+        schema_name=SCHEMA_NAME,
+        schema_version=SCHEMA_VERSION,
+        logger=_logger,
     )
 
 
@@ -274,7 +266,7 @@ def _assert_has_full_text(*, doi: str, root: etree._Element) -> None:
     :class:`~litspectraits.errors.MalformedDocumentError` because the
     extract-side taxonomy doesn't carry an entitlement class.
     """
-    original_text = _first_descendant(root, 'originalText')
+    original_text = first_descendant(root, 'originalText')
     xocs_doc = _first_xocs_doc(root)
     if original_text is None and xocs_doc is None:
         raise MalformedDocumentError(
@@ -291,7 +283,7 @@ def _assert_has_full_text(*, doi: str, root: etree._Element) -> None:
 # Stage 3 — walk --------------------------------------------------------------
 
 
-def _walk(root: etree._Element) -> tuple[dict[str, Any], _Counts]:
+def _walk(root: etree._Element) -> tuple[dict[str, Any], Counts]:
     """Walk the Elsevier tree once, building the dict and tallying counts."""
     acc = _Acc()
     front = _extract_front(root, acc=acc)
@@ -306,7 +298,7 @@ def _walk(root: etree._Element) -> tuple[dict[str, Any], _Counts]:
         'figures': figures,
         'references': references,
     }
-    counts = _Counts(
+    counts = Counts(
         n_text_blocks=acc.text_blocks,
         n_section_headers=acc.section_headers,
         n_tables=acc.tables,
@@ -325,19 +317,19 @@ def _extract_front(root: etree._Element, *, acc: _Acc) -> dict[str, Any]:
     already covers authors / year / journal, so we only surface the bits
     that live in the artifact.
     """
-    coredata = _first_descendant(root, 'coredata')
+    coredata = first_descendant(root, 'coredata')
     if coredata is None:
         return {'title': None, 'abstract': None}
     title = None
     abstract = None
-    title_el = _first_descendant(coredata, 'title')
+    title_el = first_descendant(coredata, 'title')
     if title_el is not None:
-        title = _full_text(title_el).strip() or None
+        title = full_text(title_el).strip() or None
         if title:
             acc.chars += len(title)
-    description_el = _first_descendant(coredata, 'description')
+    description_el = first_descendant(coredata, 'description')
     if description_el is not None:
-        text = _full_text(description_el).strip()
+        text = full_text(description_el).strip()
         if text:
             abstract = text
             acc.chars += len(text)
@@ -359,8 +351,8 @@ def _extract_sections(root: etree._Element, *, acc: _Acc) -> list[dict[str, Any]
     def _walk_sec(sec: etree._Element, path: list[str | None]) -> None:
         sec_id = sec.get('id')
         sec_path: list[str | None] = [*path, sec_id]
-        title_el = _first_child(sec, 'section-title')
-        title = _full_text(title_el) if title_el is not None else ''
+        title_el = first_child(sec, 'section-title')
+        title = full_text(title_el) if title_el is not None else ''
         if title:
             acc.section_headers += 1
             acc.chars += len(title)
@@ -374,12 +366,12 @@ def _extract_sections(root: etree._Element, *, acc: _Acc) -> list[dict[str, Any]
                 'blocks': blocks,
             }
         )
-        for child in _local_findall(sec, 'section'):
+        for child in local_findall(sec, 'section'):
             _walk_sec(child, sec_path)
 
-    body_container = _first_descendant(root, 'sections')
+    body_container = first_descendant(root, 'sections')
     if body_container is not None:
-        for sec in _local_findall(body_container, 'section'):
+        for sec in local_findall(body_container, 'section'):
             _walk_sec(sec, [])
         floating_blocks = _extract_blocks(body_container, acc=acc)
         if floating_blocks:
@@ -451,13 +443,13 @@ def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
     """
     return {
         'type': 'paragraph',
-        'text': _full_text(p),
-        'xrefs': [_xref_descriptor(x) for x in _local_findall(p, 'cross-ref')],
+        'text': full_text(p),
+        'xrefs': [_xref_descriptor(x) for x in local_findall(p, 'cross-ref')],
     }
 
 
 def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
-    label = (_full_text(xref) or '').strip()
+    label = (full_text(xref) or '').strip()
     if len(label) > _XREF_LABEL_MAX:
         label = label[:_XREF_LABEL_MAX]
     return {
@@ -485,9 +477,9 @@ def _extract_tables(root: etree._Element, *, acc: _Acc) -> list[dict[str, Any]]:
         tables.append(
             {
                 'id': table.get('id'),
-                'label': _first_child_text(table, 'label'),
+                'label': first_child_text(table, 'label'),
                 'caption': caption,
-                'section_path': _ancestor_section_path(table),
+                'section_path': ancestor_section_path(table, section_localname='section'),
                 'n_rows': n_rows,
                 'n_cols': n_cols,
                 'cells': cells,
@@ -506,7 +498,7 @@ def _table_cells(table: etree._Element) -> list[list[dict[str, Any]]]:
     that want a rendered grid resolve spans themselves.
     """
     rows_out: list[list[dict[str, Any]]] = []
-    for row in _all_descendants(table, 'row'):
+    for row in all_descendants(table, 'row'):
         row_cells: list[dict[str, Any]] = []
         for cell in row:
             local = etree.QName(cell.tag).localname
@@ -514,7 +506,7 @@ def _table_cells(table: etree._Element) -> list[list[dict[str, Any]]]:
                 continue
             row_cells.append(
                 {
-                    'text': _full_text(cell),
+                    'text': full_text(cell),
                     'type': 'entry',
                     'rowspan': _cals_rowspan(cell),
                     'colspan': _cals_colspan(cell),
@@ -575,12 +567,12 @@ def _ce_caption_text(wrap: etree._Element) -> str | None:
     children are present (a minority pattern; some article types embed
     caption text directly).
     """
-    caption = _first_child(wrap, 'caption')
+    caption = first_child(wrap, 'caption')
     if caption is None:
         return None
-    parts = [_full_text(p) for p in _local_findall(caption, 'simple-para')]
+    parts = [full_text(p) for p in local_findall(caption, 'simple-para')]
     text = '\n\n'.join(p for p in parts if p)
-    return text or _full_text(caption) or None
+    return text or full_text(caption) or None
 
 
 def _extract_figures(root: etree._Element, *, acc: _Acc) -> list[dict[str, Any]]:
@@ -596,9 +588,9 @@ def _extract_figures(root: etree._Element, *, acc: _Acc) -> list[dict[str, Any]]
         figures.append(
             {
                 'id': fig.get('id'),
-                'label': _first_child_text(fig, 'label'),
+                'label': first_child_text(fig, 'label'),
                 'caption': caption,
-                'section_path': _ancestor_section_path(fig),
+                'section_path': ancestor_section_path(fig, section_localname='section'),
             }
         )
         acc.figures += 1
@@ -619,11 +611,11 @@ def _extract_references(root: etree._Element, *, acc: _Acc) -> list[dict[str, An
     for ref in root.iter():
         if etree.QName(ref.tag).localname != 'bib-reference':
             continue
-        source_text_el = _first_descendant(ref, 'source-text')
+        source_text_el = first_descendant(ref, 'source-text')
         if source_text_el is not None:
-            raw_text = _full_text(source_text_el).strip()
+            raw_text = full_text(source_text_el).strip()
         else:
-            raw_text = _full_text(ref).strip()
+            raw_text = full_text(ref).strip()
         raw_text = re.sub(r'\s+', ' ', raw_text)
         if raw_text:
             acc.chars += len(raw_text)
@@ -651,8 +643,8 @@ def _ref_authors(ref: etree._Element) -> list[str]:
     for author in ref.iter():
         if etree.QName(author.tag).localname != 'author':
             continue
-        surname = _first_descendant_text(author, 'surname')
-        given = _first_descendant_text(author, 'given-name')
+        surname = first_descendant_text(author, 'surname')
+        given = first_descendant_text(author, 'given-name')
         if surname and given:
             authors.append(f'{surname}, {given}')
         elif surname:
@@ -669,9 +661,9 @@ def _ref_title(ref: etree._Element) -> str | None:
     for contribution in ref.iter():
         if etree.QName(contribution.tag).localname != 'contribution':
             continue
-        maintitle = _first_descendant(contribution, 'maintitle')
+        maintitle = first_descendant(contribution, 'maintitle')
         if maintitle is not None:
-            text = _full_text(maintitle).strip()
+            text = full_text(maintitle).strip()
             if text:
                 return text
     return None
@@ -682,9 +674,9 @@ def _ref_source(ref: etree._Element) -> str | None:
     for host in ref.iter():
         if etree.QName(host.tag).localname != 'host':
             continue
-        maintitle = _first_descendant(host, 'maintitle')
+        maintitle = first_descendant(host, 'maintitle')
         if maintitle is not None:
-            text = _full_text(maintitle).strip()
+            text = full_text(maintitle).strip()
             if text:
                 return text
     return None
@@ -695,7 +687,7 @@ def _ref_year(ref: etree._Element) -> str | None:
     for date in ref.iter():
         if etree.QName(date.tag).localname != 'date':
             continue
-        text = _full_text(date).strip()
+        text = full_text(date).strip()
         if text:
             return text
     return None
@@ -706,38 +698,13 @@ def _ref_doi(ref: etree._Element) -> str | None:
     for doi_el in ref.iter():
         if etree.QName(doi_el.tag).localname != 'doi':
             continue
-        text = _full_text(doi_el).strip()
+        text = full_text(doi_el).strip()
         if text:
             return text
     return None
 
 
-# XPath / text helpers --------------------------------------------------------
-#
-# Mirror :mod:`litspectraits.extract.jats`. Cross-extractor consolidation is
-# the natural follow-up to 10d (the JATS module foreshadows this). Left
-# duplicated for this commit to keep the diff focused on landing the
-# Elsevier extractor.
-
-
-def _local_findall(node: etree._Element | None, name: str) -> list[etree._Element]:
-    if node is None:
-        return []
-    return cast(list[etree._Element], node.xpath(_LOCAL_NAME_CHILDREN, name=name))
-
-
-def _first_child(node: etree._Element | None, name: str) -> etree._Element | None:
-    matches = _local_findall(node, name)
-    return matches[0] if matches else None
-
-
-def _first_descendant(node: etree._Element | None, name: str) -> etree._Element | None:
-    if node is None:
-        return None
-    for child in node.iter():
-        if etree.QName(child.tag).localname == name:
-            return child
-    return None
+# Elsevier-specific helpers ---------------------------------------------------
 
 
 def _first_xocs_doc(node: etree._Element) -> etree._Element | None:
@@ -752,206 +719,6 @@ def _first_xocs_doc(node: etree._Element) -> etree._Element | None:
         if qname.localname == 'doc' and qname.namespace == 'http://www.elsevier.com/xml/xocs/dtd':
             return el
     return None
-
-
-def _all_descendants(node: etree._Element, name: str) -> list[etree._Element]:
-    return [child for child in node.iter() if etree.QName(child.tag).localname == name]
-
-
-def _first_child_text(node: etree._Element | None, name: str) -> str | None:
-    child = _first_child(node, name)
-    if child is None:
-        return None
-    text = _full_text(child).strip()
-    return text or None
-
-
-def _first_descendant_text(node: etree._Element | None, name: str) -> str | None:
-    child = _first_descendant(node, name)
-    if child is None:
-        return None
-    text = _full_text(child).strip()
-    return text or None
-
-
-def _full_text(node: etree._Element | None) -> str:
-    """Concatenated text content of ``node`` and its descendants.
-
-    Whitespace inside the element is preserved as-is — CEP paragraphs use
-    significant whitespace around inline ``<ce:cross-ref>`` elements, and
-    collapsing it would make ``[ 12 ]`` indistinguishable from ``[12]``
-    for downstream citation matching.
-    """
-    if node is None:
-        return ''
-    parts: list[str] = []
-    if node.text:
-        parts.append(node.text)
-    for child in node:
-        parts.append(_full_text(child))
-        if child.tail:
-            parts.append(child.tail)
-    return ''.join(parts)
-
-
-def _ancestor_section_path(node: etree._Element) -> list[str | None]:
-    """Walk up to the first non-section ancestor, recording section ids."""
-    path: list[str | None] = []
-    parent = node.getparent()
-    while parent is not None:
-        if etree.QName(parent.tag).localname == 'section':
-            path.append(parent.get('id'))
-        parent = parent.getparent()
-    return list(reversed(path))
-
-
-# Stage 4 — serialize ---------------------------------------------------------
-
-
-def _serialize_document(*, doi: str, document: dict[str, Any]) -> bytes:
-    try:
-        text = json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError) as exc:
-        raise SerializationError(
-            doi=doi,
-            extractor=Extractor.ELSEVIER.value,
-            hint='extracted document carried a value json.dumps could not encode',
-            error=str(exc),
-        ) from exc
-    return (text + '\n').encode('utf-8')
-
-
-# Stage 5 — commit ------------------------------------------------------------
-
-
-def _commit(
-    *,
-    record: AcquisitionRecord,
-    store: ArtifactStore,
-    counts: _Counts,
-    body: bytes,
-    reextract: bool,
-) -> ExtractRecord:
-    """Atomically install ``document.json`` + ``meta.json``; enforce integrity.
-
-    Same idempotency-on-identical-bytes contract as
-    :func:`litspectraits.extract.jats._commit`. Duplicated rather than
-    abstracted; see the module-level note on consolidation.
-    """
-    target_dir = store.document_dir(record.sha256)
-    target_doc = target_dir / _DOCUMENT_FILENAME
-    target_meta = target_dir / _META_FILENAME
-
-    new_sha = hashlib.sha256(body).hexdigest()
-    if target_doc.exists():
-        existing_sha = _file_sha256(target_doc)
-        if existing_sha == new_sha:
-            _logger.info(
-                'extract no-op; document.json bytes unchanged',
-                doi=record.doi,
-                sha256=record.sha256,
-                document_sha256=new_sha,
-            )
-            return _build_extract_record(
-                record=record, counts=counts, extracted_at=datetime.now(tz=UTC)
-            )
-        if not reextract:
-            raise ExtractIntegrityError(
-                doi=record.doi,
-                sha256=record.sha256,
-                existing_document_sha256=existing_sha,
-                incoming_document_sha256=new_sha,
-                hint='re-extracted document differs; pass --reextract to overwrite',
-            )
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    extracted_at = datetime.now(tz=UTC)
-    extract_record = _build_extract_record(record=record, counts=counts, extracted_at=extracted_at)
-    meta_payload = _build_meta(record=record, counts=counts, extracted_at=extracted_at)
-    meta_bytes = (json.dumps(meta_payload, indent=2, sort_keys=True) + '\n').encode('utf-8')
-
-    _atomic_write(tmp_dir=store.tmp_dir, target=target_doc, body=body)
-    _atomic_write(tmp_dir=store.tmp_dir, target=target_meta, body=meta_bytes)
-
-    _logger.info(
-        'extract committed',
-        doi=record.doi,
-        sha256=record.sha256,
-        document_sha256=new_sha,
-        n_text_blocks=counts.n_text_blocks,
-        n_section_headers=counts.n_section_headers,
-        n_tables=counts.n_tables,
-        n_figures=counts.n_figures,
-        n_references=counts.n_references,
-        char_count=counts.char_count,
-    )
-    return extract_record
-
-
-def _build_extract_record(
-    *,
-    record: AcquisitionRecord,
-    counts: _Counts,
-    extracted_at: datetime,
-) -> ExtractRecord:
-    return ExtractRecord(
-        sha256=record.sha256,
-        extractor=Extractor.ELSEVIER,
-        extractor_version=f'{SCHEMA_NAME}/{SCHEMA_VERSION}',
-        extracted_at=extracted_at,
-        n_text_blocks=counts.n_text_blocks,
-        n_section_headers=counts.n_section_headers,
-        n_tables=counts.n_tables,
-        n_figures=counts.n_figures,
-        char_count=counts.char_count,
-        n_pages=None,
-    )
-
-
-def _build_meta(
-    *,
-    record: AcquisitionRecord,
-    counts: _Counts,
-    extracted_at: datetime,
-) -> dict[str, Any]:
-    """Assemble ``meta.json``.
-
-    Symmetric with the JATS ``meta.json``: no ``pipeline`` block (Elsevier
-    extraction has no tunable knobs beyond the lxml parser settings, which
-    are hard-wired) and no ``n_pages`` (Elsevier XML carries no page
-    concept).
-    """
-    return {
-        'extractor': Extractor.ELSEVIER.value,
-        'extractor_version': f'{SCHEMA_NAME}/{SCHEMA_VERSION}',
-        'schema_name': SCHEMA_NAME,
-        'schema_version': SCHEMA_VERSION,
-        'format': record.format.value,
-        'source_sha256': record.sha256,
-        'extracted_at': extracted_at.isoformat(),
-        'n_text_blocks': counts.n_text_blocks,
-        'n_section_headers': counts.n_section_headers,
-        'n_tables': counts.n_tables,
-        'n_figures': counts.n_figures,
-        'n_references': counts.n_references,
-        'char_count': counts.char_count,
-    }
-
-
-def _atomic_write(*, tmp_dir: Path, target: Path, body: bytes) -> None:
-    """Stage to ``<tmp_dir>/<rand>.part`` then ``os.replace`` into place."""
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    staging = tmp_dir / f'{target.name}.{secrets.token_hex(8)}.part'
-    staging.write_bytes(body)
-    os.replace(staging, target)
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as fp:
-        while chunk := fp.read(64 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 __all__ = ['SCHEMA_NAME', 'SCHEMA_VERSION', 'extract_elsevier']
