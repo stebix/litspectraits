@@ -61,6 +61,23 @@ MIN_TEXT_BLOCKS: Final[int] = 1
 # Defensive; should be unreachable post-Stage 2.
 MIN_PAGES: Final[int] = 1
 
+# Wall-clock ceiling per PDF. A docling timeout produces
+# ``ConversionStatus.PARTIAL_SUCCESS``, which :func:`_check_conversion_status`
+# already maps to a loud :class:`DoclingDegradedError` — so this turns "a
+# pathological PDF hangs the worker forever" into the typed failure the project
+# wants everywhere else (``docs/docling-settings-buildout.md`` §1.2).
+DOCUMENT_TIMEOUT_S: Final[float] = 120.0
+
+# docling layout region-detector repo folder (under the model cache root). We
+# configure ``DOCLING_LAYOUT_EGRET_LARGE`` rather than the docling 2.93 default
+# (``DOCLING_LAYOUT_HERON``): two-column papers with interleaved tables and
+# figures are exactly where stronger region detection lifts the floor on the
+# PDF route (``docs/docling-settings-buildout.md`` §1.2). This string must
+# stay equal to ``DOCLING_LAYOUT_EGRET_LARGE.model_repo_folder``; ``doctor``
+# imports this constant for its model-cache probe so the configured layout
+# model and the doctor required-models list move in lockstep (ibid. §2, §3).
+LAYOUT_MODEL_REPO_FOLDER: Final = 'docling-project--docling-layout-egret-large'
+
 _DIST_NAME: Final = 'docling'
 _DOCUMENT_FILENAME: Final = 'document.json'
 _META_FILENAME: Final = 'meta.json'
@@ -245,10 +262,11 @@ def _preflight(*, record: AcquisitionRecord, store: ArtifactStore) -> Path:
 def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingAdapter:
     """Lazy-import docling and build a converter with our academic-PDF settings.
 
-    Matches ``extract-pdf-plan.md`` §4 verbatim: ``do_ocr=False``,
-    ``TableFormerMode.ACCURATE``, ``do_cell_matching=True``,
-    ``AcceleratorDevice.AUTO``. See the plan-doc for the rationale on
-    each switch.
+    Matches ``extract-pdf-plan.md`` §4 / ``docling-settings-buildout.md`` §2:
+    ``do_ocr=False``, ``TableFormerMode.ACCURATE`` (TableFormer V1),
+    ``do_cell_matching=True``, the Egret-Large layout region-detector,
+    ``do_formula_enrichment=True``, a ``document_timeout``, and
+    ``AcceleratorDevice.AUTO``. See those docs for the per-switch rationale.
 
     Parameters
     ----------
@@ -256,9 +274,9 @@ def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingA
         Bound onto any :class:`~litspectraits.errors.DoclingImportError`.
     model_cache_dir : pathlib.Path | None, default None
         When set, forwarded as ``PdfPipelineOptions.artifacts_path`` so
-        docling resolves the layout + TableFormer weights from this
-        directory instead of ``~/.cache/docling/models``. ``None`` keeps
-        docling's default lookup.
+        docling resolves the layout / TableFormer / code-formula weights
+        from this directory instead of ``~/.cache/docling/models``.
+        ``None`` keeps docling's default lookup.
 
     Tests bypass this by monkeypatching the symbol; the import-error path
     is exercised by patching ``sys.modules['docling'] = None``.
@@ -272,7 +290,11 @@ def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingA
             ConversionStatus,
             InputFormat,
         )
+        from docling.datamodel.layout_model_specs import (  # pyright: ignore[reportMissingImports]
+            DOCLING_LAYOUT_EGRET_LARGE,
+        )
         from docling.datamodel.pipeline_options import (  # pyright: ignore[reportMissingImports]
+            LayoutOptions,
             PdfPipelineOptions,
             TableFormerMode,
             TableStructureOptions,
@@ -293,9 +315,26 @@ def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingA
         do_ocr=False,
         do_table_structure=True,
         table_structure_options=TableStructureOptions(
+            # TableFormer V1, accurate mode. The V1-vs-V2 bake-off on the
+            # gold-set relaxometry fixtures is still open
+            # (``docling-settings-buildout.md`` §1.2); ``table_structure_kind``
+            # in ``pipeline_view`` records which one produced a document so the
+            # flip is visible in ``meta.json`` when it happens.
             mode=TableFormerMode.ACCURATE,
             do_cell_matching=True,
         ),
+        # Closes the ``EquationBlock``-empty-on-PDF-route gap
+        # (``agentic-buildout-sketch.md`` §1.5): MR signal-model and fitting
+        # equations become first-class instead of falling out as stray text /
+        # picture items. Costs an extra VLM pass; acceptable for the PDF slice.
+        do_formula_enrichment=True,
+        # Egret-Large region detector over the docling default (Heron) — the
+        # highest-leverage quality knob for two-column-with-floats layouts.
+        layout_options=LayoutOptions(model_spec=DOCLING_LAYOUT_EGRET_LARGE),
+        # Fail-loud hygiene: a timeout → ``PARTIAL_SUCCESS`` → the loud
+        # ``DoclingDegradedError`` that ``_check_conversion_status`` already
+        # raises (see ``DOCUMENT_TIMEOUT_S``).
+        document_timeout=DOCUMENT_TIMEOUT_S,
         generate_picture_images=False,
         images_scale=1.0,
         accelerator_options=AcceleratorOptions(
@@ -311,11 +350,21 @@ def _load_docling(*, doi: str, model_cache_dir: Path | None = None) -> _DoclingA
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
         },
     )
+    # The recorded view that lands in ``meta.json``'s ``pipeline`` block — the
+    # extraction-time analogue of the ingest manifest's ``sdk_version``. Every
+    # knob the converter sets that could change output bytes is recorded here
+    # so a later commit can detect "this extraction is stale because we bumped
+    # docling settings" without re-running (``docling-settings-buildout.md`` §3).
     pipeline_view: dict[str, Any] = {
         'do_ocr': False,
         'do_table_structure': True,
         'table_mode': 'accurate',
+        'table_structure_kind': 'docling_tableformer',
         'do_cell_matching': True,
+        'do_formula_enrichment': True,
+        'layout_model': str(DOCLING_LAYOUT_EGRET_LARGE.name),
+        'document_timeout': DOCUMENT_TIMEOUT_S,
+        'force_backend_text': False,
         'device': _resolve_accelerator_label(),
     }
     return _DoclingAdapter(

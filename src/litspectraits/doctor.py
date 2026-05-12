@@ -24,10 +24,10 @@ Three checks, all read-only by default:
    when set, it is both the directory probed for weights and the
    ``output_dir`` ``--download-models`` writes to; otherwise docling's
    own ``~/.cache/docling/models`` applies. Two opt-ins ride on top of
-   this section: ``--download-models`` runs
-   :func:`docling.utils.model_downloader.download_models` for the
-   required layout + TableFormer weights, and ``--smoke-extract`` runs
-   a live docling conversion against the packaged synthetic fixture.
+   this section: ``--download-models`` fetches the three required v3
+   weights — the Egret-Large layout model, TableFormer, and the
+   code/formula VLM — and ``--smoke-extract`` runs a live docling
+   conversion against the packaged synthetic fixture.
    Both side-effects are off by default — plain ``doctor`` stays
    read-only and network-free for the extract section.
 
@@ -476,6 +476,7 @@ def _summarize(exc: IngestError | ExtractError) -> str:
 _COMPONENT_EXTRA: Final = 'docling[extract]'
 _COMPONENT_LAYOUT: Final = 'layout model'
 _COMPONENT_TABLEFORMER: Final = 'TableFormer'
+_COMPONENT_CODE_FORMULA: Final = 'code-formula'
 _COMPONENT_ACCEL: Final = 'accelerator'
 _COMPONENT_OCR: Final = 'OCR engines'
 _COMPONENT_SMOKE: Final = 'smoke convert'
@@ -576,7 +577,16 @@ def _check_docling_extra() -> ExtractComponentCheck:
 
 
 def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractComponentCheck]:
-    """Probe the docling model cache for layout + TableFormer presence.
+    """Probe the docling model cache for layout + TableFormer + code-formula.
+
+    Three required weights for the v3 ``PdfPipelineOptions`` (see
+    ``docling-settings-buildout.md`` §2): the Egret-Large layout
+    region-detector, the TableFormer table-structure model (accurate
+    mode), and the code/formula VLM that ``do_formula_enrichment=True``
+    needs. The list moves in lockstep with that config — if the converter
+    is bumped to a different layout model or formula enrichment is
+    disabled, this list changes too, or ``doctor`` greenlights a machine
+    that fails mid-extract on a missing weight (ibid. §2, §3).
 
     Existence-and-non-emptiness rather than per-file fingerprinting —
     docling's HF snapshot layout shifts across releases, and "directory
@@ -591,16 +601,17 @@ def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractCompon
         (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``); ``None`` falls back to
         docling's own ``~/.cache/docling/models``.
     """
-    models_root, layout_folder, tableformer_folder = _docling_model_dirs(
+    models_root, layout_folder, tableformer_folder, code_formula_folder = _docling_model_dirs(
         model_cache_dir=model_cache_dir
     )
     layout_dir = models_root / layout_folder
     tableformer_dir = models_root / tableformer_folder
+    code_formula_dir = models_root / code_formula_folder
     return [
         _model_row(
             component=_COMPONENT_LAYOUT,
             cache_dir=layout_dir,
-            ok_hint=f'cached at {layout_dir}',
+            ok_hint=f'egret-large, cached at {layout_dir}',
             missing_hint=f'missing at {layout_dir} — `litspectraits doctor --download-models`',
         ),
         _model_row(
@@ -609,6 +620,14 @@ def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractCompon
             ok_hint='accurate mode loaded',
             missing_hint=(
                 f'missing at {tableformer_dir} — `litspectraits doctor --download-models`'
+            ),
+        ),
+        _model_row(
+            component=_COMPONENT_CODE_FORMULA,
+            cache_dir=code_formula_dir,
+            ok_hint='formula enrichment loaded',
+            missing_hint=(
+                f'missing at {code_formula_dir} — `litspectraits doctor --download-models`'
             ),
         ),
     ]
@@ -634,15 +653,18 @@ def _model_row(
     )
 
 
-def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str]:
-    """Resolve ``(models_root, layout_folder, tableformer_folder)``.
+def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str, str]:
+    """Resolve ``(models_root, layout_folder, tableformer_folder, code_formula_folder)``.
 
-    Pulls the folder names from docling's own public-ish APIs rather than
-    hardcoding paths: ``LayoutOptions().model_spec.model_repo_folder`` for
-    layout and ``TableStructureModel._model_repo_folder`` for TableFormer.
-    The TableFormer accessor is dunder-private inside docling but stable
-    across the 2.x line; we accept that fragility in exchange for not
-    string-duplicating ``'docling-project--docling-models'`` here.
+    Three required weights for the v3 pipeline. The layout folder name
+    comes from :data:`litspectraits.extract.pdf.LAYOUT_MODEL_REPO_FOLDER`
+    — the single source of truth for *which* layout model the converter
+    is configured with — so this probe and the extractor cannot drift.
+    TableFormer and code-formula folder names are pulled from docling's
+    own dunder-private ``_model_repo_folder`` accessors: those are
+    private but stable across the 2.x line, and tying to the symbol means
+    a docling bump that renames a repo folder surfaces as an
+    ``AttributeError`` here rather than a silent "models all missing" gate.
 
     The root is ``model_cache_dir`` when set
     (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`` — the same value the
@@ -650,32 +672,26 @@ def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, s
     ``--download-models`` writes to), otherwise docling's default
     ``settings.cache_dir / 'models'`` (``~/.cache/docling/models``).
     """
-    from docling.datamodel.pipeline_options import (  # pyright: ignore[reportMissingImports]
-        LayoutOptions,
-    )
     from docling.datamodel.settings import (  # pyright: ignore[reportMissingImports]
         settings as docling_settings,
     )
-
-    # ``TableStructureModel`` is re-exported into ``model_downloader`` but
-    # pyright flags that as a private-import; we go via the canonical path
-    # and accept that this still depends on the dunder-private folder
-    # attribute, which is stable across the 2.x line. Hardcoding the
-    # string ``'docling-project--docling-models'`` would also work — same
-    # value, no import — but tying it to the symbol means the next
-    # docling bump that renames the repo folder surfaces as an
-    # AttributeError here rather than a silent "models all missing" gate.
+    from docling.models.stages.code_formula.code_formula_model import (  # pyright: ignore[reportMissingImports]
+        CodeFormulaModel,
+    )
     from docling.models.stages.table_structure.table_structure_model import (  # pyright: ignore[reportMissingImports]
         TableStructureModel,
     )
+
+    from litspectraits.extract.pdf import LAYOUT_MODEL_REPO_FOLDER
 
     if model_cache_dir is not None:
         models_root = model_cache_dir
     else:
         models_root = Path(docling_settings.cache_dir) / 'models'
-    layout_folder = str(LayoutOptions().model_spec.model_repo_folder)
+    layout_folder = LAYOUT_MODEL_REPO_FOLDER
     tableformer_folder = str(TableStructureModel._model_repo_folder)
-    return models_root, layout_folder, tableformer_folder
+    code_formula_folder = str(CodeFormulaModel._model_repo_folder)
+    return models_root, layout_folder, tableformer_folder, code_formula_folder
 
 
 def _check_accelerator() -> ExtractComponentCheck:
@@ -742,15 +758,24 @@ def _check_ocr_engines() -> ExtractComponentCheck:
 
 
 def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) -> None:
-    """Run docling's downloader for the required v3 weights.
+    """Download the three required v3 weights: Egret layout, TableFormer, code-formula.
 
     Synchronous; the caller dispatches via :func:`asyncio.to_thread`.
-    Matches the ``with_*`` switches from ``extract-pdf-plan.md`` §8:
-    layout + TableFormer on, everything optional off. ``with_rapidocr``
-    is *not* part of the plan-doc enumeration but defaults to True in
-    docling 2.93 — we pin it False so a doctor run with
-    ``--download-models`` doesn't quietly pull an OCR engine we never
-    use (``extract-pdf-plan.md`` §8 "Required vs optional models").
+    The required-models list matches the v3 ``PdfPipelineOptions``
+    (``docling-settings-buildout.md`` §2) — which is *not* the same as
+    docling's downloader defaults:
+
+    - ``download_models(with_layout=True)`` would pull the docling
+      *default* layout model (Heron), not the Egret-Large spec the
+      extractor configures, so we fetch the layout weights explicitly via
+      :meth:`LayoutModel.download_models` with the matching
+      ``layout_model_config``.
+    - ``with_code_formula=True`` — ``do_formula_enrichment=True`` needs
+      the formula VLM.
+    - ``with_rapidocr`` / ``with_picture_classifier`` / the VLM-figure
+      switches default to True in docling 2.93; we pin them False so a
+      doctor ``--download-models`` run doesn't quietly pull weights the
+      v3 pipeline never loads.
 
     ``model_cache_dir`` (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``) is the
     weights directory; passing ``None`` leaves docling on its default
@@ -758,19 +783,37 @@ def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) 
     :func:`_docling_model_dirs` then probes and what
     :func:`litspectraits.extract.pdf.extract_pdf` reads from.
     """
+    from docling.datamodel.layout_model_specs import (  # pyright: ignore[reportMissingImports]
+        DOCLING_LAYOUT_EGRET_LARGE,
+    )
+    from docling.models.stages.layout.layout_model import (  # pyright: ignore[reportMissingImports]
+        LayoutModel,
+    )
     from docling.utils.model_downloader import (  # pyright: ignore[reportMissingImports]
         download_models,
     )
 
-    _logger.info('downloading docling models (layout + tableformer)', output_dir=model_cache_dir)
+    models_root, layout_folder, _tableformer_folder, _code_formula_folder = _docling_model_dirs(
+        model_cache_dir=model_cache_dir
+    )
+    _logger.info(
+        'downloading docling models (egret layout + tableformer + code-formula)',
+        models_root=str(models_root),
+    )
+    LayoutModel.download_models(
+        local_dir=models_root / layout_folder,
+        force=force,
+        progress=False,
+        layout_model_config=DOCLING_LAYOUT_EGRET_LARGE,
+    )
     download_models(
         output_dir=model_cache_dir,
         force=force,
         progress=False,
-        with_layout=True,
+        with_layout=False,  # handled above for the Egret spec, not docling's default
         with_tableformer=True,
         with_tableformer_v2=False,
-        with_code_formula=False,
+        with_code_formula=True,  # do_formula_enrichment=True needs the formula VLM
         with_picture_classifier=False,
         with_smolvlm=False,
         with_granitedocling=False,

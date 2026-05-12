@@ -173,7 +173,12 @@ def fake_docling(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDocling]:
             'do_ocr': False,
             'do_table_structure': True,
             'table_mode': 'accurate',
+            'table_structure_kind': 'docling_tableformer',
             'do_cell_matching': True,
+            'do_formula_enrichment': True,
+            'layout_model': 'docling_layout_egret_large',
+            'document_timeout': 120.0,
+            'force_backend_text': False,
             'device': 'cpu',
         },
     )

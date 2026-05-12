@@ -121,8 +121,9 @@ async def test_missing_extract_extra_raises_docling_import_error(
     """Setting ``sys.modules['docling'] = None`` makes ``import docling`` fail.
 
     Exercises the real :func:`_load_docling` import-error path without
-    touching the patched fake adapter — the only test in this module that
-    runs the unmocked import code.
+    touching the patched fake adapter — one of the two tests in this
+    module that run the unmocked import code (the other being
+    :func:`test_load_docling_records_buildout_knobs`).
     """
     monkeypatch.setitem(sys.modules, 'docling', None)
     monkeypatch.setitem(sys.modules, 'docling.datamodel', None)
@@ -136,6 +137,36 @@ async def test_missing_extract_extra_raises_docling_import_error(
     hint = excinfo.value.context['hint']
     assert isinstance(hint, str)
     assert 'uv sync --extra extract' in hint
+
+
+@pytest.mark.extract_real
+def test_load_docling_records_buildout_knobs() -> None:
+    """The real :func:`_load_docling` builds the ``docling-settings-buildout.md`` §2 config.
+
+    Builds the converter for real (no model download — ``DocumentConverter``
+    loads weights lazily on first ``.convert()``), then asserts on the
+    recorded ``pipeline_view``: a misspelled ``PdfPipelineOptions`` kwarg
+    (``do_formula_enrichment``, ``layout_options``, ``document_timeout``)
+    would already have raised here, and ``layout_model`` is read straight
+    off the docling ``DOCLING_LAYOUT_EGRET_LARGE`` symbol so it pins the
+    spec-name coupling too.
+    """
+    adapter = pdf_mod._load_docling(doi='10.1234/buildout-knobs')
+    pv = adapter.pipeline_view
+    assert pv['layout_model'] == 'docling_layout_egret_large'
+    assert pv['do_formula_enrichment'] is True
+    assert pv['document_timeout'] == pdf_mod.DOCUMENT_TIMEOUT_S == 120.0
+    assert pv['table_structure_kind'] == 'docling_tableformer'
+    assert pv['table_mode'] == 'accurate'
+    assert pv['do_cell_matching'] is True
+    assert pv['force_backend_text'] is False
+    # ``LAYOUT_MODEL_REPO_FOLDER`` (which ``doctor`` probes) must match the
+    # repo folder of the spec the converter is actually configured with.
+    from docling.datamodel.layout_model_specs import (  # pyright: ignore[reportMissingImports]
+        DOCLING_LAYOUT_EGRET_LARGE,
+    )
+
+    assert DOCLING_LAYOUT_EGRET_LARGE.model_repo_folder == pdf_mod.LAYOUT_MODEL_REPO_FOLDER
 
 
 async def test_failure_status_raises_docling_conversion_error(
@@ -323,7 +354,12 @@ async def test_happy_path_writes_document_and_meta_with_expected_counts(
     assert meta['n_tables'] == 2
     assert meta['n_figures'] == 1
     assert meta['pipeline']['table_mode'] == 'accurate'
+    assert meta['pipeline']['table_structure_kind'] == 'docling_tableformer'
     assert meta['pipeline']['do_cell_matching'] is True
+    assert meta['pipeline']['do_formula_enrichment'] is True
+    assert meta['pipeline']['layout_model'] == 'docling_layout_egret_large'
+    assert meta['pipeline']['document_timeout'] == 120.0
+    assert meta['pipeline']['force_backend_text'] is False
 
     # No leftover ``.part`` files in tmp/.
     assert list(store.tmp_dir.glob('*.part')) == []

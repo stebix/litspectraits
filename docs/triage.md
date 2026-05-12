@@ -526,3 +526,82 @@ under the entry rather than rewriting history.
   resolver catch `FileNotFoundError` from `read_manifest` and emit
   exit 1 with a "manifest exists but artifact is gone" hint,
   leaving exit 2 for the truly-config-shaped failures.
+
+## Step 10g — docling settings (Egret layout / formula enrichment / timeout) (committed TBD, 2026-05-12)
+
+Implements `docs/docling-settings-buildout.md` §1.2 / §2 / §3 and the
+`extract-pdf-plan.md` §4 / §6 / §8 lockstep edits. Touches
+`extract/pdf.py._load_docling` (config + `pipeline_view`) and
+`doctor.py` (required-models list + `--download-models`).
+
+### E10g-1 — Egret-Large layout, `do_formula_enrichment=True`, `document_timeout=120.0` set; no CLI surface
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/pdf.py` — `_load_docling`'s
+  `PdfPipelineOptions`; constants `DOCUMENT_TIMEOUT_S`,
+  `LAYOUT_MODEL_REPO_FOLDER`. Cross-ref `docs/docling-settings-buildout.md`
+  §1.2, §2; `docs/extract-pdf-plan.md` §4.
+- **Decision:** the three "decided" §1.2 knobs land as a plain code
+  change to the converter builder — no env var, no `--flag`. Egret-Large
+  over the docling 2.93 default (Heron) for region detection on two-
+  column-with-floats layouts; `do_formula_enrichment=True` to populate
+  `EquationBlock` on the PDF route; `document_timeout=120.0` to convert a
+  pathological hang into the loud `DoclingDegradedError` the
+  `PARTIAL_SUCCESS` branch already raises.
+- **Why:** the buildout doc's governing principle is "pick once, freeze,
+  move on" — these are settled judgement calls, not operator dials, on a
+  narrow born-digital-publisher-PDF input distribution. Plumbing a flag
+  for each is accidental complexity (`docling-settings-buildout.md` §0).
+- **Revisit when:** a docling major version reshuffles the layout-model
+  catalogue or the formula-enrichment option, or the gold-set bake-off
+  (next item) produces evidence to change one. Then it is again a
+  reviewed code change, with the `pipeline_view` and doctor-models list
+  bumped in the same commit.
+
+### E10g-2 — `force_backend_text` and TableFormer V1→V2 left at defaults, fixture-gated
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/extract/pdf.py` — `force_backend_text`
+  not set (docling default `False`); `TableStructureOptions` (V1), not
+  `TableStructureV2Options`. `pipeline_view` records `force_backend_text`
+  and `table_structure_kind` so a future flip is visible in `meta.json`.
+  Cross-ref `docs/docling-settings-buildout.md` §1.2, §1.3, §4.
+- **Decision:** these two are settled on the gold-set PDF-route fixtures
+  (two-column-with-floats layouts; multi-level-header relaxometry
+  tables), which don't exist yet — so they stay at their conservative
+  defaults until the bake-off can run. `force_backend_text` pairs with
+  the layout-model choice (test the combination, not the knob alone).
+- **Why:** "char count went up" is not evidence; the deciding metrics are
+  anchor rate (verbatim-anchor gate keys on substrings) and table-cell
+  coverage, and you can't measure those without curated fixtures
+  (`agentic-buildout-sketch.md` §5.9).
+- **Revisit when:** the ~50–200-paper gold set lands (Phase 2 of this
+  work). At that point run `force_backend_text` ∈ {False, True} × the
+  layout model, and TableFormer V1 vs V2 on the relaxometry tables; bump
+  `table_structure_kind` / `force_backend_text` in `pipeline_view` and
+  the doctor required-models list if anything flips.
+
+### E10g-3 — `doctor --download-models` fetches the Egret spec explicitly, not via `download_models(with_layout=True)`
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/doctor.py` — `_maybe_download_models`
+  calls `LayoutModel.download_models(..., layout_model_config=DOCLING_LAYOUT_EGRET_LARGE)`
+  then `download_models(with_layout=False, with_tableformer=True,
+  with_code_formula=True, ...)`; `_docling_model_dirs` returns a 4-tuple
+  (layout / TableFormer / code-formula) and reads the layout folder name
+  from `extract.pdf.LAYOUT_MODEL_REPO_FOLDER`.
+- **Decision:** `download_models(with_layout=True)` pulls docling's
+  *default* layout model (Heron), not the Egret-Large spec the extractor
+  configures — so doctor would download (and then probe-OK) the wrong
+  weights, exactly the "greenlight a machine that fails mid-extract"
+  failure the buildout doc warns about. Fetch the configured spec
+  directly; pin every OCR / picture-classifier / VLM-figure switch False
+  (several default True in docling 2.93).
+- **Why:** the required-models list and the converter config have to move
+  in lockstep (`docling-settings-buildout.md` §2, §3); routing the layout
+  download through the same `LAYOUT_MODEL_REPO_FOLDER` constant the probe
+  uses makes "which layout model" single-sourced in `extract/pdf.py`.
+- **Revisit when:** docling exposes a `layout_model_config` passthrough on
+  `download_models` itself (then the explicit `LayoutModel.download_models`
+  call collapses into the bulk call), or the layout-model choice changes
+  (update the constant; the probe and download follow).

@@ -254,23 +254,32 @@ that silent overwrites are never acceptable.
 
 ## 4. `PdfPipelineOptions` — concrete configuration
 
-No CLI surface for these in this iteration; tightening the surface
-keeps the corpus deterministic. If any of these needs to flex
-later, it becomes a deliberate CLI flag, not an env-var lever.
+No CLI surface for these in any iteration; tightening the surface
+keeps the corpus deterministic. If any of these needs to flex later,
+it becomes a deliberate, reviewed change to the converter builder —
+never an env var, never a `--flag`. The standing decision is "pick
+once against the gold-set PDF-route fixtures, freeze, move on";
+`docs/docling-settings-buildout.md` is the change-management story and
+holds the per-switch rationale this section summarises. The live
+implementation is `litspectraits.extract.pdf._load_docling`.
 
 ```python
 from docling.datamodel.base_models import InputFormat
+from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_EGRET_LARGE
 from docling.datamodel.pipeline_options import (
     AcceleratorDevice,
     AcceleratorOptions,
+    LayoutOptions,
     PdfPipelineOptions,
     TableFormerMode,
     TableStructureOptions,
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
+DOCUMENT_TIMEOUT_S = 120.0
 
-def _build_converter() -> DocumentConverter:
+
+def _build_converter(model_cache_dir: Path | None = None) -> DocumentConverter:
     """Build the docling converter with our academic-PDF settings.
 
     Notes
@@ -282,15 +291,21 @@ def _build_converter() -> DocumentConverter:
     pipeline_options = PdfPipelineOptions(
         do_ocr=False,
         do_table_structure=True,
-        table_structure_options=TableStructureOptions(
+        table_structure_options=TableStructureOptions(  # TableFormer V1
             mode=TableFormerMode.ACCURATE,
             do_cell_matching=True,
         ),
+        do_formula_enrichment=True,                      # populates EquationBlock on the PDF route
+        layout_options=LayoutOptions(
+            model_spec=DOCLING_LAYOUT_EGRET_LARGE,       # region detector over the Heron default
+        ),
+        document_timeout=DOCUMENT_TIMEOUT_S,             # timeout → PARTIAL_SUCCESS → DoclingDegradedError
         generate_picture_images=False,
         images_scale=1.0,
         accelerator_options=AcceleratorOptions(
             device=AcceleratorDevice.AUTO,
         ),
+        artifacts_path=model_cache_dir,                  # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR; None → docling default
     )
     return DocumentConverter(
         format_options={
@@ -299,19 +314,45 @@ def _build_converter() -> DocumentConverter:
     )
 ```
 
+`force_backend_text` and the TableFormer V1→V2 question are still
+**open** — both are settled on the gold-set relaxometry / two-column
+fixtures, which don't exist yet (`docling-settings-buildout.md` §1.2,
+§1.3). Until then `force_backend_text` stays `False` and TableFormer
+V1 stands; `pipeline_view` (see §6) records both so a future flip is
+visible in `meta.json`.
+
 ### Why each option is set as it is
 
 - **`do_ocr=False`** — publisher PDFs have text layers; OCR adds
   minutes of latency and numeric transcription errors. See
   anti-pattern §2.3.
-- **`do_table_structure=True` + `TableFormerMode.ACCURATE`** —
-  measurement tables are the corpus's centre of mass. The accuracy
-  mode is materially slower than `FAST` but the right default for
-  this domain.
+- **`do_table_structure=True` + `TableFormerMode.ACCURATE`** (TableFormer
+  V1) — measurement tables are the corpus's centre of mass. The
+  accuracy mode is materially slower than `FAST` but the right default
+  for this domain. The V1-vs-V2 bake-off on the gold-set relaxometry
+  tables is still open.
 - **`do_cell_matching=True`** — the option that makes per-cell `prov`
   (bbox per cell) work. This is what enables table-cell-level
   highlight-back-to-source end-to-end. Without it, only the
   enclosing `TableItem.prov` is recovered.
+- **`do_formula_enrichment=True`** — closes the
+  `EquationBlock`-empty-on-PDF-route gap (`agentic-buildout-sketch.md`
+  §1.5): MR signal-model and fitting equations become first-class
+  instead of falling out as stray `text` / `picture` items. Costs an
+  extra VLM pass (the code/formula model — now a *required* doctor
+  download, §8); acceptable given the PDF slice is the minority one.
+- **`layout_options.model_spec = DOCLING_LAYOUT_EGRET_LARGE`** — the
+  highest-leverage quality knob. Two-column papers with tables and
+  figures interleaved are exactly where stronger region detection
+  earns its keep (clipped tables, captions on the wrong float, body
+  text bleeding into a cell all originate in region detection). Egret-
+  Large over the docling 2.93 default (Heron). Cost: bigger weights,
+  slower per-page inference.
+- **`document_timeout=120.0`** — fail-loud hygiene, not a quality knob.
+  A timeout yields `ConversionStatus.PARTIAL_SUCCESS`, which
+  `_check_conversion_status` already maps to a hard `DoclingDegradedError`
+  (§2.2) — so this turns "a pathological PDF hangs the worker forever"
+  into the loud, typed failure the project wants everywhere.
 - **`generate_picture_images=False`** — figure-pixel extraction is a
   v1 non-goal (`overview.md`). We keep captions and bboxes only;
   cropped image bytes are not stored.
@@ -319,6 +360,10 @@ def _build_converter() -> DocumentConverter:
   CUDA > MPS > CPU. `doctor` (§8 below) reports what it picked so
   operators can spot "extraction silently fell back to CPU and is
   now slow."
+- **`artifacts_path=model_cache_dir`** — `None` keeps docling's own
+  `~/.cache/docling/models` lookup; a path (from
+  `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`) points it at an out-of-tree
+  weights directory, decoupled from `data_dir`.
 
 ## 5. Error taxonomy
 
@@ -394,16 +439,29 @@ of the paper.
     "do_ocr": false,
     "do_table_structure": true,
     "table_mode": "accurate",
+    "table_structure_kind": "docling_tableformer",
     "do_cell_matching": true,
+    "do_formula_enrichment": true,
+    "layout_model": "docling_layout_egret_large",
+    "document_timeout": 120.0,
+    "force_backend_text": false,
     "device": "cuda"
   }
 }
 ```
 
 The `pipeline` block is what lets a later commit decide "is the
-existing `document.json` stale because we bumped `table_mode`?"
+existing `document.json` stale because we bumped a docling setting?"
 without re-running. It is the extraction-time equivalent of the
-ingest manifest's `sdk_version`.
+ingest manifest's `sdk_version`, and it must record *every* knob the
+converter sets that can change output bytes — adding a knob to
+`_load_docling` without widening this dict is the one place where a
+config change becomes invisible to the stale-detection check
+(`docling-settings-buildout.md` §3). `table_structure_kind` and
+`force_backend_text` are recorded even though their values are fixed
+today, precisely so the open V1→V2 / backend-text decisions
+(`docling-settings-buildout.md` §1.2, §1.3) show up here when they
+land.
 
 `warnings` is intentionally absent: any condition that would
 produce one becomes a hard fail per §3, so the field would be
@@ -460,15 +518,16 @@ Columns mirror the publisher-credentials section (§12) for visual
 consistency:
 
 ```
-┌────────────────────┬──────────┬──────────┬───────────────────────────────────┐
-│ Component          │ Required │ Status   │ Hint                              │
-├────────────────────┼──────────┼──────────┼───────────────────────────────────┤
-│ docling[extract]   │ yes      │ ok       │ docling 2.x.y                     │
-│ layout model       │ yes      │ ok       │ cached at ~/.cache/docling/models │
-│ TableFormer        │ yes      │ ok       │ accurate mode loaded              │
-│ accelerator        │ auto     │ cuda     │ NVIDIA <gpu-name>                 │
-│ OCR engines        │ no       │ off      │ do_ocr=False (default)            │
-└────────────────────┴──────────┴──────────┴───────────────────────────────────┘
+┌────────────────────┬──────────┬──────────┬─────────────────────────────────────┐
+│ Component          │ Required │ Status   │ Hint                                │
+├────────────────────┼──────────┼──────────┼─────────────────────────────────────┤
+│ docling[extract]   │ yes      │ ok       │ docling 2.x.y                       │
+│ layout model       │ yes      │ ok       │ egret-large, cached at ~/.cache/...  │
+│ TableFormer        │ yes      │ ok       │ accurate mode loaded                │
+│ code-formula       │ yes      │ ok       │ formula enrichment loaded           │
+│ accelerator        │ auto     │ cuda     │ NVIDIA <gpu-name>                   │
+│ OCR engines        │ no       │ off      │ do_ocr=False (default)              │
+└────────────────────┴──────────┴──────────┴─────────────────────────────────────┘
 ```
 
 ### Checks performed
@@ -478,18 +537,26 @@ consistency:
    `uv sync --extra extract`. Subsequent rows are skipped. Exit 0
    if all other doctor checks pass — the extract extra is opt-in.
 2. **Model cache present.** Probe the docling model cache directory
-   (`docling.utils.model_downloader.MODELS_PATH` or equivalent
-   public API; fall back to `~/.cache/docling/models` if no public
-   accessor exists). Per required model, check the on-disk
-   artifact exists.
-3. **Download-if-missing knob.** `doctor --download-models` invokes
-   `docling.utils.model_downloader.download_models(force=False,
-   with_layout=True, with_tableformer=True, with_code_formula=False,
-   with_picture_classifier=False, with_smolvlm=False,
-   with_easyocr=False)`. This is the deliberate first-run path. By
-   default `doctor` only *reports* missing models; it does not pull
-   them, because the operator should know they are about to start a
-   multi-gigabyte download.
+   (honoring `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`; fall back to
+   `~/.cache/docling/models`). Per required model — Egret-Large
+   layout, TableFormer, code/formula VLM — check the on-disk
+   artifact directory exists and is non-empty. The layout folder name
+   is read from `litspectraits.extract.pdf.LAYOUT_MODEL_REPO_FOLDER`
+   so the probe and the configured layout model can't drift.
+3. **Download-if-missing knob.** `doctor --download-models` fetches
+   the three required v3 weights. It does **not** just call
+   `download_models(with_layout=True, ...)` — that pulls the docling
+   *default* layout model (Heron), not the Egret-Large spec the
+   extractor configures — so it calls `LayoutModel.download_models(...,
+   layout_model_config=DOCLING_LAYOUT_EGRET_LARGE)` for the layout
+   weights, then `download_models(with_layout=False, with_tableformer=True,
+   with_code_formula=True, ...)` (every OCR / picture-classifier / VLM-
+   figure switch pinned `False` — several default to `True` in docling
+   2.93). This is the deliberate first-run path. By default `doctor`
+   only *reports* missing models; it does not pull them, because the
+   operator should know they are about to start a multi-gigabyte
+   download (Egret-Large + a formula VLM is meaningfully more than the
+   old Heron + TableFormer).
 4. **Accelerator detection.** Read
    `torch.cuda.is_available()` / `torch.backends.mps.is_available()`
    to report what `AcceleratorDevice.AUTO` will resolve to. Report
@@ -503,18 +570,26 @@ consistency:
 
 ### Required vs optional models
 
-Required (used by our `PdfPipelineOptions`):
+Required (used by our `PdfPipelineOptions` — `docling-settings-buildout.md` §2):
 
-- `docling-layout` — the layout segmentation model
-- `TableFormer` — both `fast` and `accurate` variants are downloaded
-  by default; we use `accurate`
+- `docling-layout-egret-large` — the layout / region-detection model
+  (`layout_options.model_spec = DOCLING_LAYOUT_EGRET_LARGE`)
+- `TableFormer` — `accurate` mode (TableFormer V1; the V1→V2 bake-off
+  is still open)
+- `code-formula` VLM — required because `do_formula_enrichment=True`
 
 Optional (not used in v3):
 
-- `code-formula` enrichment
 - `picture-classifier` / `SmolVLM` for figure description
-- `EasyOCR` (or any OCR engine) — only relevant if `do_ocr=True`,
-  which we do not set
+- `EasyOCR` / `RapidOCR` (or any OCR engine) — only relevant if
+  `do_ocr=True`, which we do not set
+- TableFormer V2, Granite-Vision table reader, chart-extraction — all
+  parked; see `docling-settings-buildout.md` §1.2, §1.4
+
+Note this list **must move in lockstep with §4** — bumping the layout
+model or toggling formula enrichment changes which weights are
+required, and a stale list means `doctor` greenlights a machine that
+then fails mid-extract on a missing weight.
 
 Reporting these as `off` rather than `missing` keeps operators from
 chasing a phantom error when the v3 default pipeline does not need
@@ -648,10 +723,12 @@ normalisation yet — deferred per §11).
 
 ### Tradeoffs explicitly accepted
 
-- **First-run model download is a 1–2 GB implicit dependency.**
-  Mitigated by the `doctor --download-models` step in §8 so it is
-  an *explicit* operator action, not a surprise inside the first
-  `extract` run.
+- **First-run model download is a multi-GB implicit dependency.**
+  Egret-Large layout + TableFormer + the code/formula VLM — bigger
+  than the original Heron + TableFormer set, since §4 traded weight
+  size for PDF-route quality. Mitigated by the `doctor --download-models`
+  step in §8 so it is an *explicit* operator action, not a surprise
+  inside the first `extract` run.
 - **Determinism is best-effort.** Docling's neural models are
   deterministic given fixed weights + fixed CPU/GPU device, but
   cross-device reruns (CPU → GPU) may produce different bbox
