@@ -217,6 +217,19 @@ uv run pyright src/ tests/           # type check
 uv run pytest                        # offline (respx-mocked + SDK monkeypatched)
 ```
 
+### Decision point — normalized `Document` (2026-05-13)
+
+Step 10g (frozen docling settings) is committed and the ingest + extract stack
+is feature-complete. The next architectural choice — whether to introduce a
+normalized `Document` type that unifies the JATS/Elsevier dict shape with
+docling's PDF output, or to keep the per-route dicts and normalise downstream
+in the measurement layer — is open. See `docs/normalized-documents-discussion.md`
+for the trade-off analysis.
+
+A spike branch `spike/normalized-document` was forked from this commit for
+prototyping; `trunk` remains the no-normalisation baseline until the question
+is answered.
+
 ## Documentation
 
 - `docs/overview.md` — full pipeline design (ingestion → extraction →
