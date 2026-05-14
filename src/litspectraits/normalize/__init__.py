@@ -6,8 +6,8 @@ extractors. Two adapters populate it:
 - :mod:`litspectraits.normalize.xml_adapter` (E0.5a) — converts the
   JATS / Elsevier publisher dict shape (:mod:`litspectraits.extract.jats`,
   :mod:`litspectraits.extract.elsevier`) into a :class:`Document`.
-- :mod:`litspectraits.normalize.docling_adapter` (E0.5b) — converts a
-  docling ``DoclingDocument`` into a :class:`Document`.
+- :mod:`litspectraits.normalize.docling_adapter` (E0.5b, future) —
+  converts a docling ``DoclingDocument`` into a :class:`Document`.
 
 See ``docs/normalized-documents-discussion.md`` for the design;
 ``docs/agentic-buildout-sketch.md`` §1.5 for the schema commitments;
@@ -28,6 +28,19 @@ Schema commitments (must read before changing this module)
   until a citation-parsing pass runs.
 """
 
+from litspectraits.normalize.diff import (
+    DocumentComparison,
+    DualFormatComparison,
+    DualFormatResult,
+    DualFormatSkip,
+    SkipReason,
+    TableComparison,
+    compare_documents,
+    compare_dual_format_dois,
+    compare_reports,
+    format_comparison_report,
+    format_dual_format_report,
+)
 from litspectraits.normalize.docling_adapter import normalize_docling_document
 from litspectraits.normalize.hooks import converter
 from litspectraits.normalize.models import (
@@ -67,6 +80,10 @@ __all__ = [
     'CharRange',
     'Completeness',
     'Document',
+    'DocumentComparison',
+    'DualFormatComparison',
+    'DualFormatResult',
+    'DualFormatSkip',
     'EquationBlock',
     'FigureBlock',
     'InlineRef',
@@ -77,12 +94,19 @@ __all__ = [
     'Reference',
     'ResolvedReference',
     'Route',
+    'SkipReason',
     'TableBlock',
     'TableCell',
+    'TableComparison',
     'TextBlock',
     'XmlRoute',
     'commit_normalized_document',
+    'compare_documents',
+    'compare_dual_format_dois',
+    'compare_reports',
     'converter',
+    'format_comparison_report',
+    'format_dual_format_report',
     'load_normalized_document',
     'load_normalized_meta',
     'normalize_docling_document',

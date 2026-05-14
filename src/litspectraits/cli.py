@@ -1,12 +1,12 @@
 """Command-line interface (``docs/overview-v3.md`` §10, §17.9).
 
-Six commands ship today: ``ingest``, ``sideload``, ``doctor``,
-``show``, ``extract``, ``normalize`` (plus the convenience ``smoke``
-ephemeral-tempdir wrapper around ``ingest``). ``extract`` and
-``normalize`` are deliberately separate composable steps rather than
-folded into one command — each stage stays independently re-runnable
-and operator-introspectable
-(``docs/normalized-documents-discussion.md`` §3).
+Seven commands ship today: ``ingest``, ``sideload``, ``doctor``,
+``show``, ``extract``, ``normalize``, ``diff-routes`` (plus the
+convenience ``smoke`` ephemeral-tempdir wrapper around ``ingest``).
+``extract``, ``normalize``, and ``diff-routes`` are deliberately
+separate composable steps rather than folded into one command — each
+stage stays independently re-runnable and operator-introspectable
+(``docs/dual-route-comparison-overview.md`` §9).
 
 Failure model
 -------------
@@ -91,8 +91,12 @@ from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, converter
 from litspectraits.normalize import (
+    DualFormatResult,
     NormalizedMeta,
     commit_normalized_document,
+    compare_dual_format_dois,
+    compare_reports,
+    format_dual_format_report,
     normalize_docling_document,
     normalize_xml_document,
 )
@@ -795,6 +799,120 @@ def _render_normalize_meta_panel(
     table.add_row('has_equations', str(meta.completeness.has_equations))
     table.add_row('table_source', meta.completeness.table_source)
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# diff-routes
+# ---------------------------------------------------------------------------
+
+
+@app.command(name='diff-routes')
+def cmd_diff_routes(
+    doi: list[str] = typer.Option(
+        [],
+        '--doi',
+        help=(
+            'Restrict the harness to specific DOIs (repeatable). '
+            'Omit for auto-discovery across the entire index.'
+        ),
+    ),
+    out: Path | None = typer.Option(
+        None,
+        '--out',
+        help=(
+            'Write the cattrs-shaped JSON report to this path. The file is '
+            'the input format `--compare-to` reads.'
+        ),
+    ),
+    compare_to: Path | None = typer.Option(
+        None,
+        '--compare-to',
+        help=(
+            'Path to a previous report (written by a prior `--out` run). '
+            'When set, the command renders a temporal regression view '
+            'instead of the single-snapshot text report.'
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False, '--json', help='Emit the report as JSON on stdout instead of text.'
+    ),
+) -> None:
+    """Run the cross-format differential harness on dual-format DOIs.
+
+    Auto-discovers candidate DOIs from ``index/by_doi.jsonl`` (those
+    with both a PDF and an XML manifest), loads their persisted
+    normalised documents (``normalize`` must have been run first),
+    and feeds each pair into the structural diff. Yields one record
+    per DOI — either a :class:`DualFormatComparison` (the harness
+    produced numbers) or a :class:`DualFormatSkip` (the DOI was not
+    eligible for one of three operator-actionable reasons).
+
+    Use ``--out report.json`` to persist; pair with
+    ``--compare-to prev-report.json`` on a later run for temporal
+    regression detection (``docs/dual-route-comparison-overview.md``
+    §5). The single-snapshot text report and the temporal-diff text
+    are both written to stdout; ``--json`` emits cattrs-unstructured
+    JSON instead.
+
+    Exit codes:
+
+    - 1: operator-input error (unknown DOI passed via ``--doi``, or
+      ``--compare-to`` file missing / malformed).
+    """
+    settings = _load_settings()
+    store = ArtifactStore(settings.data_dir)
+    err_console = _stderr_console()
+    out_console = _stdout_console()
+
+    try:
+        results = list(compare_dual_format_dois(store, dois=doi or None))
+    except ValueError as exc:
+        err_console.print(f'[bold yellow]diff-routes:[/bold yellow] {exc}')
+        raise typer.Exit(1) from exc
+
+    if out is not None:
+        unstructured = [normalize_converter.unstructure(r) for r in results]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(unstructured, indent=2, sort_keys=True) + '\n')
+
+    if compare_to is not None:
+        try:
+            previous = _load_report(compare_to)
+        except (OSError, ValueError) as exc:
+            err_console.print(
+                f'[bold yellow]diff-routes --compare-to:[/bold yellow] '
+                f'cannot read {compare_to}: {exc}'
+            )
+            raise typer.Exit(1) from exc
+        text = compare_reports(previous=previous, current=results)
+        out_console.print(text)
+        return
+
+    if json_output:
+        unstructured = [normalize_converter.unstructure(r) for r in results]
+        print(json.dumps(unstructured, indent=2, sort_keys=True))
+        return
+
+    out_console.print(format_dual_format_report(results))
+
+
+def _load_report(path: Path) -> list[DualFormatResult]:
+    """Read a cattrs-shaped harness report from disk.
+
+    Counterpart to ``--out``'s writer. Wraps the cattrs structuring
+    in a typed surface so the CLI catches malformed reports as a
+    clean exit 1 rather than letting a raw cattrs exception escape.
+    """
+    raw = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(raw, list):
+        raise ValueError(f'expected a JSON array of harness results; got {type(raw).__name__}')
+    # cattrs supports type-alias unions via the structure hook registered
+    # in :mod:`litspectraits.normalize.diff`; pyright sees ``DualFormatResult``
+    # as a UnionType, not a ``type[T]``, and flags the call.
+    return [
+        normalize_converter.structure(item, DualFormatResult)  # pyright: ignore[reportArgumentType]
+        for item in raw
+    ]
 
 
 # ---------------------------------------------------------------------------
