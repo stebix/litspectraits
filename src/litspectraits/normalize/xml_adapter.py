@@ -69,7 +69,7 @@ def normalize_xml_document(
     Parameters
     ----------
     document : dict
-        The on-disk ``documents/<sha>/document.json`` payload — exactly
+        The on-disk ``documents/sha256/<aa>/<sha>/document.json`` payload — exactly
         the dict shape :func:`litspectraits.extract.jats.extract_jats`
         and :func:`litspectraits.extract.elsevier.extract_elsevier`
         emit. Required top-level keys are ``front``, ``sections``,

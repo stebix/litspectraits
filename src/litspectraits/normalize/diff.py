@@ -390,13 +390,13 @@ class SkipReason(StrEnum):
 
     MISSING_EXTRACTION = 'missing_extraction'
     """One or both sides of the dual-format pair has no
-    ``documents/<sha>/document.json`` — the artifact was ingested but
+    ``documents/sha256/<aa>/<sha>/document.json`` — the artifact was ingested but
     extraction has not run for it. Operator remediation:
     ``litspectraits extract <doi-or-sha>``."""
 
     MISSING_NORMALIZATION = 'missing_normalization'
     """Both sides are extracted but one or both has no
-    ``normalized/<sha>/document.json`` — extraction is done but the
+    ``normalized/sha256/<aa>/<sha>/document.json`` — extraction is done but the
     normalize step has not run. Operator remediation:
     ``litspectraits normalize <doi-or-sha>``."""
 

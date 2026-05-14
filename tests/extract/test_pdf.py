@@ -333,7 +333,7 @@ async def test_happy_path_writes_document_and_meta_with_expected_counts(
     assert extract_record.n_figures == 1
     assert extract_record.char_count > FLOOR_CHARS
 
-    # Both files written into documents/<sha>/.
+    # Both files written into documents/sha256/<aa>/<sha>/.
     doc_path = store.document_dir(record.sha256) / 'document.json'
     meta_path = store.document_dir(record.sha256) / 'meta.json'
     assert doc_path.is_file()

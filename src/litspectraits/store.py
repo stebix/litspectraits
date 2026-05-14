@@ -4,8 +4,8 @@ Layout under :attr:`Settings.data_dir`::
 
     artifacts/{pdf,jats,elsevier}/sha256/<aa>/<sha>.<ext>
     manifests/sha256/<aa>/<sha>.manifest.json
-    documents/<sha256>/{document.json,meta.json}
-    normalized/<sha256>/{document.json,meta.json}
+    documents/sha256/<aa>/<sha>/{document.json,meta.json}
+    normalized/sha256/<aa>/<sha>/{document.json,meta.json}
     index/by_doi.jsonl
     tmp/                   # cleared on init
 
@@ -14,14 +14,11 @@ between JATS and Elsevier XML (both ``.xml``); ``<aa>`` is the first two
 hex characters of the sha256 (one-level sharding).
 
 ``documents/`` is keyed on the *artifact* sha256 so an extraction always
-co-locates with the bytes it describes. It is intentionally **not** sharded
-— the population is bounded by the artifact population (one extraction per
-artifact, append-only) and one-level-deeper directories already gives
-filesystems an easy enumerate. ``normalized/`` mirrors the same un-sharded
-shape one layer downstream (E0.5b persistence, ``docs/normalized-documents-discussion.md``
-§3); when corpus size eventually motivates sharding, both layers move
-together in one coordinated migration (see
-``docs/dual-route-comparison-overview.md`` §9).
+co-locates with the bytes it describes. ``normalized/`` mirrors it one
+layer downstream (E0.5b persistence, ``docs/normalized-documents-discussion.md``
+§3). Both trees use the same ``sha256/<aa>/<sha>/`` sharding as
+``artifacts/`` and ``manifests/`` so no single directory accumulates
+unbounded entries as the corpus grows.
 
 Atomic ``os.replace`` from ``tmp/`` to the canonical path is non-negotiable
 (§3): a half-written ``.part`` file must never be visible at the canonical
@@ -134,22 +131,25 @@ class ArtifactStore:
     def document_dir(self, sha256: str) -> Path:
         """Absolute path of the per-artifact extract output directory.
 
-        The directory itself is not created here — extractors lazy-create
-        it on commit so a query for an un-extracted artifact does not
-        leave an empty dir behind.
+        Sharded as ``documents/sha256/<aa>/<sha>/`` (mirrors ``artifacts/``
+        / ``manifests/``). The directory itself is not created here —
+        extractors lazy-create it on commit so a query for an un-extracted
+        artifact does not leave an empty dir behind.
         """
-        return self._documents_dir / sha256
+        shard = sha256[:_SHARD_PREFIX_LEN]
+        return self._documents_dir / 'sha256' / shard / sha256
 
     def normalized_dir(self, sha256: str) -> Path:
         """Absolute path of the per-artifact normalised-output directory.
 
-        Sibling of :meth:`document_dir`, with the same un-sharded layout
-        — see this module's layout docstring for the rationale.
-        Lazy-created by the normalize commit (
-        :mod:`litspectraits.normalize.persistence`) so a query for an
-        un-normalised artifact does not leave an empty directory behind.
+        Sibling of :meth:`document_dir`, sharded identically as
+        ``normalized/sha256/<aa>/<sha>/``. Lazy-created by the normalize
+        commit (:mod:`litspectraits.normalize.persistence`) so a query
+        for an un-normalised artifact does not leave an empty directory
+        behind.
         """
-        return self._normalized_dir / sha256
+        shard = sha256[:_SHARD_PREFIX_LEN]
+        return self._normalized_dir / 'sha256' / shard / sha256
 
     def commit(self, *, src: Path, record: AcquisitionRecord) -> Path:
         """Atomically install ``src`` and persist ``record``.

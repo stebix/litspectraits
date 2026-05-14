@@ -6,7 +6,7 @@ anchors, so this extractor's job is to lift that structure into a stable
 dict shape — *richer* than docling-on-PDF (§11) precisely because we
 don't have to reconstruct anything.
 
-The on-disk shape (``documents/<sha>/document.json``) is a
+The on-disk shape (``documents/sha256/<aa>/<sha>/document.json``) is a
 publisher-agnostic-flavored dict:
 
 - ``front``: title + abstract text.
@@ -105,7 +105,7 @@ async def extract_jats(
     *,
     reextract: bool = False,
 ) -> ExtractRecord:
-    """Convert a JATS artifact to ``documents/<sha>/document.json`` + ``meta.json``.
+    """Convert a JATS artifact to ``documents/sha256/<aa>/<sha>/document.json`` + ``meta.json``.
 
     Five-stage pipeline mirroring :func:`~litspectraits.extract.pdf.extract_pdf`:
     preflight → parse (``lxml``) → walk → serialize → commit. Every failure
@@ -113,7 +113,7 @@ async def extract_jats(
     any on-disk write.
 
     Idempotent on identical extraction output: if
-    ``documents/<sha>/document.json`` already exists with bytes matching
+    ``documents/sha256/<aa>/<sha>/document.json`` already exists with bytes matching
     the freshly-serialized dict, the on-disk files are left untouched and
     the returned :class:`~litspectraits.manifest.ExtractRecord` describes
     the just-completed run.

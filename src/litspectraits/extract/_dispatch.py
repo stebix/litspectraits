@@ -34,7 +34,7 @@ async def extract(
         ``store.data_dir``) is where the leaf reads bytes from.
     store : ArtifactStore
         Used by leaf extractors to read the artifact and stage
-        ``documents/<sha>/`` outputs atomically (same tmp → rename pattern
+        ``documents/sha256/<aa>/<sha>/`` outputs atomically (same tmp → rename pattern
         as ingest).
     reextract : bool, default False
         Whether to overwrite an existing extraction whose serialized

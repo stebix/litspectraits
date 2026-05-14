@@ -4,7 +4,7 @@
 Six-stage pipeline mirroring the ingest happy path: preflight → convert →
 structural sanity → serialize → commit. Every failure raises a typed
 :class:`~litspectraits.errors.ExtractError` subclass before anything is
-written under ``documents/<sha>/`` (``extract-pdf-plan.md`` §3, §5).
+written under ``documents/sha256/<aa>/<sha>/`` (``extract-pdf-plan.md`` §3, §5).
 
 Imports of ``docling`` itself are lazy and live behind :func:`_load_docling`
 — the ``[extract]`` extra is opt-in (``extract-pdf-plan.md`` §0, §2.4); a
@@ -130,15 +130,15 @@ async def extract_pdf(
     reextract: bool = False,
     model_cache_dir: Path | None = None,
 ) -> ExtractRecord:
-    """Convert a PDF artifact to ``documents/<sha>/document.json`` + ``meta.json``.
+    """Convert a PDF artifact to ``documents/sha256/<aa>/<sha>/document.json`` + ``meta.json``.
 
     Implements the six-stage pipeline from ``extract-pdf-plan.md`` §3.
-    Commits to ``documents/<sha>/`` only on full success; every failure
+    Commits to ``documents/sha256/<aa>/<sha>/`` only on full success; every failure
     raises an :class:`~litspectraits.errors.ExtractError` subclass before
     any on-disk write.
 
     Idempotent on identical extraction output: if
-    ``documents/<sha>/document.json`` already exists with bytes matching
+    ``documents/sha256/<aa>/<sha>/document.json`` already exists with bytes matching
     the freshly-serialized dict, the on-disk files are left untouched and
     the returned :class:`~litspectraits.manifest.ExtractRecord` describes
     the just-completed run (the new run's stats and the existing dict are
@@ -152,7 +152,7 @@ async def extract_pdf(
     store : ArtifactStore
         Used to resolve ``record.artifact_path`` to an absolute path, to
         stage the document/meta writes under ``store.tmp_dir``, and to
-        compute the canonical ``documents/<sha>/`` directory.
+        compute the canonical ``documents/sha256/<aa>/<sha>/`` directory.
     reextract : bool, default False
         Overwrite an existing ``document.json`` whose bytes differ from
         the new extraction. Without this flag a divergent re-extract
@@ -170,7 +170,7 @@ async def extract_pdf(
     -------
     ExtractRecord
         In-memory description of the extraction. The persisted form is
-        ``documents/<sha>/meta.json``; this struct is not separately
+        ``documents/sha256/<aa>/<sha>/meta.json``; this struct is not separately
         written.
 
     Raises
@@ -589,7 +589,7 @@ def _commit(
 ) -> ExtractRecord:
     """Atomically install ``document.json`` + ``meta.json``; enforce integrity.
 
-    Decision tree on ``documents/<sha>/document.json``:
+    Decision tree on ``documents/sha256/<aa>/<sha>/document.json``:
 
     - absent → write both files atomically, log success.
     - present and bytes match → no-op (don't even rewrite ``meta.json``,

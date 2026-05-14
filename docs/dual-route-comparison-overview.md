@@ -82,7 +82,7 @@ For a Springer or Elsevier DOI:
    it via `litspectraits sideload <doi> <pdf-path>` (PDF-only sideload,
    per v3 §10). Manifest + artifact land under `artifacts/pdf/`.
 3. `litspectraits extract <doi>` runs against both artifacts; each
-   produces a `documents/<sha>/document.json` (the publisher-dict /
+   produces a `documents/sha256/<aa>/<sha>/document.json` (the publisher-dict /
    docling-dict shape).
 4. A normalize step (planned: `litspectraits normalize <doi>`) routes
    each extractor output through the matching adapter
@@ -235,10 +235,9 @@ is replaceable.
 - Loader (planned, follow-on #1): `compare_dual_format_dois(dois, store)
   -> Iterable[(doi, DocumentComparison)]`. Auto-discovers dual-format
   candidates by scanning `index/by_doi.jsonl`; reads
-  `normalized/<sha>/document.json` per side.
-- Persistence (planned, follow-on #2): `normalized/sha256/<aa>/<sha>/`
-  with `document.json` + `meta.json`; atomic commit via `tmp/` +
-  `os.replace` per `CLAUDE.md`.
+  `normalized/sha256/<aa>/<sha>/document.json` per side.
+- Persistence: `normalized/sha256/<aa>/<sha>/` with `document.json` +
+  `meta.json`; atomic commit via `tmp/` + `os.replace` per `CLAUDE.md`.
 - CLI: separate composable commands (`extract`, `normalize`,
   `diff-routes`) rather than folding `normalize` into `extract` — keeps
   each stage independently re-runnable and introspectable, at the cost

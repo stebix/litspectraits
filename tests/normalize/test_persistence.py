@@ -86,7 +86,7 @@ def store(tmp_path: Path) -> ArtifactStore:
 
 @pytest.fixture
 def upstream_meta_path(store: ArtifactStore) -> Path:
-    """Stage a fake ``documents/<sha>/meta.json`` so commit can hash it.
+    """Stage a fake ``documents/sha256/<aa>/<sha>/meta.json`` so commit can hash it.
 
     Mirrors the on-disk shape the JATS / Elsevier extractors produce, in
     enough detail that a different content hash falls out for the
@@ -436,7 +436,7 @@ def test_failed_normalize_leaves_no_partial_files(
 
 
 def test_commit_without_upstream_meta_raises(store: ArtifactStore) -> None:
-    """No ``documents/<sha>/meta.json`` → loud :class:`FileNotFoundError`.
+    """No ``documents/sha256/<aa>/<sha>/meta.json`` → loud :class:`FileNotFoundError`.
 
     The operator forgot to run ``litspectraits extract`` first.
     Normalize must not silently invent a meta hash; the resulting
@@ -452,13 +452,13 @@ def test_commit_without_upstream_meta_raises(store: ArtifactStore) -> None:
 
 
 def test_load_document_missing_raises(store: ArtifactStore) -> None:
-    """No ``normalized/<sha>/document.json`` → :class:`FileNotFoundError`."""
+    """No ``normalized/sha256/<aa>/<sha>/document.json`` → :class:`FileNotFoundError`."""
     with pytest.raises(FileNotFoundError):
         load_normalized_document(source_artifact_sha=_FAKE_ARTIFACT_SHA, store=store)
 
 
 def test_load_meta_missing_raises(store: ArtifactStore) -> None:
-    """No ``normalized/<sha>/meta.json`` → :class:`FileNotFoundError`."""
+    """No ``normalized/sha256/<aa>/<sha>/meta.json`` → :class:`FileNotFoundError`."""
     with pytest.raises(FileNotFoundError):
         load_normalized_meta(source_artifact_sha=_FAKE_ARTIFACT_SHA, store=store)
 

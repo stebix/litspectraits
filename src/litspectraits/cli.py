@@ -624,7 +624,7 @@ def _emit_extract_record_json(*, record: AcquisitionRecord, extract_record: Extr
     """Print the ExtractRecord as JSON on stdout, with DOI injected.
 
     The on-disk :class:`ExtractRecord` is keyed by sha (to align with
-    ``documents/<sha>/``); injecting ``doi`` at the top level keeps
+    ``documents/sha256/<aa>/<sha>/``); injecting ``doi`` at the top level keeps
     operator workflows that pipe ``--json`` through ``jq`` self-contained.
     """
     payload = {'doi': record.doi, **converter.unstructure(extract_record)}
@@ -673,8 +673,8 @@ def cmd_normalize(
         False,
         '--renormalize',
         help=(
-            'Overwrite an existing `normalized/<sha>/document.json` whose bytes differ '
-            'from the freshly-normalised output.'
+            'Overwrite an existing `normalized/sha256/<aa>/<sha>/document.json` whose bytes '
+            'differ from the freshly-normalised output.'
         ),
     ),
     json_output: bool = typer.Option(
@@ -683,10 +683,10 @@ def cmd_normalize(
 ) -> None:
     """Build the normalised :class:`Document` for a previously-extracted artifact.
 
-    Reads ``documents/<sha>/document.json``, routes through the
+    Reads ``documents/sha256/<aa>/<sha>/document.json``, routes through the
     format-appropriate adapter (docling for PDF, the XML adapter for
     JATS / Elsevier), and atomically commits the result to
-    ``normalized/<sha>/{document.json,meta.json}``
+    ``normalized/sha256/<aa>/<sha>/{document.json,meta.json}``
     (``docs/normalized-documents-discussion.md`` §3,
     ``docs/dual-route-comparison-overview.md`` §9).
 
@@ -1020,7 +1020,7 @@ def _render_record_panel(
     """Render a record summary as a Rich table.
 
     Includes an "extraction" row that probes for
-    ``documents/<sha>/document.json`` so the same renderer serves
+    ``documents/sha256/<aa>/<sha>/document.json`` so the same renderer serves
     ``ingest`` (where extraction always reads "not extracted") and a
     future ``show`` against an extracted record (Step 10).
     """
@@ -1052,7 +1052,7 @@ def _manifest_relpath(record: AcquisitionRecord, *, settings: Settings) -> str:
 
 
 def _extraction_status(record: AcquisitionRecord, *, settings: Settings) -> str:
-    """Probe for ``documents/<sha>/document.json``; report textually.
+    """Probe for ``documents/sha256/<aa>/<sha>/document.json``; report textually.
 
     Forward-compatible with Step 10 — once :mod:`litspectraits.extract`
     lands and writes the document tree, this row flips to "extracted"
@@ -1068,7 +1068,7 @@ def _extraction_status(record: AcquisitionRecord, *, settings: Settings) -> str:
 
 
 def _normalization_status(record: AcquisitionRecord, *, settings: Settings) -> str:
-    """Probe for ``normalized/<sha>/document.json``; report textually.
+    """Probe for ``normalized/sha256/<aa>/<sha>/document.json``; report textually.
 
     Mirror of :func:`_extraction_status` for the layer downstream.
     Operators need this to know whether the diff harness can run for a

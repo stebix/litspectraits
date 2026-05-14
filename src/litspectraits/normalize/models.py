@@ -355,7 +355,7 @@ class Completeness:
 
     Lets the measurement layer's confidence gate branch on route
     quality without re-deriving it from the blocks. Persisted into
-    ``normalized/<sha>/meta.json`` (``docs/normalized-documents-discussion.md``
+    ``normalized/sha256/<aa>/<sha>/meta.json`` (``docs/normalized-documents-discussion.md``
     §3.5).
     """
 

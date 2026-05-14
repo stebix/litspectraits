@@ -69,9 +69,23 @@ def test_init_creates_layout_and_clears_tmp(tmp_path: Path) -> None:
 
     assert (tmp_path / 'artifacts').is_dir()
     assert (tmp_path / 'manifests').is_dir()
+    assert (tmp_path / 'documents').is_dir()
+    assert (tmp_path / 'normalized').is_dir()
     assert (tmp_path / 'index').is_dir()
     assert store.tmp_dir.is_dir()
     assert not stale.exists()
+
+
+def test_document_dir_is_sharded_under_sha256(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    sha = 'ab' + 'c' * 62
+    assert store.document_dir(sha) == tmp_path / 'documents' / 'sha256' / 'ab' / sha
+
+
+def test_normalized_dir_is_sharded_under_sha256(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    sha = '01' + 'd' * 62
+    assert store.normalized_dir(sha) == tmp_path / 'normalized' / 'sha256' / '01' / sha
 
 
 def test_artifact_path_pdf_uses_pdf_dir_and_extension(tmp_path: Path) -> None:

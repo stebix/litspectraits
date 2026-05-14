@@ -46,7 +46,7 @@ from litspectraits.store import ArtifactStore
 # :mod:`litspectraits._io`.
 __all__ = ['atomic_write', 'file_sha256']
 
-# Filenames under ``documents/<sha>/``. Kept here so the two XML
+# Filenames under ``documents/sha256/<aa>/<sha>/``. Kept here so the two XML
 # extractors and the (separate) PDF extractor agree on the on-disk
 # convention without each carrying its own copy.
 DOCUMENT_FILENAME: Final = 'document.json'

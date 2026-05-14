@@ -8,7 +8,7 @@ Common Element Pool (CEP) — ``<ce:section>`` / ``<ce:para>`` /
 ``<ce:table>`` etc. — distinct from JATS in both element names *and* the
 table model (CALS/OASIS in CEP vs HTML-style in JATS).
 
-The on-disk shape (``documents/<sha>/document.json``) is the same
+The on-disk shape (``documents/sha256/<aa>/<sha>/document.json``) is the same
 JATS-flavored dict shape :mod:`litspectraits.extract.jats` emits:
 
 - ``front``: title + abstract text.
@@ -114,7 +114,7 @@ async def extract_elsevier(
     *,
     reextract: bool = False,
 ) -> ExtractRecord:
-    """Convert an Elsevier artifact to ``documents/<sha>/document.json`` + ``meta.json``.
+    """Convert an Elsevier artifact to ``documents/sha256/<aa>/<sha>/{document,meta}.json``.
 
     Five-stage pipeline mirroring :func:`~litspectraits.extract.jats.extract_jats`:
     preflight → parse (``lxml``) → META_ABS guard → walk → serialize → commit.

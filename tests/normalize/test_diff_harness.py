@@ -127,7 +127,7 @@ def _write_index_entry(store: ArtifactStore, record: AcquisitionRecord) -> None:
 
 
 def _stage_extraction(store: ArtifactStore, sha: str) -> Path:
-    """Write a placeholder ``documents/<sha>/{document.json,meta.json}`` pair.
+    """Write a placeholder ``documents/sha256/<aa>/<sha>/{document.json,meta.json}`` pair.
 
     The placeholder document.json content is irrelevant for the
     harness's existence-checks; it just needs to be on disk for the

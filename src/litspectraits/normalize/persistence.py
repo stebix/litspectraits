@@ -6,15 +6,14 @@ the diff harness loader.
 
 Layout under :attr:`ArtifactStore.data_dir`::
 
-    normalized/<sha256>/document.json    # cattrs-unstructured Document
-    normalized/<sha256>/meta.json        # the NormalizedMeta sidecar
+    normalized/sha256/<aa>/<sha>/document.json    # cattrs-unstructured Document
+    normalized/sha256/<aa>/<sha>/meta.json        # the NormalizedMeta sidecar
 
-Mirrors :meth:`ArtifactStore.document_dir`'s un-sharded layout one
-layer downstream — population is bounded by the artifact set (one
-normalisation per artifact, append-only). The discussion doc proposes
-sharded ``normalized/sha256/<aa>/<sha>/…`` long-term; we defer until
-``documents/`` migrates alongside (see
-``docs/dual-route-comparison-overview.md`` §9).
+Mirrors :meth:`ArtifactStore.document_dir`'s sharded layout one layer
+downstream (one normalisation per artifact, append-only). The
+``<aa>/<sha>/`` segments come from
+:meth:`ArtifactStore.normalized_dir` — never construct paths by
+hand here.
 
 The commit discipline is the same as ingest and extract:
 
@@ -35,7 +34,7 @@ discussion doc §3.5 enumeration verbatim:
 - ``whitespace_rule`` — id of the canonicalisation rule baked into the
   adapters (today: passthrough; verbatim source text);
 - ``source_extractor_meta_sha`` — sha256 of the upstream
-  ``documents/<sha>/meta.json``, so an extractor ``pipeline_view``
+  ``documents/sha256/<aa>/<sha>/meta.json``, so an extractor ``pipeline_view``
   change correctly invalidates this normalisation;
 - ``completeness`` — copy of :attr:`Document.completeness` so the
   measurement layer's confidence gate can branch without re-parsing
@@ -198,8 +197,8 @@ def commit_normalized_document(
         structured-log line so an operator can grep the failure.
     source_artifact_sha : str
         SHA-256 of the artifact this normalisation derives from. Keys
-        the ``normalized/<sha>/`` output directory and identifies which
-        ``documents/<sha>/`` to read the upstream meta from.
+        the ``normalized/sha256/<aa>/<sha>/`` output directory and identifies which
+        ``documents/sha256/<aa>/<sha>/`` to read the upstream meta from.
     store : ArtifactStore
         Provides :meth:`ArtifactStore.normalized_dir`,
         :meth:`ArtifactStore.document_dir`, and :attr:`tmp_dir`.
@@ -217,7 +216,7 @@ def commit_normalized_document(
     Raises
     ------
     FileNotFoundError
-        Upstream ``documents/<sha>/meta.json`` is missing — the
+        Upstream ``documents/sha256/<aa>/<sha>/meta.json`` is missing — the
         operator needs to run ``litspectraits extract <doi>`` first.
     NormalizeIntegrityError
         Existing ``document.json`` bytes differ from the freshly
@@ -297,7 +296,7 @@ def load_normalized_document(
     source_artifact_sha: str,
     store: ArtifactStore,
 ) -> Document:
-    """Load and structure ``normalized/<sha>/document.json``.
+    """Load and structure ``normalized/sha256/<aa>/<sha>/document.json``.
 
     The diff harness loader (follow-on #1) is the primary caller — see
     ``docs/dual-route-comparison-overview.md`` §9.
@@ -305,7 +304,7 @@ def load_normalized_document(
     Raises
     ------
     FileNotFoundError
-        ``normalized/<sha>/document.json`` does not exist (no
+        ``normalized/sha256/<aa>/<sha>/document.json`` does not exist (no
         ``normalize`` run has committed for this artifact).
     """
     path = store.normalized_dir(source_artifact_sha) / DOCUMENT_FILENAME
@@ -318,7 +317,7 @@ def load_normalized_meta(
     source_artifact_sha: str,
     store: ArtifactStore,
 ) -> NormalizedMeta:
-    """Load and structure ``normalized/<sha>/meta.json``.
+    """Load and structure ``normalized/sha256/<aa>/<sha>/meta.json``.
 
     Lets the diff harness filter / stratify by route or completeness
     without paying the cost of structuring the full
@@ -327,7 +326,7 @@ def load_normalized_meta(
     Raises
     ------
     FileNotFoundError
-        ``normalized/<sha>/meta.json`` does not exist.
+        ``normalized/sha256/<aa>/<sha>/meta.json`` does not exist.
     """
     path = store.normalized_dir(source_artifact_sha) / META_FILENAME
     raw = json.loads(path.read_text(encoding='utf-8'))

@@ -12,7 +12,7 @@ One extractor module per :class:`~litspectraits.manifest.Format`:
 Routing through :func:`extract` is keyed on
 :attr:`AcquisitionRecord.format`. Failures raise an
 :class:`~litspectraits.errors.ExtractError` subclass before any
-``documents/<sha>/`` write — same fail-loud discipline as ingest (§14).
+``documents/sha256/<aa>/<sha>/`` write — same fail-loud discipline as ingest (§14).
 
 Step 10a landed the package, the error taxonomy, and
 :class:`~litspectraits.manifest.ExtractRecord`; steps 10b-10d wired the

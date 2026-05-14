@@ -167,7 +167,7 @@ at `manifests/sha256/<aa>/<sha>.manifest.json`. The manifest carries the
 column** so a single index scan answers "what do we have for this DOI?"
 without touching individual manifests.
 
-The `documents/<sha256>/` tree stays format-agnostic — one extractor produces
+The `documents/sha256/<aa>/<sha>/` tree stays format-agnostic — one extractor produces
 one `document.json` regardless of input format. The extractor's name +
 version go into `meta.json` so we know how to invalidate / re-extract on
 schema bumps.
@@ -677,7 +677,7 @@ async def extract(record: AcquisitionRecord, store: ArtifactStore) -> ExtractRec
 Each extractor writes:
 
 ```
-documents/<sha256>/
+documents/sha256/<aa>/<sha>/
 ├── document.json    # extractor output (dict)
 └── meta.json        # {extractor: 'docling'|'jats'|'elsevier', version, format, extracted_at, n_pages?, n_tables?}
 ```

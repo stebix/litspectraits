@@ -55,7 +55,7 @@ class Extractor(StrEnum):
     Recorded explicitly on :class:`ExtractRecord` (rather than derived from
     ``format`` at read time) so a future PDF-extractor swap — e.g.
     docling → some alternative — only changes this value, leaving the
-    schema shape and the ``documents/<sha>/`` layout untouched.
+    schema shape and the ``documents/sha256/<aa>/<sha>/`` layout untouched.
     """
 
     DOCLING = 'docling'
@@ -197,7 +197,7 @@ class ExtractRecord:
     """In-memory result of a successful extraction (§11, ``extract-pdf-plan.md`` §7).
 
     Returned by :func:`litspectraits.extract.extract` and the per-format
-    extractors. The persisted form is ``documents/<sha>/meta.json`` next to
+    extractors. The persisted form is ``documents/sha256/<aa>/<sha>/meta.json`` next to
     the canonical ``document.json``; this record itself is not separately
     serialized (no ``manifests/...extract.json`` file). Round-tripping it
     through :data:`converter` is supported and used by tests to pin the
@@ -207,7 +207,7 @@ class ExtractRecord:
     ----------
     sha256 : str
         SHA-256 of the *source* artifact, matching
-        :attr:`AcquisitionRecord.sha256`. The directory ``documents/<sha>/``
+        :attr:`AcquisitionRecord.sha256`. The directory ``documents/sha256/<aa>/<sha>/``
         is keyed on this value, so extract outputs co-locate with the
         artifact they describe.
     extractor : Extractor

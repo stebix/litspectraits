@@ -2,7 +2,7 @@
 
 Consumes the verbatim ``DoclingDocument.export_to_dict()`` payload that
 :func:`litspectraits.extract.pdf.extract_pdf` writes to
-``documents/<sha>/document.json``, re-hydrates it via
+``documents/sha256/<aa>/<sha>/document.json``, re-hydrates it via
 :meth:`docling_core.types.doc.DoclingDocument.model_validate`, and walks
 its body tree (in docling's own reading order, via
 :meth:`DoclingDocument.iterate_items`) to produce a :class:`Document`
@@ -150,7 +150,7 @@ def normalize_docling_document(document: dict[str, Any]) -> Document:
     ----------
     document : dict
         The verbatim ``DoclingDocument.export_to_dict()`` payload — the
-        on-disk shape of ``documents/<sha>/document.json`` produced by
+        on-disk shape of ``documents/sha256/<aa>/<sha>/document.json`` produced by
         :func:`litspectraits.extract.pdf.extract_pdf`. Validated via
         :meth:`DoclingDocument.model_validate`; a malformed payload
         surfaces as :class:`pydantic.ValidationError`, which is the
