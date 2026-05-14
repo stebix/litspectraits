@@ -605,3 +605,206 @@ Implements `docs/docling-settings-buildout.md` §1.2 / §2 / §3 and the
   `download_models` itself (then the explicit `LayoutModel.download_models`
   call collapses into the bulk call), or the layout-model choice changes
   (update the constant; the probe and download follow).
+
+---
+
+## Step E0.5b — Normalize persistence (committed TBD, 2026-05-14)
+
+Implements `docs/normalized-documents-discussion.md` §3 and the diff-
+harness loader prerequisites of `docs/dual-route-comparison-overview.md`
+§9. Adds `src/litspectraits/normalize/persistence.py`,
+`src/litspectraits/_io.py`, the `NormalizeError` tree, the
+`litspectraits normalize` CLI command, and `ArtifactStore.normalized_dir`.
+
+### N0.5b-1 — `normalized/` mirrors un-sharded `documents/`, diverges from discussion-doc §3.3 prescription
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/store.py` — `normalized_dir()` returns
+  `_normalized_dir / sha256` with no sharding; layout docstring at
+  module top. Cross-ref
+  `docs/normalized-documents-discussion.md` §3.3 ("Match the ingest
+  one-level sha256 sharding `<aa>/<sha>`") and
+  `docs/dual-route-comparison-overview.md` §9.
+- **Decision:** the on-disk layout is `normalized/<sha256>/{document.json,
+  meta.json}` — un-sharded, one directory per artifact. The discussion
+  doc prescribes `normalized/sha256/<aa>/<sha>/...` (one-level sharded)
+  *and* notes that `documents/<sha>/...` "wants tightening before any
+  one directory holds tens of thousands of entries" — i.e. it
+  recommends sharding both layers. We deliberately keep the un-sharded
+  shape so the two adjacent layers stay structurally identical.
+- **Why:** `store.py`'s own rationale for un-sharded `documents/`
+  applies symmetrically — population is bounded by the artifact set
+  (one normalisation per artifact, append-only). Sharding `normalized/`
+  alone would create cross-layer inconsistency; sharding both would
+  fold a migration into a slice that is already wide enough. Current
+  corpus size (tens of papers) does not motivate the move. The
+  abstraction in `ArtifactStore` (`document_dir` / `normalized_dir`
+  methods, callers do not concatenate paths) means a future "shard
+  both" migration is one coordinated change.
+- **Revisit when:** the artifact population crosses ~5–10k papers,
+  *or* the discussion doc's §3.3 lands as enforcement (someone audits
+  `documents/` enumeration cost on the production corpus). At that
+  point migrate both layers in one commit: update the two
+  `*_dir` methods to add the `<aa>/` prefix, rename existing
+  directories at startup, and bump
+  `Document.schema_version` so the layout change is recorded in
+  every fresh manifest.
+
+### N0.5b-2 — `atomic_write` + `file_sha256` lifted to `litspectraits._io`
+
+- [ ] Reviewed
+- **Where:** new module `src/litspectraits/_io.py`;
+  `src/litspectraits/extract/_lxml_helpers.py` re-imports both names
+  for backwards compatibility. Cross-ref the E10d-4 follow-up item
+  ("commit machinery duplicated rather than abstracted") above.
+- **Decision:** the two file-IO helpers move out of
+  `extract/_lxml_helpers.py` into a neutral
+  `litspectraits._io` module so the normalize layer can use them
+  without depending on extract internals. `_lxml_helpers.py`
+  re-imports + re-exports under `__all__` so existing import sites
+  continue to work; new code should import from `litspectraits._io`
+  directly.
+- **Why:** the normalize persistence layer needed the same
+  atomic-write discipline (CLAUDE.md non-negotiable). Duplicating
+  the helpers into `normalize/persistence.py` would have created two
+  implementations of one invariant — a real correctness risk for the
+  one piece of plumbing the entire write path depends on.
+  `_lxml_helpers.py`'s own docstring already acknowledged the helpers
+  were "generic enough that the file-name on the module is a slight
+  misnomer", which made this the right moment to lift.
+- **Revisit when:** the ingest commit (`store.py`'s `_write_manifest`)
+  has its own inline atomic-write implementation. Folding that into
+  `litspectraits._io.atomic_write` would unify the third site too.
+  Not blocking; the three implementations are byte-identical today.
+
+### N0.5b-3 — `atomic_write` cleans up staging file on `os.replace` failure
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/_io.py` — `atomic_write()` wraps
+  `os.replace` in try/except, unlinks the staging `.part` file on
+  any `OSError`, then re-raises.
+- **Decision:** the previous extract-side implementation left the
+  staging `.part` file behind in `<data_dir>/tmp/` when `os.replace`
+  failed (disk full, target dir vanished, etc.). The new
+  `litspectraits._io.atomic_write` cleans up the staging file before
+  the exception propagates. The store's startup `_reset_tmp()` was the
+  backstop for these orphans; cleanup is now in-process so callers
+  can assert `tmp_dir` is empty after a failure.
+- **Why:** persistence-layer test
+  `test_failed_normalize_leaves_no_partial_files` exposed the gap.
+  The pre-existing behaviour was harmless but eroded the
+  "tmp is empty at rest" invariant within a single process — useful
+  for tests, and slightly useful for long-running batch sessions where
+  the backstop only fires on next process boot.
+- **Revisit when:** never expected — kept for audit. The fix benefits
+  the extract layer too (jats / elsevier / pdf all route through this
+  helper).
+
+### N0.5b-4 — Three error trees keep duplicated `__init__` rather than refactor to shared base
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/errors.py` — `NormalizeError`
+  inherits from `RuntimeError` and mirrors `IngestError.__init__` and
+  `ExtractError.__init__` verbatim (seven lines, identical body). Module
+  docstring updated to acknowledge the three trees.
+- **Decision:** the pre-existing comment on the `ExtractError`
+  section said *"Revisit if a third tree ever lands"* — adding
+  `NormalizeError` is exactly that trigger. We deliberately continued
+  the duplication rather than refactoring to a shared private base.
+- **Why:** the original rationale ("explicit duplication keeps the
+  contracts independent and the class taxonomies grep-able") gets
+  *stronger* at three trees, not weaker. A reader chasing an
+  `except NormalizeError` at the CLI boundary should see the class
+  definition complete and self-contained, not have to chase a base
+  class shared with two unrelated stages. The cost is 14 duplicated
+  lines across the file; the alternative cost is a coupling between
+  three otherwise-independent failure taxonomies.
+- **Revisit when:** a fourth error tree lands (unlikely — the
+  pipeline stages are bounded), *or* the `__init__` body grows
+  non-trivially. At that point the duplication cost crosses the
+  coupling cost and a private `_LitspectraitsError` base in
+  `errors.py` becomes the right move. Until then, three copies it is.
+
+### N0.5b-5 — Indented + sorted JSON on disk, against discussion-doc §3.4 prescription of compact
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/normalize/persistence.py` —
+  `_serialize()` uses `json.dumps(..., indent=2, sort_keys=True,
+  ensure_ascii=False)`. Cross-ref
+  `docs/normalized-documents-discussion.md` §3.4 point 2
+  ("Compact JSON, not pretty").
+- **Decision:** match the existing extract-layer output format
+  (`extract/_lxml_helpers.py:serialize_document` also uses
+  `indent=2, sort_keys=True`) rather than the discussion doc's
+  compact-JSON prescription. ``document.json`` and ``meta.json`` are
+  pretty-printed and deterministically sorted.
+- **Why:** consistency with the upstream extract layer matters more
+  than the discussion doc's size argument at corpus sizes we target.
+  Indented output supports operator workflows (`jq`, casual `cat`)
+  and bit-for-bit reproducibility (sorted keys = stable byte hash
+  on identical inputs). The size delta is ~1.5x for typical paper
+  outputs (~100–200 KiB), negligible at the ~hundreds-to-thousands
+  paper corpus scale.
+- **Revisit when:** the corpus crosses ~50k papers *and* on-disk
+  total size becomes a real concern, *or* a binary index layer
+  (Layer 3 Postgres / parquet) lands and the on-disk JSON's role
+  shifts from "source of truth read by tools" to "snapshot
+  archive". At that point flip to compact JSON across all four
+  layers (extract + normalize × document + meta) in one commit so
+  the convention stays uniform.
+
+### N0.5b-6 — `litspectraits normalize` is a separate composable command, not folded into `extract`
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/cli.py` — `cmd_normalize` is its
+  own `@app.command(name='normalize')` rather than an extra step
+  inside `cmd_extract`. Module-top docstring updated from "Five
+  commands" to "Six commands" with the composable-step rationale
+  inline.
+- **Decision:** the canonical three-step happy path for an artifact
+  is `ingest → extract → normalize`. Each step is independently
+  re-runnable with its own integrity flag
+  (`--reextract` / `--renormalize`) and its own exit-code matrix.
+  No `extract --and-normalize` convenience flag.
+- **Why:** the diff harness use case
+  (`docs/dual-route-comparison-overview.md` §9) requires re-running
+  *normalize alone* repeatedly while iterating on adapter code,
+  without paying the expensive extract step each iteration.
+  Composability also makes the `show` panel's per-stage row
+  (`extraction`, `normalization`) accurately reflect which artifacts
+  are ready for which downstream consumer. Folding the steps would
+  recover one CLI invocation at the cost of these properties.
+- **Revisit when:** the gold-set bake-off operationalises a
+  ~50–200-paper sweep and the per-paper CLI overhead becomes
+  measurable. Even then, prefer a batch-orchestrator script over
+  collapsing the per-stage commands.
+
+### N0.5b-7 — `WHITESPACE_RULE = 'passthrough-v1'` (no canonicalisation today)
+
+- [ ] Reviewed
+- **Where:** `src/litspectraits/normalize/persistence.py` —
+  `WHITESPACE_RULE: Final = 'passthrough-v1'`. Cross-ref
+  `docs/normalized-documents-discussion.md` §3.4 point 3
+  ("One declared whitespace canonicalisation rule baked into the
+  assembly").
+- **Decision:** the canonicalisation rule recorded in `meta.json`
+  for every committed normalised document is the literal string
+  `'passthrough-v1'` — i.e. the adapters take block text verbatim
+  from the extractor output, no collapsing, no stripping, no
+  normalisation. The rule id exists so a future canonicalisation
+  pass can be detected as a rule bump (and forces a
+  `NORMALIZER_VERSION` bump in the same commit), rather than
+  silently changing output bytes for unchanged inputs.
+- **Why:** the discussion doc assumes a canonicalisation rule
+  exists; today it does not. Recording the rule's current state
+  honestly is better than recording an aspirational rule we do not
+  enforce. The `-v1` suffix is forward-compatible: when a real
+  rule lands (e.g. `'collapse-runs-v1'`) the recorded id changes
+  and the stale-check fires correctly across the corpus.
+- **Revisit when:** the verbatim-anchor gate
+  (`agentic-buildout-sketch.md` §5.3) starts rejecting records
+  whose value strings differ from their `source_block.text` only by
+  whitespace. At that point introduce a canonical rule, bump the
+  `WHITESPACE_RULE` id, bump `NORMALIZER_VERSION`, and rebuild the
+  affected normalisations. Until then, passthrough is the honest
+  record.

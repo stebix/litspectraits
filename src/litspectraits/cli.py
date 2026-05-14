@@ -1,8 +1,12 @@
 """Command-line interface (``docs/overview-v3.md`` §10, §17.9).
 
-Five commands ship today: ``ingest``, ``sideload``, ``doctor``, ``show``,
-``extract`` (plus the convenience ``smoke`` ephemeral-tempdir wrapper
-around ``ingest``).
+Six commands ship today: ``ingest``, ``sideload``, ``doctor``,
+``show``, ``extract``, ``normalize`` (plus the convenience ``smoke``
+ephemeral-tempdir wrapper around ``ingest``). ``extract`` and
+``normalize`` are deliberately separate composable steps rather than
+folded into one command — each stage stays independently re-runnable
+and operator-introspectable
+(``docs/normalized-documents-discussion.md`` §3).
 
 Failure model
 -------------
@@ -72,6 +76,8 @@ from litspectraits.errors import (
     MalformedDocumentError,
     MissingArtifactError,
     MissingCredentialError,
+    NormalizeError,
+    NormalizeIntegrityError,
     NotOpenAccessError,
     ParseDegradedError,
     PublisherAPIError,
@@ -83,7 +89,14 @@ from litspectraits.errors import (
 from litspectraits.extract import extract as run_extract
 from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
-from litspectraits.manifest import AcquisitionRecord, ExtractRecord, converter
+from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, converter
+from litspectraits.normalize import (
+    NormalizedMeta,
+    commit_normalized_document,
+    normalize_docling_document,
+    normalize_xml_document,
+)
+from litspectraits.normalize import converter as normalize_converter
 from litspectraits.sideload import sideload as run_sideload
 from litspectraits.store import ArtifactStore
 
@@ -178,6 +191,20 @@ _INGEST_HINTS: Final[dict[type[IngestError], str]] = {
     IntegrityError: (
         'sha256 collision against an existing artifact with different bytes; '
         'investigate before overwriting'
+    ),
+}
+
+
+_NORMALIZE_EXIT_CODES: Final[dict[type[NormalizeError], int]] = {
+    # Refused to overwrite a divergent on-disk normalisation.
+    NormalizeIntegrityError: 7,
+}
+
+
+_NORMALIZE_HINTS: Final[dict[type[NormalizeError], str]] = {
+    NormalizeIntegrityError: (
+        're-normalised document differs from the existing one; '
+        'pass `--renormalize` to overwrite if the change is intentional'
     ),
 }
 
@@ -625,6 +652,152 @@ def _render_extract_record_panel(
 
 
 # ---------------------------------------------------------------------------
+# normalize
+# ---------------------------------------------------------------------------
+
+
+@app.command(name='normalize')
+def cmd_normalize(
+    target: str = typer.Argument(
+        ...,
+        help=(
+            'DOI or sha256 of the artifact to normalise. '
+            'Sha is a 64-char lowercase hex string; anything else is parsed as a DOI.'
+        ),
+    ),
+    renormalize: bool = typer.Option(
+        False,
+        '--renormalize',
+        help=(
+            'Overwrite an existing `normalized/<sha>/document.json` whose bytes differ '
+            'from the freshly-normalised output.'
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False, '--json', help='Emit the resulting NormalizedMeta as JSON on stdout.'
+    ),
+) -> None:
+    """Build the normalised :class:`Document` for a previously-extracted artifact.
+
+    Reads ``documents/<sha>/document.json``, routes through the
+    format-appropriate adapter (docling for PDF, the XML adapter for
+    JATS / Elsevier), and atomically commits the result to
+    ``normalized/<sha>/{document.json,meta.json}``
+    (``docs/normalized-documents-discussion.md`` §3,
+    ``docs/dual-route-comparison-overview.md`` §9).
+
+    The artifact must already be ingested *and* extracted — run
+    ``litspectraits ingest`` then ``litspectraits extract`` first. The
+    composable three-step (``ingest`` → ``extract`` → ``normalize``) is
+    a deliberate choice over folding ``normalize`` into ``extract``:
+    each stage stays independently re-runnable and operator-introspectable.
+
+    Exit codes:
+
+    - 1: artifact not in local store, or upstream extraction missing.
+    - 2: invalid input shape, or docling SDK missing for a PDF target.
+    - 7: re-normalisation diverges from existing bytes and ``--renormalize``
+      was not passed (:class:`~litspectraits.errors.NormalizeIntegrityError`).
+    """
+    settings = _load_settings()
+    store = ArtifactStore(settings.data_dir)
+    err_console = _stderr_console()
+    out_console = _stdout_console()
+
+    record = _resolve_extract_target(target=target, store=store, err_console=err_console)
+    try:
+        meta = _run_normalize(record=record, store=store, renormalize=renormalize)
+    except FileNotFoundError as exc:
+        err_console.print(
+            f'[bold yellow]upstream extraction missing:[/bold yellow] {exc}. '
+            f'Run `litspectraits extract {record.doi}` first.'
+        )
+        raise typer.Exit(1) from exc
+    except DoclingImportError as exc:
+        _render_error_panel(exc, console=err_console, hints=_EXTRACT_HINTS)
+        raise typer.Exit(2) from exc
+    except NormalizeError as exc:
+        _render_error_panel(exc, console=err_console, hints=_NORMALIZE_HINTS)
+        raise typer.Exit(_NORMALIZE_EXIT_CODES.get(type(exc), 1)) from exc
+
+    if json_output:
+        _emit_normalize_meta_json(record=record, meta=meta)
+    else:
+        _render_normalize_meta_panel(record=record, meta=meta, console=out_console)
+
+
+def _run_normalize(
+    *, record: AcquisitionRecord, store: ArtifactStore, renormalize: bool
+) -> NormalizedMeta:
+    """Glue: load the extractor output, dispatch by format, commit.
+
+    Kept synchronous because none of the adapters are I/O bound (cattrs
+    structuring against an in-memory dict). If a future adapter grows
+    real I/O — e.g. a network-fetched ontology lookup — switch the
+    helper to async and ``asyncio.run`` from ``cmd_normalize`` to match
+    the ingest/extract pattern.
+    """
+    document_path = store.document_dir(record.sha256) / 'document.json'
+    if not document_path.exists():
+        raise FileNotFoundError(
+            f'missing {document_path.relative_to(store.data_dir)} (sha256={record.sha256!r})'
+        )
+    payload = json.loads(document_path.read_text(encoding='utf-8'))
+
+    if record.format is Format.PDF:
+        doc = normalize_docling_document(payload)
+    elif record.format is Format.JATS_XML:
+        doc = normalize_xml_document(payload, route='jats')
+    elif record.format is Format.ELSEVIER_XML:
+        doc = normalize_xml_document(payload, route='elsevier')
+    else:
+        # New format added without updating dispatch — defensive guard.
+        raise RuntimeError(f'no normalize adapter for format {record.format!r}')
+
+    return commit_normalized_document(
+        doc=doc,
+        doi=record.doi,
+        source_artifact_sha=record.sha256,
+        store=store,
+        renormalize=renormalize,
+    )
+
+
+def _emit_normalize_meta_json(*, record: AcquisitionRecord, meta: NormalizedMeta) -> None:
+    """Print the :class:`NormalizedMeta` as JSON on stdout, DOI injected.
+
+    DOI is added at the top level for the same reason as the extract
+    JSON emitter: keeps ``--json | jq`` workflows self-contained when
+    the operator pipes multiple normalisations into a single stream.
+    """
+    payload = {'doi': record.doi, **normalize_converter.unstructure(meta)}
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _render_normalize_meta_panel(
+    *,
+    record: AcquisitionRecord,
+    meta: NormalizedMeta,
+    console: Console,
+) -> None:
+    table = Table(title=f'normalised — {record.doi}', show_header=False, expand=False)
+    table.add_column('field', no_wrap=True, style='bold')
+    table.add_column('value')
+    table.add_row('doi', record.doi)
+    table.add_row('source_artifact_sha', meta.source_artifact_sha)
+    table.add_row('route', meta.route)
+    table.add_row('normaliser_version', meta.normaliser_version)
+    table.add_row('whitespace_rule', meta.whitespace_rule)
+    table.add_row('source_extractor_meta_sha', meta.source_extractor_meta_sha)
+    table.add_row('normalized_at', meta.normalized_at.isoformat())
+    table.add_row('has_structured_refs', str(meta.completeness.has_structured_refs))
+    table.add_row('has_inline_ref_ids', str(meta.completeness.has_inline_ref_ids))
+    table.add_row('has_equations', str(meta.completeness.has_equations))
+    table.add_row('table_source', meta.completeness.table_source)
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 
@@ -669,9 +842,7 @@ def cmd_doctor(
         raise typer.Exit(1)
 
 
-async def _run_doctor(
-    *, settings: Settings, download_models: bool, smoke_extract: bool
-):
+async def _run_doctor(*, settings: Settings, download_models: bool, smoke_extract: bool):
     async with http_client(settings) as client:
         return await run_doctor(
             settings=settings,
@@ -750,6 +921,7 @@ def _render_record_panel(
     table.add_row('fetcher', f'litspectraits {record.fetcher_version}')
     table.add_row('sdk', record.sdk_version)
     table.add_row('extraction', _extraction_status(record, settings=settings))
+    table.add_row('normalization', _normalization_status(record, settings=settings))
     console.print(table)
 
 
@@ -777,6 +949,33 @@ def _extraction_status(record: AcquisitionRecord, *, settings: Settings) -> str:
     return 'not extracted'
 
 
+def _normalization_status(record: AcquisitionRecord, *, settings: Settings) -> str:
+    """Probe for ``normalized/<sha>/document.json``; report textually.
+
+    Mirror of :func:`_extraction_status` for the layer downstream.
+    Operators need this to know whether the diff harness can run for a
+    dual-format DOI without first invoking ``litspectraits normalize``
+    (``docs/dual-route-comparison-overview.md`` §3).
+    """
+    document_path = settings.data_dir / 'normalized' / record.sha256 / 'document.json'
+    if document_path.is_file():
+        meta_path = settings.data_dir / 'normalized' / record.sha256 / 'meta.json'
+        if meta_path.is_file():
+            return f'normalised ({_brief_normalizer(meta_path)})'
+        return 'normalised'
+    return 'not normalised'
+
+
+def _brief_normalizer(meta_path: Path) -> str:
+    try:
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    except OSError, ValueError:
+        return 'meta unreadable'
+    route = meta.get('route', '?')
+    version = meta.get('normaliser_version', '?')
+    return f'{route} v{version}'
+
+
 def _brief_extractor(meta_path: Path) -> str:
     try:
         meta = json.loads(meta_path.read_text(encoding='utf-8'))
@@ -798,18 +997,22 @@ def _render_invalid_doi(exc: InvalidDOIError, *, console: Console) -> None:
 
 
 def _render_error_panel(
-    exc: IngestError | ExtractError,
+    exc: IngestError | ExtractError | NormalizeError,
     *,
     console: Console,
-    hints: dict[type[IngestError], str] | dict[type[ExtractError], str],
+    hints: dict[type[IngestError], str]
+    | dict[type[ExtractError], str]
+    | dict[type[NormalizeError], str],
 ) -> None:
-    """Render a typed :class:`IngestError` / :class:`ExtractError` as a Rich panel on stderr.
+    """Render a typed pipeline-stage error as a Rich panel on stderr.
 
-    Includes class name, DOI, every key/value in ``exc.context``, and an
-    operator hint (per-call from ``context['hint']`` when present;
-    otherwise the class default from ``hints``).
+    Accepts any of :class:`IngestError`, :class:`ExtractError`, or
+    :class:`NormalizeError`. Includes class name, DOI, every key/value
+    in ``exc.context``, and an operator hint (per-call from
+    ``context['hint']`` when present; otherwise the class default from
+    ``hints``).
 
-    The two error trees are inheritance-disjoint and share the same
+    The three error trees are inheritance-disjoint and share the same
     ``.doi`` + ``.context`` shape; the renderer is identical between
     them so we share one function and route the right hints dict in.
     """

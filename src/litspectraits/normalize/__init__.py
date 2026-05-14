@@ -49,9 +49,19 @@ from litspectraits.normalize.models import (
     TableCell,
     TextBlock,
 )
+from litspectraits.normalize.persistence import (
+    NORMALIZER_VERSION,
+    WHITESPACE_RULE,
+    NormalizedMeta,
+    commit_normalized_document,
+    load_normalized_document,
+    load_normalized_meta,
+)
 from litspectraits.normalize.xml_adapter import XmlRoute, normalize_xml_document
 
 __all__ = [
+    'NORMALIZER_VERSION',
+    'WHITESPACE_RULE',
     'BBox',
     'Block',
     'CharRange',
@@ -60,6 +70,7 @@ __all__ = [
     'EquationBlock',
     'FigureBlock',
     'InlineRef',
+    'NormalizedMeta',
     'ParsedReference',
     'Provenance',
     'RefIdSource',
@@ -70,7 +81,10 @@ __all__ = [
     'TableCell',
     'TextBlock',
     'XmlRoute',
+    'commit_normalized_document',
     'converter',
+    'load_normalized_document',
+    'load_normalized_meta',
     'normalize_docling_document',
     'normalize_xml_document',
 ]

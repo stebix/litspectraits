@@ -5,6 +5,7 @@ Layout under :attr:`Settings.data_dir`::
     artifacts/{pdf,jats,elsevier}/sha256/<aa>/<sha>.<ext>
     manifests/sha256/<aa>/<sha>.manifest.json
     documents/<sha256>/{document.json,meta.json}
+    normalized/<sha256>/{document.json,meta.json}
     index/by_doi.jsonl
     tmp/                   # cleared on init
 
@@ -16,12 +17,16 @@ hex characters of the sha256 (one-level sharding).
 co-locates with the bytes it describes. It is intentionally **not** sharded
 — the population is bounded by the artifact population (one extraction per
 artifact, append-only) and one-level-deeper directories already gives
-filesystems an easy enumerate.
+filesystems an easy enumerate. ``normalized/`` mirrors the same un-sharded
+shape one layer downstream (E0.5b persistence, ``docs/normalized-documents-discussion.md``
+§3); when corpus size eventually motivates sharding, both layers move
+together in one coordinated migration (see
+``docs/dual-route-comparison-overview.md`` §9).
 
 Atomic ``os.replace`` from ``tmp/`` to the canonical path is non-negotiable
 (§3): a half-written ``.part`` file must never be visible at the canonical
-location. Extract outputs follow the same discipline (``extract-pdf-plan.md``
-§3 stage 5).
+location. Extract and normalize outputs follow the same discipline
+(``extract-pdf-plan.md`` §3 stage 5; persistence module).
 """
 
 import json
@@ -78,6 +83,7 @@ class ArtifactStore:
         self._artifacts_dir = data_dir / 'artifacts'
         self._manifests_dir = data_dir / 'manifests'
         self._documents_dir = data_dir / 'documents'
+        self._normalized_dir = data_dir / 'normalized'
         self._index_dir = data_dir / 'index'
         self._tmp_dir = data_dir / 'tmp'
         self._index_path = self._index_dir / _INDEX_FILENAME
@@ -86,6 +92,7 @@ class ArtifactStore:
             self._artifacts_dir,
             self._manifests_dir,
             self._documents_dir,
+            self._normalized_dir,
             self._index_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -132,6 +139,17 @@ class ArtifactStore:
         leave an empty dir behind.
         """
         return self._documents_dir / sha256
+
+    def normalized_dir(self, sha256: str) -> Path:
+        """Absolute path of the per-artifact normalised-output directory.
+
+        Sibling of :meth:`document_dir`, with the same un-sharded layout
+        — see this module's layout docstring for the rationale.
+        Lazy-created by the normalize commit (
+        :mod:`litspectraits.normalize.persistence`) so a query for an
+        un-normalised artifact does not leave an empty directory behind.
+        """
+        return self._normalized_dir / sha256
 
     def commit(self, *, src: Path, record: AcquisitionRecord) -> Path:
         """Atomically install ``src`` and persist ``record``.
