@@ -118,6 +118,35 @@ _RICH_ELSEVIER: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
 </full-text-retrieval-response>
 """
 
+_ELSEVIER_WITH_EQUATION: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
+<full-text-retrieval-response xmlns="http://www.elsevier.com/xml/svapi/article/dtd"
+                              xmlns:ce="http://www.elsevier.com/xml/common/dtd"
+                              xmlns:xocs="http://www.elsevier.com/xml/xocs/dtd"
+                              xmlns:mml="http://www.w3.org/1998/Math/MathML">
+  <originalText>
+    <xocs:doc>
+      <ce:sections>
+        <ce:section id="theory">
+          <ce:section-title>Theory</ce:section-title>
+          <ce:para>The signal evolves per the Bloch equation:</ce:para>
+          <ce:formula id="eq1">
+            <ce:label>(1)</ce:label>
+            <mml:math>
+              <mml:mi>S</mml:mi><mml:mo>=</mml:mo>
+              <mml:mi>M</mml:mi>
+            </mml:math>
+          </ce:formula>
+          <ce:para>where M is equilibrium magnetisation.</ce:para>
+          <ce:formula id="eq2-text-only">
+            <ce:label>(2)</ce:label>
+          </ce:formula>
+        </ce:section>
+      </ce:sections>
+    </xocs:doc>
+  </originalText>
+</full-text-retrieval-response>
+"""
+
 # Same shape as the retriever-side fixture: a META_ABS abstract-only
 # envelope that lacks ``<originalText>``. The retriever raises
 # :class:`EntitlementDowngradeError` on this; the extractor must raise
@@ -267,6 +296,39 @@ async def test_empty_full_text_raises_empty_document_error(
     assert not store.document_dir(record.sha256).exists()
 
 
+async def test_ce_formula_with_mathml_extracted_as_equation_block(
+    store: ArtifactStore,
+    make_acquisition_record: Callable[..., AcquisitionRecord],
+) -> None:
+    """`<ce:formula>` carrying MathML lands as an in-section equation block.
+
+    The fixture also includes a `<ce:formula>` without MathML — the
+    extractor must silently skip it rather than emit a half-empty
+    equation entry, matching :func:`extract_jats`'s posture.
+    """
+    record = _elsevier_record(
+        store=store,
+        make_acquisition_record=make_acquisition_record,
+        body=_ELSEVIER_WITH_EQUATION,
+    )
+    extract_record = await extract_elsevier(record, store)
+
+    assert extract_record.n_text_blocks == 2
+
+    document = json.loads((store.document_dir(record.sha256) / 'document.json').read_text())
+    theory = next(sec for sec in document['sections'] if sec['id'] == 'theory')
+    block_types = [b['type'] for b in theory['blocks']]
+    assert block_types == ['paragraph', 'equation', 'paragraph']
+
+    equation = theory['blocks'][1]
+    assert equation['id'] == 'eq1'
+    assert '<math' in equation['mathml'] or '<mml:math' in equation['mathml']
+    assert 'S' in equation['text']
+
+    meta = json.loads((store.document_dir(record.sha256) / 'meta.json').read_text())
+    assert meta['n_equations'] == 1
+
+
 # Stage 4 — serialize ---------------------------------------------------------
 
 
@@ -386,6 +448,7 @@ async def test_happy_path_writes_document_and_meta(
     assert meta['n_section_headers'] == 3
     assert meta['n_tables'] == 1
     assert meta['n_figures'] == 1
+    assert meta['n_equations'] == 0
     assert meta['n_references'] == 1
     assert meta['format'] == Format.ELSEVIER_XML.value
     assert 'pipeline' not in meta

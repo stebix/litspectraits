@@ -82,6 +82,7 @@ class Counts:
     n_section_headers: int
     n_tables: int
     n_figures: int
+    n_equations: int
     n_references: int
     char_count: int
 
@@ -230,6 +231,21 @@ def walk_paragraph_with_offsets(
 
     _recurse(paragraph)
     return ''.join(parts), spans
+
+
+def serialize_mathml(math: etree._Element) -> str:
+    """Render a ``<math>`` element back to its XML string, namespaces intact.
+
+    Used by the XML extractors when surfacing a display-mode equation in
+    the publisher dict: the verbatim MathML lands in ``equation['mathml']``
+    so the anchor gate downstream can compare an emitted value string
+    against an exact bytes-of-source-MathML view rather than a re-rendered
+    one. ``pretty_print=False`` keeps the byte-shape stable across walks
+    (the on-disk ``document.json`` itself is pretty-printed; equation
+    payloads should not nest a second formatting layer that introduces
+    serialise-ambiguity).
+    """
+    return etree.tostring(math, encoding='unicode', pretty_print=False)
 
 
 def ancestor_section_path(node: etree._Element, *, section_localname: str) -> list[str | None]:
@@ -385,6 +401,7 @@ def commit_document(
         n_section_headers=counts.n_section_headers,
         n_tables=counts.n_tables,
         n_figures=counts.n_figures,
+        n_equations=counts.n_equations,
         n_references=counts.n_references,
         char_count=counts.char_count,
     )
@@ -442,6 +459,7 @@ def _build_meta(
         'n_section_headers': counts.n_section_headers,
         'n_tables': counts.n_tables,
         'n_figures': counts.n_figures,
+        'n_equations': counts.n_equations,
         'n_references': counts.n_references,
         'char_count': counts.char_count,
     }

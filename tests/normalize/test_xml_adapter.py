@@ -32,6 +32,7 @@ from litspectraits.manifest import (
 )
 from litspectraits.normalize import (
     Document,
+    EquationBlock,
     FigureBlock,
     TableBlock,
     TextBlock,
@@ -264,6 +265,79 @@ def test_normalized_document_round_trips_through_converter() -> None:
     # Survives JSON encode/decode (the on-disk shape will be JSON).
     restored = converter.structure(json.loads(json.dumps(raw)), Document)
     assert restored == doc
+
+
+# ---------------------------------------------------------------------------
+# Display-mode equations
+# ---------------------------------------------------------------------------
+
+
+def _publisher_dict_with_equation(*, route: XmlRoute) -> dict[str, Any]:
+    """Minimal publisher dict whose section carries a paragraph then an equation.
+
+    Block order is preserved through the adapter, so the two should land
+    adjacent in :attr:`Document.blocks` with the equation following the
+    text block. ``mathml`` carries a verbatim ``<math>`` envelope of the
+    sort the JATS / Elsevier extractors serialise via ``serialize_mathml``.
+    """
+    return {
+        'front': {'title': None, 'abstract': None},
+        'sections': [
+            {
+                'id': 's1',
+                'title': 'Theory',
+                'level': 1,
+                'path': ['s1'],
+                'blocks': [
+                    {'type': 'paragraph', 'text': 'See below.', 'xrefs': []},
+                    {
+                        'type': 'equation',
+                        'id': 'eq1',
+                        'text': 'T1 = a + b',
+                        'mathml': (
+                            '<math xmlns="http://www.w3.org/1998/Math/MathML">'
+                            '<mi>T1</mi><mo>=</mo><mi>a</mi><mo>+</mo><mi>b</mi>'
+                            '</math>'
+                        ),
+                    },
+                ],
+            }
+        ],
+        'tables': [],
+        'figures': [],
+        'references': [],
+    }
+
+
+@pytest.mark.parametrize('route', ['jats', 'elsevier'])
+def test_equation_block_emitted_with_mathml(route: XmlRoute) -> None:
+    doc = normalize_xml_document(_publisher_dict_with_equation(route=route), route=route)
+    equations = [b for b in doc.blocks if isinstance(b, EquationBlock)]
+    assert len(equations) == 1
+    eq = equations[0]
+    assert eq.id == 'eq1'
+    assert eq.text == 'T1 = a + b'
+    assert eq.mathml is not None and '<mi>T1</mi>' in eq.mathml
+    # XML routes never populate ``latex`` — that's the docling field.
+    assert eq.latex is None
+    assert eq.section_path == ('s1',)
+    assert eq.provenance.route == route
+
+
+@pytest.mark.parametrize('route', ['jats', 'elsevier'])
+def test_equation_preserves_section_block_order(route: XmlRoute) -> None:
+    # Paragraph comes first, equation second — the adapter must respect
+    # the publisher-dict's reading order so the verbatim-anchor gate's
+    # block-index references stay stable.
+    doc = normalize_xml_document(_publisher_dict_with_equation(route=route), route=route)
+    kinds = [b.type for b in doc.blocks]
+    assert kinds[:2] == ['text', 'equation']
+
+
+@pytest.mark.parametrize('route', ['jats', 'elsevier'])
+def test_completeness_has_equations_when_equation_present(route: XmlRoute) -> None:
+    doc = normalize_xml_document(_publisher_dict_with_equation(route=route), route=route)
+    assert doc.completeness.has_equations is True
 
 
 def test_empty_publisher_dict_yields_empty_document() -> None:

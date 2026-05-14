@@ -27,9 +27,13 @@ Limitations (E0.5a explicit non-goals — tracked as follow-ons in
   Elsevier (rare but present) are not yet anchored; this matches the
   schema, where ``TableBlock.inline_refs`` / ``FigureBlock.inline_refs``
   default to ``()``.
-- **No ``EquationBlock`` instances.** XML extractors do not yet emit
-  display-mode equations (``<disp-formula>``); EquationBlock first
-  shows up via the docling adapter (E0.5b).
+- **Inline equations stay inside paragraph text.** ``<inline-formula>`` /
+  ``<ce:formula>`` content embedded mid-sentence is preserved verbatim
+  in the surrounding ``TextBlock.text`` via the extractor's ``full_text``
+  walk; it never becomes its own block. Only display-mode equations
+  (``<disp-formula>`` / ``<ce:formula>`` as a direct child of a section)
+  surface as :class:`EquationBlock`, matching the docling route's
+  display-only equation policy.
 """
 
 from typing import Any, Final, Literal
@@ -38,6 +42,7 @@ from litspectraits.normalize.models import (
     CharRange,
     Completeness,
     Document,
+    EquationBlock,
     FigureBlock,
     InlineRef,
     ParsedReference,
@@ -89,16 +94,16 @@ def normalize_xml_document(
         :data:`litspectraits.normalize.converter`. Route-purity is
         enforced by :meth:`Document.__attrs_post_init__`.
     """
-    blocks: list[TextBlock | TableBlock | FigureBlock] = []
+    blocks: list[TextBlock | TableBlock | FigureBlock | EquationBlock] = []
 
     for section in document.get('sections', []) or []:
         section_path = tuple(section.get('path') or ())
         for raw_block in section.get('blocks', []) or []:
-            text_block = _paragraph_to_text_block(
+            section_block = _section_block_to_normalized(
                 raw_block, section_path=section_path, route=route
             )
-            if text_block is not None:
-                blocks.append(text_block)
+            if section_block is not None:
+                blocks.append(section_block)
 
     for raw_table in document.get('tables', []) or []:
         blocks.append(_table_to_block(raw_table, route=route))
@@ -128,21 +133,34 @@ def normalize_xml_document(
 # ---------------------------------------------------------------------------
 
 
+def _section_block_to_normalized(
+    raw: dict[str, Any],
+    *,
+    section_path: tuple[str | None, ...],
+    route: XmlRoute,
+) -> TextBlock | EquationBlock | None:
+    """Dispatch one in-section block dict to its normalised counterpart.
+
+    The publisher dict currently carries two block kinds inside a
+    section: ``'paragraph'`` and ``'equation'``. Unknown kinds return
+    ``None`` so a future block type (e.g. a list-item shape) isn't
+    silently mis-typed as text — the loud failure here is the same
+    posture as everywhere else in the extract path.
+    """
+    block_kind = raw.get('type')
+    if block_kind == 'paragraph':
+        return _paragraph_to_text_block(raw, section_path=section_path, route=route)
+    if block_kind == 'equation':
+        return _equation_to_block(raw, section_path=section_path, route=route)
+    return None
+
+
 def _paragraph_to_text_block(
     raw: dict[str, Any],
     *,
     section_path: tuple[str | None, ...],
     route: XmlRoute,
-) -> TextBlock | None:
-    """Adapt one paragraph dict; return ``None`` for non-paragraph blocks.
-
-    The dict's ``type`` field has historically only ever been
-    ``'paragraph'``, but the guard means a future block kind in the
-    publisher dict (e.g. a list-item shape) won't be silently
-    mis-typed as text.
-    """
-    if raw.get('type') != 'paragraph':
-        return None
+) -> TextBlock:
     text = raw.get('text') or ''
     inline_refs = tuple(
         _xref_to_inline_ref(xref, block_text=text, route=route)
@@ -153,6 +171,31 @@ def _paragraph_to_text_block(
         provenance=Provenance(route=route),
         section_path=section_path,
         inline_refs=inline_refs,
+    )
+
+
+def _equation_to_block(
+    raw: dict[str, Any],
+    *,
+    section_path: tuple[str | None, ...],
+    route: XmlRoute,
+) -> EquationBlock:
+    """Adapt one equation dict.
+
+    The extractor only emits equation entries that carry verbatim MathML
+    (see :func:`litspectraits.extract.jats._disp_formula_to_block` /
+    :func:`litspectraits.extract.elsevier._formula_to_block`), so
+    ``raw['mathml']`` is always populated on the XML route — the schema
+    requires it. ``latex`` stays ``None``; that field is the docling
+    route's responsibility.
+    """
+    return EquationBlock(
+        id=raw.get('id'),
+        text=raw.get('text') or '',
+        mathml=raw.get('mathml'),
+        latex=None,
+        provenance=Provenance(route=route),
+        section_path=section_path,
     )
 
 
@@ -289,7 +332,7 @@ def _reference_to_attrs(raw: dict[str, Any]) -> Reference:
 
 def _derive_completeness(
     *,
-    blocks: list[TextBlock | TableBlock | FigureBlock],
+    blocks: list[TextBlock | TableBlock | FigureBlock | EquationBlock],
     references: tuple[Reference, ...],
 ) -> Completeness:
     has_structured_refs = any(ref.parsed is not None for ref in references)
@@ -299,15 +342,11 @@ def _derive_completeness(
         if isinstance(block, TextBlock)
         for inline in block.inline_refs
     )
+    has_equations = any(isinstance(block, EquationBlock) for block in blocks)
     return Completeness(
         has_structured_refs=has_structured_refs,
         has_inline_ref_ids=has_inline_ref_ids,
-        # XML extractors don't emit equation blocks in E0.5a; the
-        # docling adapter (E0.5b) is where this flag flips for the
-        # PDF route. If a future XML extractor pass starts surfacing
-        # ``<disp-formula>`` as a normalized block, set this to True
-        # in this adapter (and add the EquationBlock instances above).
-        has_equations=False,
+        has_equations=has_equations,
         # Both XML routes take tables straight from the publisher
         # markup; no TableFormer in the loop, so the table source is
         # unambiguous.

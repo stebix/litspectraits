@@ -70,6 +70,7 @@ from litspectraits.extract._lxml_helpers import (
     full_text,
     local_findall,
     serialize_document,
+    serialize_mathml,
     walk_paragraph_with_offsets,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
@@ -84,8 +85,10 @@ from litspectraits.store import ArtifactStore
 # ``end`` byte offsets — see :mod:`litspectraits.extract.jats` for the
 # same change and rationale. The two XML extractors bump in lockstep so
 # the normaliser can treat them uniformly.
+# Version '3' adds display-mode equation blocks (``<ce:formula>``
+# carrying MathML) as a third in-section block kind alongside paragraphs.
 SCHEMA_NAME: Final = 'litspectraits-elsevier-extract'
-SCHEMA_VERSION: Final = '2'
+SCHEMA_VERSION: Final = '3'
 
 # Soft-cap on the inline label preserved for a ``<ce:cross-ref>`` (the
 # visible bracketed citation marker). Same rationale as
@@ -104,6 +107,7 @@ class _Acc:
     section_headers: int = 0
     tables: int = 0
     figures: int = 0
+    equations: int = 0
     references: int = 0
     chars: int = 0
 
@@ -309,6 +313,7 @@ def _walk(root: etree._Element) -> tuple[dict[str, Any], Counts]:
         n_section_headers=acc.section_headers,
         n_tables=acc.tables,
         n_figures=acc.figures,
+        n_equations=acc.equations,
         n_references=acc.references,
         char_count=acc.chars,
     )
@@ -421,21 +426,28 @@ def _outermost_sections(root: etree._Element) -> list[etree._Element]:
 
 
 def _extract_blocks(parent: etree._Element, *, acc: _Acc) -> list[dict[str, Any]]:
-    """Pull paragraph blocks out of ``parent``'s direct children.
+    """Pull paragraph + display-equation blocks from ``parent``'s direct children.
 
     Nested ``<ce:section>`` content is handled by the section walker;
     iterating recursive descendants here would double-count those
-    paragraphs.
+    paragraphs. Reading order is preserved across the two block kinds
+    (paragraph + equation), matching the JATS extractor.
     """
     blocks: list[dict[str, Any]] = []
     for child in parent:
-        if etree.QName(child.tag).localname != 'para':
-            continue
-        block = _paragraph_to_block(child)
-        if block['text']:
-            blocks.append(block)
-            acc.text_blocks += 1
-            acc.chars += len(block['text'])
+        local = etree.QName(child.tag).localname
+        if local == 'para':
+            block = _paragraph_to_block(child)
+            if block['text']:
+                blocks.append(block)
+                acc.text_blocks += 1
+                acc.chars += len(block['text'])
+        elif local == 'formula':
+            equation = _formula_to_block(child)
+            if equation is not None:
+                blocks.append(equation)
+                acc.equations += 1
+                acc.chars += len(equation['text'])
     return blocks
 
 
@@ -453,6 +465,27 @@ def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
         'type': 'paragraph',
         'text': text,
         'xrefs': [_xref_descriptor(span) for span in spans],
+    }
+
+
+def _formula_to_block(formula: etree._Element) -> dict[str, Any] | None:
+    """Turn a ``<ce:formula>`` into an equation block dict.
+
+    Same MathML-required contract as
+    :func:`litspectraits.extract.jats._disp_formula_to_block`: only
+    formulas carrying a ``<math>`` (MathML) descendant get surfaced; a
+    bare textual formula returns ``None`` so the section's block list
+    stays clean (no half-empty equation entries).
+    """
+    math_el = first_descendant(formula, 'math')
+    if math_el is None:
+        return None
+    text = full_text(math_el)
+    return {
+        'type': 'equation',
+        'id': formula.get('id'),
+        'text': text,
+        'mathml': serialize_mathml(math_el),
     }
 
 

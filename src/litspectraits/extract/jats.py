@@ -58,6 +58,7 @@ from litspectraits.extract._lxml_helpers import (
     full_text,
     local_findall,
     serialize_document,
+    serialize_mathml,
     walk_paragraph_with_offsets,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
@@ -73,8 +74,10 @@ from litspectraits.store import ArtifactStore
 # means an on-disk ``document.json`` written by an older extractor will
 # fail the integrity check on re-extract — that is intentional; force
 # a re-extract with ``--reextract`` after upgrading.
+# Version '3' adds display-mode equation blocks (``<disp-formula>``
+# carrying MathML) as a third in-section block kind alongside paragraphs.
 SCHEMA_NAME: Final = 'litspectraits-jats-extract'
-SCHEMA_VERSION: Final = '2'
+SCHEMA_VERSION: Final = '3'
 
 # Soft-cap on the inline label preserved for an `<xref>` (the visible
 # bracketed citation marker, e.g. "[12]" or "Smith et al., 2019"). Long
@@ -95,6 +98,7 @@ class _Acc:
     section_headers: int = 0
     tables: int = 0
     figures: int = 0
+    equations: int = 0
     references: int = 0
     chars: int = 0
 
@@ -270,6 +274,7 @@ def _walk(root: etree._Element) -> tuple[dict[str, Any], Counts]:
         n_section_headers=acc.section_headers,
         n_tables=acc.tables,
         n_figures=acc.figures,
+        n_equations=acc.equations,
         n_references=acc.references,
         char_count=acc.chars,
     )
@@ -360,20 +365,29 @@ def _extract_sections(body: etree._Element | None, *, acc: _Acc) -> list[dict[st
 
 
 def _extract_blocks(parent: etree._Element, *, acc: _Acc) -> list[dict[str, Any]]:
-    """Pull paragraph blocks out of ``parent``'s direct children.
+    """Pull paragraph + display-equation blocks from ``parent``'s direct children.
 
     Nested ``<sec>`` content is handled by the section walker; iterating
     recursive descendants here would double-count those paragraphs.
+    Reading order is preserved: blocks land in the same order they appear
+    in the XML, so a display formula between two paragraphs stays between
+    them in the dict.
     """
     blocks: list[dict[str, Any]] = []
     for child in parent:
-        if etree.QName(child.tag).localname != 'p':
-            continue
-        block = _paragraph_to_block(child)
-        if block['text']:
-            blocks.append(block)
-            acc.text_blocks += 1
-            acc.chars += len(block['text'])
+        local = etree.QName(child.tag).localname
+        if local == 'p':
+            block = _paragraph_to_block(child)
+            if block['text']:
+                blocks.append(block)
+                acc.text_blocks += 1
+                acc.chars += len(block['text'])
+        elif local == 'disp-formula':
+            equation = _disp_formula_to_block(child)
+            if equation is not None:
+                blocks.append(equation)
+                acc.equations += 1
+                acc.chars += len(equation['text'])
     return blocks
 
 
@@ -392,6 +406,30 @@ def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
         'type': 'paragraph',
         'text': text,
         'xrefs': [_xref_descriptor(span) for span in spans],
+    }
+
+
+def _disp_formula_to_block(formula: etree._Element) -> dict[str, Any] | None:
+    """Turn a ``<disp-formula>`` into an equation block dict.
+
+    Only emits when the formula carries a ``<math>`` (MathML) descendant —
+    the normaliser's :class:`~litspectraits.normalize.models.EquationBlock`
+    schema requires ``mathml`` on the XML route, and a ``<tex-math>``-only
+    formula can't honestly satisfy that. Returns ``None`` in that case so
+    the section's block list stays clean (no half-empty equation entries).
+    The ``text`` field is the MathML's rendered text content — used by
+    the verbatim-anchor gate downstream when matching value strings
+    against an equation's content.
+    """
+    math_el = first_descendant(formula, 'math')
+    if math_el is None:
+        return None
+    text = full_text(math_el)
+    return {
+        'type': 'equation',
+        'id': formula.get('id'),
+        'text': text,
+        'mathml': serialize_mathml(math_el),
     }
 
 

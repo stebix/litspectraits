@@ -99,6 +99,31 @@ _RICH_JATS: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
 </article>
 """
 
+_JATS_WITH_EQUATION: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
+<article article-type="research-article">
+  <body>
+    <sec id="theory">
+      <title>Theory</title>
+      <p>The signal evolves per the Bloch equation:</p>
+      <disp-formula id="eq1">
+        <label>(1)</label>
+        <math xmlns="http://www.w3.org/1998/Math/MathML">
+          <mi>S</mi><mo>=</mo><mi>M</mi><mo>&#x22C5;</mo>
+          <mo>(</mo><mn>1</mn><mo>-</mo><msup><mi>e</mi>
+          <mrow><mo>-</mo><mi>t</mi><mo>/</mo><mi>T1</mi></mrow></msup>
+          <mo>)</mo>
+        </math>
+      </disp-formula>
+      <p>where M is equilibrium magnetisation.</p>
+      <disp-formula id="eq2-text-only">
+        <label>(2)</label>
+        <tex-math>S = M \\cdot (1 - e^{-t/T_1})</tex-math>
+      </disp-formula>
+    </sec>
+  </body>
+</article>
+"""
+
 _BARE_JATS: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
 <article>
   <body>
@@ -246,6 +271,44 @@ async def test_namespaced_jats_parses_via_local_name(
     assert extract_record.n_section_headers == 1
 
 
+async def test_disp_formula_with_mathml_extracted_as_equation_block(
+    store: ArtifactStore,
+    make_acquisition_record: Callable[..., AcquisitionRecord],
+) -> None:
+    """`<disp-formula>` carrying MathML lands as an in-section equation block.
+
+    A second `<disp-formula>` in the same fixture carries only
+    `<tex-math>` (no MathML); the extractor must skip it rather than
+    emit a half-empty equation entry — the
+    :class:`~litspectraits.normalize.models.EquationBlock` schema
+    requires MathML on the XML route.
+    """
+    record = _jats_record(
+        store=store,
+        make_acquisition_record=make_acquisition_record,
+        body=_JATS_WITH_EQUATION,
+    )
+    extract_record = await extract_jats(record, store)
+
+    # Two paragraphs, exactly one equation (the MathML one); the
+    # tex-math-only formula is silently dropped.
+    assert extract_record.n_text_blocks == 2
+
+    document = json.loads((store.document_dir(record.sha256) / 'document.json').read_text())
+    theory = next(sec for sec in document['sections'] if sec['id'] == 'theory')
+    block_types = [b['type'] for b in theory['blocks']]
+    assert block_types == ['paragraph', 'equation', 'paragraph']
+
+    equation = theory['blocks'][1]
+    assert equation['id'] == 'eq1'
+    assert equation['mathml'].startswith('<math')
+    assert '<mi>S</mi>' in equation['mathml']
+    assert 'S' in equation['text']
+
+    meta = json.loads((store.document_dir(record.sha256) / 'meta.json').read_text())
+    assert meta['n_equations'] == 1
+
+
 async def test_floating_paragraph_outside_section_surfaces_as_synthetic_section(
     store: ArtifactStore,
     make_acquisition_record: Callable[..., AcquisitionRecord],
@@ -385,6 +448,7 @@ async def test_happy_path_writes_document_and_meta(
     assert meta['n_section_headers'] == 3
     assert meta['n_tables'] == 1
     assert meta['n_figures'] == 1
+    assert meta['n_equations'] == 0
     assert meta['n_references'] == 1
     assert meta['format'] == Format.JATS_XML.value
     assert 'pipeline' not in meta
