@@ -1,0 +1,76 @@
+"""Normalised ``Document`` model (E0.5).
+
+The publisher-agnostic representation built downstream of the per-format
+extractors. Two adapters populate it:
+
+- :mod:`litspectraits.normalize.xml_adapter` (E0.5a) — converts the
+  JATS / Elsevier publisher dict shape (:mod:`litspectraits.extract.jats`,
+  :mod:`litspectraits.extract.elsevier`) into a :class:`Document`.
+- :mod:`litspectraits.normalize.docling_adapter` (E0.5b) — converts a
+  docling ``DoclingDocument`` into a :class:`Document`.
+
+See ``docs/normalized-documents-discussion.md`` for the design;
+``docs/agentic-buildout-sketch.md`` §1.5 for the schema commitments;
+``CLAUDE.md`` for the cattrs-from-day-one rule.
+
+Schema commitments (must read before changing this module)
+----------------------------------------------------------
+- One :class:`Document`, one :class:`Block` tagged union — the *fields*
+  bifurcate by route, not the types.
+- Every :class:`Block` carries a :class:`Provenance` with
+  ``route: Route`` as a mandatory discriminator; ``None`` on a
+  route-irrelevant field reads as "expected", not "bug".
+- :class:`InlineRef` ``ref_id`` is ``None`` on the docling route until a
+  marker-match pass runs; ``ref_id_source`` records which pass
+  populated it.
+- :class:`Reference` is the raw / parsed / resolved split — JATS +
+  Elsevier yield ``parsed``; the docling route emits ``raw_text`` only
+  until a citation-parsing pass runs.
+"""
+
+from litspectraits.normalize.docling_adapter import normalize_docling_document
+from litspectraits.normalize.hooks import converter
+from litspectraits.normalize.models import (
+    BBox,
+    Block,
+    CharRange,
+    Completeness,
+    Document,
+    EquationBlock,
+    FigureBlock,
+    InlineRef,
+    ParsedReference,
+    Provenance,
+    Reference,
+    RefIdSource,
+    ResolvedReference,
+    Route,
+    TableBlock,
+    TableCell,
+    TextBlock,
+)
+from litspectraits.normalize.xml_adapter import XmlRoute, normalize_xml_document
+
+__all__ = [
+    'BBox',
+    'Block',
+    'CharRange',
+    'Completeness',
+    'Document',
+    'EquationBlock',
+    'FigureBlock',
+    'InlineRef',
+    'ParsedReference',
+    'Provenance',
+    'RefIdSource',
+    'Reference',
+    'ResolvedReference',
+    'Route',
+    'TableBlock',
+    'TableCell',
+    'TextBlock',
+    'XmlRoute',
+    'converter',
+    'normalize_docling_document',
+    'normalize_xml_document',
+]

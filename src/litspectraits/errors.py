@@ -1,19 +1,25 @@
-"""Ingest and extract error taxonomies.
+"""Ingest, extract, and normalize error taxonomies.
 
-Two parallel error trees rooted at :class:`IngestError` and
-:class:`ExtractError`. The v3 happy path raises exactly one subclass when
-it cannot make forward progress; nothing is materialized on failure
-(``docs/overview-v3.md`` §0, §5, §14, plus ``docs/extract-pdf-plan.md`` §5
-for the extract side). The class itself is the contract — operator hint
-and CLI exit code dispatch off ``type(exc)``.
+Three parallel error trees rooted at :class:`IngestError`,
+:class:`ExtractError`, and :class:`NormalizeError`. The v3 happy path
+raises exactly one subclass when it cannot make forward progress;
+nothing is materialized on failure (``docs/overview-v3.md`` §0, §5, §14,
+plus ``docs/extract-pdf-plan.md`` §5 for the extract side and
+``docs/normalized-documents-discussion.md`` §3.7 for the normalize side).
+The class itself is the contract — operator hint and CLI exit code
+dispatch off ``type(exc)``.
 
 Each instance carries the DOI plus an open-ended ``context`` dict
-(publisher, fetched URL, raw error string, SDK version, …). Both attributes
-are populated by the base ``__init__``; subclasses add no behavior.
+(publisher, fetched URL, raw error string, SDK version, …). Both
+attributes are populated by the base ``__init__``; subclasses add no
+behavior.
 
-The two trees are kept structurally identical but inheritance-disjoint so
-``except IngestError`` at the ingest boundary never catches an extract
-failure (and vice versa).
+The three trees are kept structurally identical but inheritance-disjoint
+so ``except IngestError`` at the ingest boundary never catches an extract
+or normalize failure, and vice versa. The seven-line ``__init__`` is
+mirrored verbatim across the three bases rather than inherited from a
+shared private parent — explicit duplication keeps the catch boundaries
+grep-able and the three contracts independent.
 """
 
 
@@ -138,12 +144,13 @@ class IntegrityError(IngestError):
 # Extract errors ==============================================================
 #
 # Step 10 (``docs/overview-v3.md`` §21, ``docs/extract-pdf-plan.md`` §5).
-# Same DOI + context-dict shape as :class:`IngestError`. The two trees are
+# Same DOI + context-dict shape as :class:`IngestError`. The trees are
 # deliberately disjoint so CLI panels and pytest-style ``except`` blocks at
-# either pipeline stage pattern-match cleanly. The ``__init__`` is mirrored
+# each pipeline stage pattern-match cleanly. The ``__init__`` is mirrored
 # verbatim rather than inherited from a shared private base — explicit
-# duplication of seven lines keeps the two contracts independent and the
-# class taxonomies grep-able. Revisit if a third tree ever lands.
+# duplication of seven lines keeps the contracts independent and the
+# class taxonomies grep-able. Same rationale applies to
+# :class:`NormalizeError` below.
 
 
 class ExtractError(RuntimeError):
@@ -290,4 +297,59 @@ class ExtractIntegrityError(ExtractError):
     panel dispatch can pattern-match each failure mode independently.
     Both classes encode the same principle — refuse to silently overwrite
     bytes — but at different layers of the pipeline.
+    """
+
+
+# Normalize errors ============================================================
+#
+# E0.5 (``docs/normalized-documents-discussion.md`` §3). The normalize layer
+# sits between extract and the measurement layer; its failures need to be
+# distinguishable from extract failures at the CLI boundary even though the
+# shape (DOI + context dict) is identical. See the module docstring for why
+# the ``__init__`` is duplicated rather than inherited.
+
+
+class NormalizeError(RuntimeError):
+    """Base class for all v3 normalisation failures.
+
+    Parameters
+    ----------
+    message : str, optional
+        Human-readable summary. When omitted, a default
+        ``ClassName doi=<doi> key=value …`` rendering is synthesized so
+        ``str(exc)`` and bare ``logger.exception`` calls remain useful
+        before the CLI's Rich panel is in place.
+    doi : str
+        DOI under which the failure occurred. Always present so structured
+        logs and per-DOI retry queues can correlate ingest, extract, and
+        normalize failures against the same paper.
+    **context : object
+        Free-form structured fields attached to the failure (e.g.
+        ``route='docling'``, ``source_artifact_sha='deadbeef…'``,
+        ``normaliser_version='1.0'``).
+    """
+
+    doi: str
+    context: dict[str, object]
+
+    def __init__(self, message: str = '', *, doi: str, **context: object) -> None:
+        if not message:
+            extras = ' '.join(f'{key}={value!r}' for key, value in context.items())
+            message = f'{type(self).__name__} doi={doi!r}'
+            if extras:
+                message = f'{message} {extras}'
+        super().__init__(message)
+        self.doi = doi
+        self.context = dict(context)
+
+
+class NormalizeIntegrityError(NormalizeError):
+    """Existing normalized ``document.json`` differs and ``--renormalize`` was not set.
+
+    Raised on commit when a fresh normalisation of the same artifact would
+    overwrite previously-committed bytes. Distinct from
+    :class:`ExtractIntegrityError` and :class:`IntegrityError` so the CLI
+    panel and the diff-harness loader can pattern-match the precise stage
+    that refused to overwrite. All three encode the same principle —
+    never silently rewrite committed bytes — at different layers.
     """
