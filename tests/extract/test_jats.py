@@ -337,9 +337,17 @@ async def test_happy_path_writes_document_and_meta(
     assert by_id['s1-1']['level'] == 2
     assert by_id['s2']['title'] == 'Methods'
 
-    # Inline xref preservation.
+    # Inline xref preservation, including the byte offsets the normaliser
+    # depends on (E0.5a). The label is the stripped surface form; the
+    # offsets index the un-stripped block text so ``text[start:end]``
+    # round-trips byte-for-byte through the verbatim-anchor gate.
     intro_blocks = by_id['s1']['blocks']
-    assert intro_blocks[0]['xrefs'] == [{'rid': 'R1', 'ref_type': 'bibr', 'label': '[1]'}]
+    assert len(intro_blocks[0]['xrefs']) == 1
+    (xref,) = intro_blocks[0]['xrefs']
+    assert xref['rid'] == 'R1'
+    assert xref['ref_type'] == 'bibr'
+    assert xref['label'] == '[1]'
+    assert intro_blocks[0]['text'][xref['start'] : xref['end']] == '[1]'
 
     # Table cell projection.
     table = document['tables'][0]

@@ -332,9 +332,15 @@ async def test_happy_path_writes_document_and_meta(
 
     # Inline xref preservation: CEP ``refid`` surfaces as ``rid`` to match
     # the JATS dict shape; ``ref_type`` is ``None`` because CEP doesn't
-    # encode an analogue.
+    # encode an analogue. ``start`` / ``end`` byte offsets index the
+    # un-stripped block text — E0.5a normaliser depends on them.
     intro_blocks = by_id['s1']['blocks']
-    assert intro_blocks[0]['xrefs'] == [{'rid': 'b1', 'ref_type': None, 'label': '[1]'}]
+    assert len(intro_blocks[0]['xrefs']) == 1
+    (xref,) = intro_blocks[0]['xrefs']
+    assert xref['rid'] == 'b1'
+    assert xref['ref_type'] is None
+    assert xref['label'] == '[1]'
+    assert intro_blocks[0]['text'][xref['start'] : xref['end']] == '[1]'
 
     # CALS table projection: 2 rows by 2 cols, spans default to 1.
     table = document['tables'][0]

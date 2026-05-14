@@ -47,6 +47,7 @@ from litspectraits.errors import (
 )
 from litspectraits.extract._lxml_helpers import (
     Counts,
+    XrefSpan,
     all_descendants,
     ancestor_section_path,
     commit_document,
@@ -57,6 +58,7 @@ from litspectraits.extract._lxml_helpers import (
     full_text,
     local_findall,
     serialize_document,
+    walk_paragraph_with_offsets,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -64,8 +66,15 @@ from litspectraits.store import ArtifactStore
 # Schema is owned by us, not by JATS upstream. Bump ``SCHEMA_VERSION`` on any
 # breaking change to the dict shape (field rename, semantic shift) so a
 # downstream reader can refuse mismatched docs cleanly.
+# SCHEMA_VERSION bumped to '2' when the xref descriptor gained ``start`` /
+# ``end`` byte offsets into the assembled paragraph text. The normaliser
+# (E0.5a) depends on those offsets for the verbatim-anchor gate
+# (``docs/normalized-documents-discussion.md`` §1.4). Bumping the version
+# means an on-disk ``document.json`` written by an older extractor will
+# fail the integrity check on re-extract — that is intentional; force
+# a re-extract with ``--reextract`` after upgrading.
 SCHEMA_NAME: Final = 'litspectraits-jats-extract'
-SCHEMA_VERSION: Final = '1'
+SCHEMA_VERSION: Final = '2'
 
 # Soft-cap on the inline label preserved for an `<xref>` (the visible
 # bracketed citation marker, e.g. "[12]" or "Smith et al., 2019"). Long
@@ -371,18 +380,23 @@ def _extract_blocks(parent: etree._Element, *, acc: _Acc) -> list[dict[str, Any]
 def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
     """Turn a ``<p>`` element into a paragraph block, preserving inline xrefs.
 
-    The full text-with-tails is what a reader sees; the xref descriptors
-    record the surface label + ``rid`` + ``ref-type`` so downstream code
-    can resolve ``[12]`` back to ``references[id == 'R12']``.
+    The full text-with-tails is what a reader sees; each xref descriptor
+    records the surface label + ``rid`` + ``ref-type`` *and* the
+    ``(start, end)`` byte offsets into the assembled text so the
+    normaliser can rebuild a verbatim-anchor-eligible ``InlineRef``
+    without re-walking the XML (E0.5a, ``docs/normalized-documents-discussion.md``
+    §1.4).
     """
+    text, spans = walk_paragraph_with_offsets(p, xref_localnames=('xref',))
     return {
         'type': 'paragraph',
-        'text': full_text(p),
-        'xrefs': [_xref_descriptor(x) for x in local_findall(p, 'xref')],
+        'text': text,
+        'xrefs': [_xref_descriptor(span) for span in spans],
     }
 
 
-def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
+def _xref_descriptor(span: XrefSpan) -> dict[str, Any]:
+    xref = span.element
     label = (full_text(xref) or '').strip()
     if len(label) > _XREF_LABEL_MAX:
         label = label[:_XREF_LABEL_MAX]
@@ -390,6 +404,8 @@ def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
         'rid': xref.get('rid'),
         'ref_type': xref.get('ref-type'),
         'label': label or None,
+        'start': span.start,
+        'end': span.end,
     }
 
 

@@ -59,6 +59,7 @@ from litspectraits.errors import (
 )
 from litspectraits.extract._lxml_helpers import (
     Counts,
+    XrefSpan,
     all_descendants,
     ancestor_section_path,
     commit_document,
@@ -69,6 +70,7 @@ from litspectraits.extract._lxml_helpers import (
     full_text,
     local_findall,
     serialize_document,
+    walk_paragraph_with_offsets,
 )
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -78,8 +80,12 @@ from litspectraits.store import ArtifactStore
 # downstream reader can refuse mismatched docs cleanly. Distinct from the
 # JATS schema name so a future reader can branch on it cheaply, even though
 # the field shape is intentionally aligned.
+# SCHEMA_VERSION bumped to '2' when the xref descriptor gained ``start`` /
+# ``end`` byte offsets — see :mod:`litspectraits.extract.jats` for the
+# same change and rationale. The two XML extractors bump in lockstep so
+# the normaliser can treat them uniformly.
 SCHEMA_NAME: Final = 'litspectraits-elsevier-extract'
-SCHEMA_VERSION: Final = '1'
+SCHEMA_VERSION: Final = '2'
 
 # Soft-cap on the inline label preserved for a ``<ce:cross-ref>`` (the
 # visible bracketed citation marker). Same rationale as
@@ -439,16 +445,19 @@ def _paragraph_to_block(p: etree._Element) -> dict[str, Any]:
     Field shape mirrors :func:`litspectraits.extract.jats._paragraph_to_block`:
     the publisher-side attribute name differs (``refid`` here vs ``rid`` in
     JATS) but we surface it as ``rid`` so downstream code stays
-    publisher-agnostic.
+    publisher-agnostic. ``start`` / ``end`` byte offsets land alongside,
+    same purpose as the JATS extractor (E0.5a anchor support).
     """
+    text, spans = walk_paragraph_with_offsets(p, xref_localnames=('cross-ref',))
     return {
         'type': 'paragraph',
-        'text': full_text(p),
-        'xrefs': [_xref_descriptor(x) for x in local_findall(p, 'cross-ref')],
+        'text': text,
+        'xrefs': [_xref_descriptor(span) for span in spans],
     }
 
 
-def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
+def _xref_descriptor(span: XrefSpan) -> dict[str, Any]:
+    xref = span.element
     label = (full_text(xref) or '').strip()
     if len(label) > _XREF_LABEL_MAX:
         label = label[:_XREF_LABEL_MAX]
@@ -458,6 +467,8 @@ def _xref_descriptor(xref: etree._Element) -> dict[str, Any]:
         # field present (publisher-agnostic shape) and ``None``.
         'ref_type': None,
         'label': label or None,
+        'start': span.start,
+        'end': span.end,
     }
 
 

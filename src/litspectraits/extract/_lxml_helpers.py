@@ -30,18 +30,21 @@ the small file-level duplication saves.
 
 import hashlib
 import json
-import os
-import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Final, cast
 
 from lxml import etree
 
+from litspectraits._io import atomic_write, file_sha256
 from litspectraits.errors import ExtractIntegrityError, SerializationError
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord
 from litspectraits.store import ArtifactStore
+
+# Re-export atomic_write / file_sha256 so existing call sites continue to
+# import them from this module. New code should import directly from
+# :mod:`litspectraits._io`.
+__all__ = ['atomic_write', 'file_sha256']
 
 # Filenames under ``documents/<sha>/``. Kept here so the two XML
 # extractors and the (separate) PDF extractor agree on the on-disk
@@ -152,9 +155,84 @@ def full_text(node: etree._Element | None) -> str:
     return ''.join(parts)
 
 
-def ancestor_section_path(
-    node: etree._Element, *, section_localname: str
-) -> list[str | None]:
+@dataclass(frozen=True)
+class XrefSpan:
+    """An inline cross-reference element with its byte offsets into the parent text.
+
+    Produced by :func:`walk_paragraph_with_offsets`. ``start`` / ``end`` are
+    half-open offsets into the paragraph's assembled :func:`full_text`
+    result, so ``paragraph_text[start:end] == full_text(element)`` byte-for-byte.
+    """
+
+    element: etree._Element
+    start: int
+    end: int
+
+
+def walk_paragraph_with_offsets(
+    paragraph: etree._Element,
+    *,
+    xref_localnames: tuple[str, ...],
+) -> tuple[str, list[XrefSpan]]:
+    """Assemble paragraph text and locate inline cross-references.
+
+    The returned text is byte-identical to ``full_text(paragraph)`` — the
+    walk mirrors :func:`full_text` exactly (recurse into every child,
+    appending ``node.text`` then each ``child`` then ``child.tail``) and
+    simply tracks a cursor alongside the assembled parts. Any direct or
+    nested child whose local-name matches ``xref_localnames`` is emitted
+    as an :class:`XrefSpan` with offsets into the assembled text.
+
+    This is the deterministic offset re-walk that
+    ``docs/normalized-documents-discussion.md`` Part 1.4 calls out as
+    "the only new code" for E0.5a. JATS uses ``xref_localnames=('xref',)``;
+    Elsevier CEP uses ``('cross-ref',)``.
+
+    Parameters
+    ----------
+    paragraph : lxml.etree._Element
+        The ``<p>`` / ``<ce:para>`` element to walk. Other element kinds
+        are accepted; the function never inspects ``paragraph.tag``.
+    xref_localnames : tuple[str, ...]
+        Local-names (namespace-stripped) that count as cross-references.
+        Matching is namespace-agnostic via :func:`etree.QName`.
+
+    Returns
+    -------
+    text : str
+        ``full_text(paragraph)`` — byte-identical, including whitespace.
+    spans : list[XrefSpan]
+        Cross-references in document order, with half-open offsets into
+        ``text``. Nested cross-references (rare but possible) are
+        emitted alongside their enclosing parent, each with its own
+        offset range.
+    """
+    parts: list[str] = []
+    spans: list[XrefSpan] = []
+    cursor = 0
+
+    def _recurse(node: etree._Element) -> None:
+        nonlocal cursor
+        if node.text:
+            parts.append(node.text)
+            cursor += len(node.text)
+        for child in node:
+            local = etree.QName(child.tag).localname
+            if local in xref_localnames:
+                start = cursor
+                _recurse(child)
+                spans.append(XrefSpan(element=child, start=start, end=cursor))
+            else:
+                _recurse(child)
+            if child.tail:
+                parts.append(child.tail)
+                cursor += len(child.tail)
+
+    _recurse(paragraph)
+    return ''.join(parts), spans
+
+
+def ancestor_section_path(node: etree._Element, *, section_localname: str) -> list[str | None]:
     """Walk up to the first non-section ancestor, recording section ids.
 
     Parameters
@@ -176,40 +254,11 @@ def ancestor_section_path(
 
 
 # ---------------------------------------------------------------------------
-# Atomic file IO
-# ---------------------------------------------------------------------------
-
-
-def atomic_write(*, tmp_dir: Path, target: Path, body: bytes) -> None:
-    """Stage to ``<tmp_dir>/<rand>.part`` then ``os.replace`` into place.
-
-    The random suffix means two concurrent extractions on the same sha
-    cannot collide on the staging filename even if (somehow) two
-    extracts of the same artifact arrive in parallel — same defence as
-    the store's manifest write.
-    """
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    staging = tmp_dir / f'{target.name}.{secrets.token_hex(8)}.part'
-    staging.write_bytes(body)
-    os.replace(staging, target)
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as fp:
-        while chunk := fp.read(64 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-# ---------------------------------------------------------------------------
 # Serialize + commit
 # ---------------------------------------------------------------------------
 
 
-def serialize_document(
-    *, doi: str, document: dict[str, Any], extractor: Extractor
-) -> bytes:
+def serialize_document(*, doi: str, document: dict[str, Any], extractor: Extractor) -> bytes:
     """Render the walker's dict as the canonical ``document.json`` bytes.
 
     Indent + sort keys so the on-disk shape is stable across walks;
