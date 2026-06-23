@@ -11,12 +11,11 @@ their primary source.
 
 ## Status
 
-The ingestion stage is being rebuilt under the **v3 design**
-(`docs/overview-v3.md`). The v1 resolver / acquisition / ranking-policy stack
-has been deleted; the surviving CLI commands are `ingest`, `doctor`, and
-`show`. `extract` and `sideload` from the §10 surface land alongside their
-backends and are intentionally absent until then — Typer reports
-"unknown command" rather than shipping NotImplementedError stubs.
+The ingestion stage has been rebuilt under the **v3 design**
+(`docs/overview-v3.md`), and the `ingest → extract → normalize` chain is in
+place. The v1 resolver / acquisition / ranking-policy stack has been deleted.
+The CLI now covers `ingest`, `sideload`, `doctor`, `show`, `list`, `extract`,
+`normalize`, `show-document`, and `diff-routes`.
 
 v3 covers exactly three publishers:
 
@@ -24,9 +23,11 @@ v3 covers exactly three publishers:
 - **Springer Nature** via `springernature-api-client` → JATS XML
 - **Elsevier** via raw httpx + lxml (`view=FULL`) → Elsevier-flavored XML
 
-Anything else fails with `UnsupportedPublisherError`. Extraction, the
-Postgres index, and the agent triad remain on the roadmap — see
-`docs/overview.md`.
+Anything else fails with `UnsupportedPublisherError`. A normalised `Document`
+type now unifies the three formats into one schema, with a self-contained HTML
+renderer (`show-document`) for inspection — see the spike note under
+[Development](#development). The Postgres index, measurement extraction, and the
+agent triad remain on the roadmap — see `docs/overview.md`.
 
 ## Install
 
@@ -34,12 +35,12 @@ Postgres index, and the agent triad remain on the roadmap — see
 uv sync
 ```
 
-This installs runtime + dev dependencies into `.venv` (Python 3.14). Two
-optional extras pull in the publisher SDKs:
+This installs runtime + dev dependencies into `.venv` (Python 3.14). Optional
+extras pull in the publisher SDKs and the PDF extractor:
 
 ```sh
 uv sync --extra wiley --extra springer
-# or, once extraction lands:
+# add the PDF extractor (docling) with `--extra extract`, or pull everything:
 uv sync --extra all
 ```
 
@@ -113,6 +114,68 @@ and error panels go to stderr):
 uv run litspectraits ingest 10.1002/mrm.xxxxx --json | jq .sha256
 ```
 
+### `extract` — structure a stored artifact
+
+Dispatches the stored artifact to the format-specific extractor (docling
+for PDF, lxml for JATS / Elsevier) and commits a `document.json` under
+`documents/`. Requires `ingest` to have run first; no network. Accepts a
+DOI or sha256.
+
+```sh
+uv run litspectraits extract 10.1002/mrm.xxxxx
+uv run litspectraits extract 10.1002/mrm.xxxxx --reextract   # overwrite divergent bytes
+uv run litspectraits extract 10.1002/mrm.xxxxx --json | jq .
+```
+
+Re-extracting bytes that differ from the stored `document.json` is an
+integrity error (exit 7) unless `--reextract` is passed.
+
+### `normalize` — build the common `Document`
+
+Reads the extracted `document.json` and routes it through the
+format-appropriate adapter (docling for PDF, the XML adapter for
+JATS / Elsevier) to produce the normalised `Document` — the single
+cross-format schema — committed under `normalized/`. Requires `extract`
+first; no network.
+
+```sh
+uv run litspectraits normalize 10.1002/mrm.xxxxx
+uv run litspectraits normalize 10.1002/mrm.xxxxx --renormalize
+```
+
+Splitting `ingest → extract → normalize` into three independently
+re-runnable steps is deliberate — each stage stays introspectable.
+Re-normalising to divergent bytes without `--renormalize` is an
+integrity error (exit 7).
+
+### `show-document` — render a `Document` to HTML
+
+Renders a normalised `Document` to a single self-contained HTML file
+(no JS, raw math, faithful single-route projection) for human
+inspection. Requires `normalize` first; no network. The output path is
+printed to stdout; `--open` launches it in a browser.
+
+```sh
+uv run litspectraits show-document 10.1002/mrm.xxxxx --out paper.html
+uv run litspectraits show-document 10.1002/mrm.xxxxx --open
+```
+
+With no `--out`, it writes `<sha256>.html` into the current directory.
+
+### `diff-routes` — cross-format differential harness
+
+For DOIs held in both a PDF and an XML format, loads both normalised
+`Document`s and runs a structural diff — a consistency check across
+routes. Auto-discovers dual-format DOIs from the index (or restrict with
+`--doi`); requires `normalize` to have run on both. Persist with `--out`,
+and pass a prior report to `--compare-to` for temporal regression detection.
+
+```sh
+uv run litspectraits diff-routes
+uv run litspectraits diff-routes --out report.json
+uv run litspectraits diff-routes --compare-to report.json
+```
+
 ### `sideload` — register an operator-retrieved PDF
 
 For DOIs where TDM access is unavailable (typical case: a Wiley title
@@ -136,15 +199,20 @@ returns the existing record without re-writing the manifest or
 duplicating the index entry. Sideload also fetches CrossRef metadata
 so the manifest shape stays uniform with auto-ingested records.
 
-### `doctor` — preflight credentials + egress
+### `doctor` — preflight credentials, egress, extract components
 
 Run before any batch ingest. Verifies the contact email is set, probes
 each configured publisher credential with a minimal authenticated
-request, and reports the egress IP against
-`LITSPECTRAITS_EXPECTED_EGRESS_CIDRS` if set.
+request, reports the egress IP against
+`LITSPECTRAITS_EXPECTED_EGRESS_CIDRS` if set, and checks the extract
+components (docling install + model cache). Plain `doctor` is read-only
+and network-free for the extract section; the two flags below are the
+only paths that touch the docling models.
 
 ```sh
 uv run litspectraits doctor
+uv run litspectraits doctor --download-models   # pull docling weights (multi-GB; opt-in)
+uv run litspectraits doctor --smoke-extract     # live docling conversion on a synthetic PDF
 ```
 
 ### `show` — look up an existing record
@@ -157,17 +225,34 @@ uv run litspectraits show 10.1002/mrm.xxxxx
 uv run litspectraits show 10.1002/mrm.xxxxx --json
 ```
 
+### `list` — enumerate the local store
+
+The discovery counterpart to `show`: prints every ingested DOI (newest
+first) with title, year, publisher, stored format(s), and extract /
+normalize status. No network.
+
+```sh
+uv run litspectraits list
+uv run litspectraits list -q                 # bare DOIs, one per line
+uv run litspectraits show "$(litspectraits list -q | head -1)"
+uv run litspectraits list --json | jq .
+```
+
 ### Storage layout
 
 ```
 <data_dir>/artifacts/pdf/sha256/9a/9a3f….pdf
 <data_dir>/artifacts/jats/sha256/9a/9a3f….xml
 <data_dir>/artifacts/elsevier/sha256/9a/9a3f….xml
+<data_dir>/documents/sha256/9a/9a3f…/document.json
+<data_dir>/normalized/sha256/9a/9a3f…/{document.json,meta.json}
 <data_dir>/manifests/sha256/9a/9a3f….manifest.json
 <data_dir>/index/by_doi.jsonl
 ```
 
-One-level sharding (first two hex chars of the sha256). The DOI index
+One-level sharding (first two hex chars of the sha256), applied across
+every tree. `documents/` holds per-format extractor output and
+`normalized/` the cross-format `Document` plus its metadata. The DOI index
 carries a `format` column so a single scan answers "what do we have for
 this DOI?".
 
@@ -220,15 +305,17 @@ uv run pytest                        # offline (respx-mocked + SDK monkeypatched
 ### Decision point — normalized `Document` (2026-05-13)
 
 Step 10g (frozen docling settings) is committed and the ingest + extract stack
-is feature-complete. The next architectural choice — whether to introduce a
+is feature-complete. The open architectural choice was whether to introduce a
 normalized `Document` type that unifies the JATS/Elsevier dict shape with
 docling's PDF output, or to keep the per-route dicts and normalise downstream
-in the measurement layer — is open. See `docs/normalized-documents-discussion.md`
-for the trade-off analysis.
+in the measurement layer. See `docs/normalized-documents-discussion.md` for the
+trade-off analysis.
 
-A spike branch `spike/normalized-document` was forked from this commit for
-prototyping; `trunk` remains the no-normalisation baseline until the question
-is answered.
+The `spike/normalized-document` branch was forked from this commit to prototype
+the first option, and now carries the full chain: the normalised `Document`
+schema + per-route adapters (E0.5), persistence, the `normalize` /
+`diff-routes` / `show-document` commands, and golden-HTML snapshots. `trunk`
+remains the no-normalisation baseline pending a merge decision.
 
 ## Documentation
 
