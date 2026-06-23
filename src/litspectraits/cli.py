@@ -1,12 +1,16 @@
 """Command-line interface (``docs/overview-v3.md`` §10, §17.9).
 
-Seven commands ship today: ``ingest``, ``sideload``, ``doctor``,
-``show``, ``extract``, ``normalize``, ``diff-routes`` (plus the
-convenience ``smoke`` ephemeral-tempdir wrapper around ``ingest``).
-``extract``, ``normalize``, and ``diff-routes`` are deliberately
-separate composable steps rather than folded into one command — each
-stage stays independently re-runnable and operator-introspectable
-(``docs/dual-route-comparison-overview.md`` §9).
+Nine commands ship today: ``ingest``, ``sideload``, ``doctor``,
+``show``, ``list``, ``extract``, ``normalize``, ``show-document``,
+``diff-routes`` (plus the convenience ``smoke`` ephemeral-tempdir
+wrapper around ``ingest``). ``list`` is the discovery counterpart to
+``show``: it enumerates every DOI in the local store so the operator
+does not need the exact DOI in hand. ``extract``, ``normalize``, and ``diff-routes`` are
+deliberately separate composable steps rather than folded into one
+command — each stage stays independently re-runnable and
+operator-introspectable (``docs/dual-route-comparison-overview.md`` §9).
+``show-document`` renders a normalised document as HTML for human
+inspection (``docs/rendering-mvp-plan.md``).
 
 Failure model
 -------------
@@ -44,8 +48,10 @@ import json
 import re
 import shutil
 import tempfile
+import webbrowser
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal, TypedDict
 
 import attrs
 import dotenv
@@ -93,16 +99,19 @@ from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, con
 from litspectraits.normalize import (
     DualFormatResult,
     NormalizedMeta,
+    RenderContext,
     commit_normalized_document,
     compare_dual_format_dois,
     compare_reports,
     format_dual_format_report,
+    load_normalized_document,
     normalize_docling_document,
     normalize_xml_document,
+    render_html,
 )
 from litspectraits.normalize import converter as normalize_converter
 from litspectraits.sideload import sideload as run_sideload
-from litspectraits.store import ArtifactStore
+from litspectraits.store import ArtifactStore, DOIIndexEntry
 
 app = typer.Typer(
     add_completion=False,
@@ -309,7 +318,7 @@ async def _run_ingest(*, doi: str, cache_hit_ok: bool, json_output: bool) -> Non
     if json_output:
         _emit_record_json(record)
     else:
-        _render_record_panel(record, settings=settings, console=out_console)
+        _render_record_panel(record, store=store, console=out_console)
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +410,7 @@ async def _run_sideload(
     if json_output:
         _emit_record_json(record)
     else:
-        _render_record_panel(record, settings=settings, console=out_console)
+        _render_record_panel(record, store=store, console=out_console)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +480,7 @@ async def _run_smoke(*, doi: str, keep: bool, json_output: bool) -> None:
         if json_output:
             _emit_record_json(record)
         else:
-            _render_record_panel(record, settings=settings, console=out_console)
+            _render_record_panel(record, store=store, console=out_console)
         success = True
     finally:
         if success and not keep:
@@ -519,7 +528,188 @@ def cmd_show(
     if json_output:
         _emit_record_json(record)
     else:
-        _render_record_panel(record, settings=settings, console=out_console)
+        _render_record_panel(record, store=store, console=out_console)
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+
+# Aware sentinel sorted *before* every real ``added_at`` so DOIs whose
+# index lines carried no parseable timestamp sink to the bottom of the
+# newest-first listing rather than crashing the mixed-aware comparison.
+_MIN_ADDED_AT: Final = datetime(1, 1, 1, tzinfo=UTC)
+
+
+@app.command(name='list')
+def cmd_list(
+    quiet: bool = typer.Option(
+        False,
+        '--quiet',
+        '-q',
+        help='Print bare DOIs, one per line (copy/pipe-friendly); suppresses the table.',
+    ),
+    json_output: bool = typer.Option(
+        False, '--json', help='Emit the catalog as a JSON array on stdout.'
+    ),
+) -> None:
+    """List every DOI in the local store, newest first (no network call).
+
+    Reads ``index/by_doi.jsonl`` and renders one row per DOI with its
+    title, year, publisher, stored format(s), and extract / normalize
+    status — the discovery counterpart to ``show <doi>``, which needs the
+    exact DOI up front.
+
+    ``--quiet`` prints just the bare DOIs (one per line) so a DOI can be
+    copied or piped without retyping it, e.g.::
+
+        litspectraits list -q | fzf
+        litspectraits show "$(litspectraits list -q | head -1)"
+
+    ``--json`` emits a structured array carrying full per-artifact detail
+    (format, sha256, extract / normalize flags). When both flags are
+    given, ``--quiet`` wins.
+
+    Exits 0 even when the store is empty — an empty catalog is a valid
+    state, not an error.
+    """
+    settings = _load_settings()
+    store = ArtifactStore(settings.data_dir)
+    out_console = _stdout_console()
+    err_console = _stderr_console()
+
+    entries = store.iter_index()
+    entries.sort(key=lambda entry: entry.latest_added_at or _MIN_ADDED_AT, reverse=True)
+
+    if quiet:
+        for entry in entries:
+            print(entry.doi)
+        return
+
+    rows = [_catalog_row(entry, store=store) for entry in entries]
+
+    if json_output:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+
+    if not rows:
+        err_console.print(
+            '[dim]local store is empty — run `litspectraits ingest <doi>` to add one[/dim]'
+        )
+        return
+    _render_catalog_table(rows, console=out_console)
+
+
+class _CatalogArtifact(TypedDict):
+    """One stored artifact's row in the ``list`` catalog (also the JSON shape)."""
+
+    format: str
+    sha256: str
+    extracted: bool
+    normalized: bool
+
+
+class _CatalogRow(TypedDict):
+    """One DOI's row in the ``list`` catalog (also the JSON shape)."""
+
+    doi: str
+    title: str | None
+    year: int | None
+    publisher: str
+    latest_added_at: str | None
+    artifacts: list[_CatalogArtifact]
+
+
+def _catalog_row(entry: DOIIndexEntry, *, store: ArtifactStore) -> _CatalogRow:
+    """Build one DOI's display/JSON payload from its index roll-up.
+
+    Reads a single manifest for the shared bibliographic fields (title /
+    year / publisher are identical across a DOI's formats — they all come
+    from the same CrossRef record) and probes the document trees for each
+    artifact's extract / normalize status. A manifest that the index
+    references but that is missing on disk is surfaced as a loud in-row
+    marker rather than aborting the whole listing — ``list`` is the tool
+    an operator reaches for to *diagnose* a damaged store.
+    """
+    sample_sha = next(iter(entry.formats.values()))
+    try:
+        record = store.read_manifest(sample_sha)
+    except FileNotFoundError:
+        title: str | None = '⚠ manifest missing'
+        year: int | None = None
+        publisher = '?'
+    else:
+        title = record.metadata.title
+        year = record.metadata.year
+        publisher = record.publisher.value
+
+    artifacts: list[_CatalogArtifact] = [
+        {
+            'format': fmt.value,
+            'sha256': sha,
+            'extracted': (store.document_dir(sha) / 'document.json').is_file(),
+            'normalized': (store.normalized_dir(sha) / 'document.json').is_file(),
+        }
+        for fmt, sha in sorted(entry.formats.items(), key=lambda item: item[0].value)
+    ]
+    return {
+        'doi': entry.doi,
+        'title': title,
+        'year': year,
+        'publisher': publisher,
+        'latest_added_at': (
+            entry.latest_added_at.isoformat() if entry.latest_added_at is not None else None
+        ),
+        'artifacts': artifacts,
+    }
+
+
+def _render_catalog_table(rows: list[_CatalogRow], *, console: Console) -> None:
+    """Render the catalog rows produced by :func:`_catalog_row` as a table."""
+    table = Table(title=f'local store — {len(rows)} DOI(s)', show_header=True, expand=False)
+    table.add_column('doi', no_wrap=True, style='bold')
+    table.add_column('title')
+    table.add_column('year', justify='right')
+    table.add_column('publisher')
+    table.add_column('formats')
+    table.add_column('extracted')
+    table.add_column('normalized')
+    for row in rows:
+        artifacts = row['artifacts']
+        title = row['title']
+        year = row['year']
+        table.add_row(
+            row['doi'],
+            title if title else '-',
+            str(year) if year is not None else '-',
+            row['publisher'],
+            ', '.join(artifact['format'] for artifact in artifacts),
+            _aggregate_status(artifacts, key='extracted'),
+            _aggregate_status(artifacts, key='normalized'),
+        )
+    console.print(table)
+
+
+def _aggregate_status(
+    artifacts: list[_CatalogArtifact], *, key: Literal['extracted', 'normalized']
+) -> str:
+    """Collapse per-artifact booleans into one scannable cell.
+
+    ``✓`` when every artifact has the stage, ``✗`` when none does, and
+    ``n/total`` for the partial dual-format case (e.g. the PDF is
+    normalised but the JATS sibling is not). The exact per-artifact
+    breakdown lives in ``--json``.
+    """
+    total = len(artifacts)
+    if total == 0:
+        return '-'
+    done = sum(1 for artifact in artifacts if artifact[key])
+    if done == total:
+        return '[green]✓[/green]'
+    if done == 0:
+        return '[red]✗[/red]'
+    return f'{done}/{total}'
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +992,73 @@ def _render_normalize_meta_panel(
 
 
 # ---------------------------------------------------------------------------
+# show-document
+# ---------------------------------------------------------------------------
+
+
+@app.command(name='show-document')
+def cmd_show_document(
+    target: str = typer.Argument(
+        ...,
+        help=(
+            'DOI or sha256 of the artifact to render. '
+            'Sha is a 64-char lowercase hex string; anything else is parsed as a DOI.'
+        ),
+    ),
+    out: Path | None = typer.Option(
+        None,
+        '--out',
+        help='Write the HTML here. Defaults to `<sha256>.html` in the current directory.',
+    ),
+    open_browser: bool = typer.Option(
+        False,
+        '--open',
+        help='Open the rendered HTML in the default web browser after writing it.',
+    ),
+) -> None:
+    """Render a normalised :class:`Document` as a self-contained HTML page.
+
+    Loads ``normalized/sha256/<aa>/<sha>/document.json`` and renders it
+    via :func:`litspectraits.normalize.render_html` — a linear,
+    route-faithful reading view for human inspection
+    (``docs/rendering-mvp-plan.md``). The artifact must already be
+    ingested, extracted, *and* normalised; run ``litspectraits normalize
+    <doi>`` first if it isn't. No network calls.
+
+    The output path is printed to stdout (pipe-friendly); ``--open``
+    additionally launches it in a browser.
+
+    Exit codes:
+
+    - 1: artifact not in local store, or it has not been normalised yet.
+    - 2: invalid DOI shape.
+    """
+    settings = _load_settings()
+    store = ArtifactStore(settings.data_dir)
+    err_console = _stderr_console()
+
+    record = _resolve_extract_target(target=target, store=store, err_console=err_console)
+    try:
+        doc = load_normalized_document(source_artifact_sha=record.sha256, store=store)
+    except FileNotFoundError as exc:
+        err_console.print(
+            f'[bold yellow]not normalised:[/bold yellow] sha256={record.sha256}. '
+            f'Run `litspectraits normalize {record.doi}` first.'
+        )
+        raise typer.Exit(1) from exc
+
+    context = RenderContext(doi=record.doi, source_artifact_sha=record.sha256)
+    html_body = render_html(doc, context=context)
+
+    out_path = out if out is not None else Path(f'{record.sha256}.html')
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html_body, encoding='utf-8')
+    print(out_path)
+    if open_browser:
+        webbrowser.open(out_path.resolve().as_uri())
+
+
+# ---------------------------------------------------------------------------
 # diff-routes
 # ---------------------------------------------------------------------------
 
@@ -1015,14 +1272,15 @@ def _emit_record_json(record: AcquisitionRecord) -> None:
 
 
 def _render_record_panel(
-    record: AcquisitionRecord, *, settings: Settings, console: Console
+    record: AcquisitionRecord, *, store: ArtifactStore, console: Console
 ) -> None:
     """Render a record summary as a Rich table.
 
-    Includes an "extraction" row that probes for
-    ``documents/sha256/<aa>/<sha>/document.json`` so the same renderer serves
-    ``ingest`` (where extraction always reads "not extracted") and a
-    future ``show`` against an extracted record (Step 10).
+    Includes an "extraction" / "normalization" row that probes the
+    sharded ``documents/`` / ``normalized/`` trees via ``store`` so the
+    same renderer serves ``ingest`` (where both read "not …" on a fresh
+    fetch) and ``show`` against a record that has since been extracted /
+    normalised.
     """
     table = Table(title=f'manifest — {record.doi}', show_header=False, expand=False)
     table.add_column('field', no_wrap=True, style='bold')
@@ -1034,50 +1292,48 @@ def _render_record_panel(
     table.add_row('license', record.metadata.license or '-')
     table.add_row('origin', record.origin)
     table.add_row('artifact', record.artifact_path)
-    table.add_row('manifest', _manifest_relpath(record, settings=settings))
+    table.add_row('manifest', _manifest_relpath(record, store=store))
     table.add_row('fetched_at', record.fetched_at.isoformat())
     table.add_row('fetcher', f'litspectraits {record.fetcher_version}')
     table.add_row('sdk', record.sdk_version)
-    table.add_row('extraction', _extraction_status(record, settings=settings))
-    table.add_row('normalization', _normalization_status(record, settings=settings))
+    table.add_row('extraction', _extraction_status(record, store=store))
+    table.add_row('normalization', _normalization_status(record, store=store))
     console.print(table)
 
 
-def _manifest_relpath(record: AcquisitionRecord, *, settings: Settings) -> str:
-    # Recompute via the shard rule for robustness — store.manifest_path
-    # is the source of truth, but we prefer to render relative-to-
-    # data_dir for portability.
-    store = ArtifactStore(settings.data_dir)
-    return store.manifest_path(record.sha256).relative_to(settings.data_dir).as_posix()
+def _manifest_relpath(record: AcquisitionRecord, *, store: ArtifactStore) -> str:
+    # ``store.manifest_path`` is the source of truth for the shard rule;
+    # we render it relative-to-data_dir for portability across relocations.
+    return store.manifest_path(record.sha256).relative_to(store.data_dir).as_posix()
 
 
-def _extraction_status(record: AcquisitionRecord, *, settings: Settings) -> str:
+def _extraction_status(record: AcquisitionRecord, *, store: ArtifactStore) -> str:
     """Probe for ``documents/sha256/<aa>/<sha>/document.json``; report textually.
 
-    Forward-compatible with Step 10 — once :mod:`litspectraits.extract`
-    lands and writes the document tree, this row flips to "extracted"
-    automatically. No coupling to the extractor module needed today.
+    Routes through :meth:`ArtifactStore.document_dir` so the probe uses
+    the same one-level-sharded path the extractor writes to.
     """
-    document_path = settings.data_dir / 'documents' / record.sha256 / 'document.json'
-    if document_path.is_file():
-        meta_path = settings.data_dir / 'documents' / record.sha256 / 'meta.json'
+    document_dir = store.document_dir(record.sha256)
+    if (document_dir / 'document.json').is_file():
+        meta_path = document_dir / 'meta.json'
         if meta_path.is_file():
             return f'extracted ({_brief_extractor(meta_path)})'
         return 'extracted'
     return 'not extracted'
 
 
-def _normalization_status(record: AcquisitionRecord, *, settings: Settings) -> str:
+def _normalization_status(record: AcquisitionRecord, *, store: ArtifactStore) -> str:
     """Probe for ``normalized/sha256/<aa>/<sha>/document.json``; report textually.
 
-    Mirror of :func:`_extraction_status` for the layer downstream.
-    Operators need this to know whether the diff harness can run for a
-    dual-format DOI without first invoking ``litspectraits normalize``
+    Mirror of :func:`_extraction_status` for the layer downstream, routed
+    through :meth:`ArtifactStore.normalized_dir`. Operators need this to
+    know whether the diff harness can run for a dual-format DOI without
+    first invoking ``litspectraits normalize``
     (``docs/dual-route-comparison-overview.md`` §3).
     """
-    document_path = settings.data_dir / 'normalized' / record.sha256 / 'document.json'
-    if document_path.is_file():
-        meta_path = settings.data_dir / 'normalized' / record.sha256 / 'meta.json'
+    normalized_dir = store.normalized_dir(record.sha256)
+    if (normalized_dir / 'document.json').is_file():
+        meta_path = normalized_dir / 'meta.json'
         if meta_path.is_file():
             return f'normalised ({_brief_normalizer(meta_path)})'
         return 'normalised'

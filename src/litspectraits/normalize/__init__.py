@@ -70,6 +70,7 @@ from litspectraits.normalize.persistence import (
     load_normalized_document,
     load_normalized_meta,
 )
+from litspectraits.normalize.render import RenderContext, render_html
 from litspectraits.normalize.xml_adapter import XmlRoute, normalize_xml_document
 
 __all__ = [
@@ -92,6 +93,7 @@ __all__ = [
     'Provenance',
     'RefIdSource',
     'Reference',
+    'RenderContext',
     'ResolvedReference',
     'Route',
     'SkipReason',
@@ -111,4 +113,5 @@ __all__ = [
     'load_normalized_meta',
     'normalize_docling_document',
     'normalize_xml_document',
+    'render_html',
 ]

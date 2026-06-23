@@ -50,11 +50,9 @@ mental model and the relationship to the E1 measurement-space
 follow-on.
 """
 
-import json
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, Final, Literal
 
 import structlog
@@ -490,7 +488,9 @@ def compare_dual_format_dois(
         index. Surface loudly per CLAUDE.md "fail loudly" — the
         operator's input is wrong.
     """
-    per_doi = _scan_index(store.index_path)
+    per_doi: dict[str, dict[Format, str]] = {
+        entry.doi: entry.formats for entry in store.iter_index()
+    }
     if dois is not None:
         wanted = list(dois)
         missing = [doi for doi in wanted if doi not in per_doi]
@@ -565,42 +565,6 @@ def _evaluate_one(
         xml_artifact_sha=xml_sha,
         comparison=comparison,
     )
-
-
-def _scan_index(index_path: Path) -> dict[str, dict[Format, str]]:
-    """Read the JSON-lines DOI index into a per-DOI, per-format sha map.
-
-    Parses every line in ``by_doi.jsonl`` and, for each (DOI, format)
-    pair, keeps the *last* sha seen — the index is append-only and
-    written in commit order, so "last seen" matches "most recent
-    ingest" per :meth:`ArtifactStore.find_by_doi`'s contract. Blank
-    lines are skipped, but a malformed line raises
-    :class:`ValueError` rather than being silently dropped (the index
-    is invariant-load-bearing; a malformed line is a corpus integrity
-    issue that wants surfacing).
-
-    Returns an empty dict when the index file does not exist — that
-    is the "fresh store, nothing ingested yet" state.
-    """
-    per_doi: dict[str, dict[Format, str]] = {}
-    if not index_path.exists():
-        return per_doi
-    with index_path.open(encoding='utf-8') as fp:
-        for line_number, raw_line in enumerate(fp, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                doi = entry['doi']
-                sha = entry['sha256']
-                fmt = Format(entry['format'])
-            except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                raise ValueError(
-                    f'{index_path}: malformed entry on line {line_number}: {raw_line!r}'
-                ) from exc
-            per_doi.setdefault(doi, {})[fmt] = sha
-    return per_doi
 
 
 def _not_dual_format_detail(formats: dict[Format, str]) -> str:

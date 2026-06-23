@@ -13,7 +13,7 @@ from litspectraits.manifest import (
     Format,
     Publisher,
 )
-from litspectraits.store import ArtifactStore
+from litspectraits.store import ArtifactStore, DOIIndexEntry
 
 
 def _crossref_metadata(doi: str = '10.1002/mrm.27973') -> CrossRefMetadata:
@@ -282,3 +282,116 @@ def test_find_by_doi_skips_unrelated_dois(tmp_path: Path) -> None:
 
     assert store.find_by_doi('10.1002/aaa') == record_a
     assert store.find_by_doi('10.1002/bbb') == record_b
+
+
+# ---------------------------------------------------------------------------
+# iter_index
+# ---------------------------------------------------------------------------
+
+
+def test_iter_index_empty_when_no_index_file(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    assert store.iter_index() == []
+
+
+def test_iter_index_rolls_up_one_entry_per_doi_in_first_seen_order(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    payload_a = b'%PDF-1.7\na\n%%EOF'
+    payload_b = b'%PDF-1.7\nb\n%%EOF'
+    record_a = _make_record(
+        store=store, doi='10.1002/aaa', sha256='1' * 64, byte_size=len(payload_a)
+    )
+    record_b = _make_record(
+        store=store, doi='10.1002/bbb', sha256='2' * 64, byte_size=len(payload_b)
+    )
+    store.commit(src=_stage(store, 'a.part', payload_a), record=record_a)
+    store.commit(src=_stage(store, 'b.part', payload_b), record=record_b)
+
+    entries = store.iter_index()
+
+    assert [entry.doi for entry in entries] == ['10.1002/aaa', '10.1002/bbb']
+    assert entries[0].formats == {Format.PDF: '1' * 64}
+    assert entries[1].formats == {Format.PDF: '2' * 64}
+    assert all(entry.latest_added_at is not None for entry in entries)
+
+
+def test_iter_index_collapses_dual_format_doi(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    pdf_payload = b'%PDF-1.7\n%%EOF'
+    xml_payload = b'<article/>'
+    pdf = _make_record(
+        store=store,
+        doi='10.1002/dual',
+        sha256='1' * 64,
+        fmt=Format.PDF,
+        byte_size=len(pdf_payload),
+    )
+    jats = _make_record(
+        store=store,
+        doi='10.1002/dual',
+        sha256='2' * 64,
+        fmt=Format.JATS_XML,
+        publisher=Publisher.SPRINGER_NATURE,
+        byte_size=len(xml_payload),
+    )
+    store.commit(src=_stage(store, 'a.part', pdf_payload), record=pdf)
+    store.commit(src=_stage(store, 'b.part', xml_payload), record=jats)
+
+    entries = store.iter_index()
+
+    assert len(entries) == 1
+    assert entries[0].formats == {Format.PDF: '1' * 64, Format.JATS_XML: '2' * 64}
+
+
+def test_iter_index_latest_added_at_is_the_max_across_lines(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    # Hand-write index lines with explicit, out-of-order timestamps for one DOI.
+    with store.index_path.open('w', encoding='utf-8') as fp:
+        fp.write(
+            json.dumps(
+                {
+                    'doi': '10.1002/x',
+                    'sha256': '1' * 64,
+                    'format': 'pdf',
+                    'added_at': '2026-05-01T00:00:00+00:00',
+                }
+            )
+            + '\n'
+        )
+        fp.write(
+            json.dumps(
+                {
+                    'doi': '10.1002/x',
+                    'sha256': '1' * 64,
+                    'format': 'pdf',
+                    'added_at': '2026-05-09T00:00:00+00:00',
+                }
+            )
+            + '\n'
+        )
+
+    (entry,) = store.iter_index()
+
+    assert entry.latest_added_at == datetime(2026, 5, 9, tzinfo=UTC)
+
+
+def test_iter_index_tolerates_missing_added_at(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    with store.index_path.open('w', encoding='utf-8') as fp:
+        fp.write(json.dumps({'doi': '10.1002/x', 'sha256': '1' * 64, 'format': 'pdf'}) + '\n')
+
+    (entry,) = store.iter_index()
+
+    assert entry == DOIIndexEntry(
+        doi='10.1002/x', formats={Format.PDF: '1' * 64}, latest_added_at=None
+    )
+
+
+def test_iter_index_raises_on_malformed_line(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    with store.index_path.open('w', encoding='utf-8') as fp:
+        fp.write(json.dumps({'doi': '10.1002/x', 'sha256': '1' * 64, 'format': 'pdf'}) + '\n')
+        fp.write('{not json}\n')
+
+    with pytest.raises(ValueError, match='malformed entry on line 2'):
+        store.iter_index()

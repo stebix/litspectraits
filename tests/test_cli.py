@@ -904,13 +904,22 @@ def _example_extract_record(*, sha256: str = 'a' * 64) -> ExtractRecord:
     )
 
 
-def _plant_record(record: AcquisitionRecord, *, store: ArtifactStore) -> None:
+def _plant_record(
+    record: AcquisitionRecord,
+    *,
+    store: ArtifactStore,
+    added_at: str = '2026-05-10T12:00:00+00:00',
+) -> None:
     """Plant the manifest + index entry so the CLI can look the record up.
 
     Mirrors what the show tests do: write the manifest JSON and append
     the by-doi index line. The artifact bytes themselves are not needed —
     the CLI's extract command never reads them; the (mocked) dispatcher
     does, and we mock at the dispatcher boundary.
+
+    ``added_at`` is exposed so the ``list`` ordering tests can plant
+    entries with distinct timestamps; it defaults to the value the other
+    suites rely on.
     """
     store.manifest_path(record.sha256).parent.mkdir(parents=True, exist_ok=True)
     store.manifest_path(record.sha256).write_text(
@@ -923,7 +932,7 @@ def _plant_record(record: AcquisitionRecord, *, store: ArtifactStore) -> None:
                     'doi': record.doi,
                     'sha256': record.sha256,
                     'format': record.format.value,
-                    'added_at': '2026-05-10T12:00:00+00:00',
+                    'added_at': added_at,
                 }
             )
             + '\n'
@@ -1204,3 +1213,233 @@ def test_extract_error_panel_uses_context_hint_when_present(
     assert 'custom per-call hint about a JATS bodyless envelope' in result.stderr
     # The class-default hint must not also be rendered.
     assert 'scanned PDF served without OCR' not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# show-document
+# ---------------------------------------------------------------------------
+
+
+def _plant_normalized_document(record: AcquisitionRecord, *, store: ArtifactStore) -> None:
+    """Stage a ``normalized/<sha>/document.json`` the renderer can load.
+
+    Built via the XML adapter (no docling dependency) and written with
+    the normalize converter — the same on-disk shape
+    :func:`litspectraits.normalize.load_normalized_document` reads.
+    """
+    from litspectraits.normalize import converter as normalize_converter
+    from litspectraits.normalize import normalize_xml_document
+
+    doc = normalize_xml_document(
+        {
+            'front': {'title': 'Rendered paper', 'abstract': 'Abstract.'},
+            'sections': [
+                {
+                    'id': 's1',
+                    'title': 'Methods',
+                    'level': 1,
+                    'path': ['Methods'],
+                    'blocks': [{'type': 'paragraph', 'text': 'Body text.', 'xrefs': []}],
+                }
+            ],
+            'tables': [],
+            'figures': [],
+            'references': [],
+        },
+        route='jats',
+    )
+    target = store.normalized_dir(record.sha256) / 'document.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(normalize_converter.unstructure(doc)), encoding='utf-8')
+
+
+def test_show_document_writes_html(runner: CliRunner, tmp_path: Path) -> None:
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _plant_normalized_document(record, store=store)
+    out_path = tmp_path / 'out.html'
+
+    result = runner.invoke(app, ['show-document', record.sha256, '--out', str(out_path)])
+
+    assert result.exit_code == 0, result.stderr
+    assert out_path.is_file()
+    html = out_path.read_text(encoding='utf-8')
+    assert '<!DOCTYPE html>' in html
+    assert 'Rendered paper' in html
+    # The written path is echoed to stdout for piping.
+    assert str(out_path) in result.stdout
+
+
+def test_show_document_not_normalised_exits_1(runner: CliRunner, tmp_path: Path) -> None:
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)  # manifest present, but no normalized/ output
+
+    result = runner.invoke(app, ['show-document', record.sha256])
+
+    assert result.exit_code == 1
+    assert 'not normalised' in result.stderr
+
+
+def test_show_document_unknown_artifact_exits_1(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['show-document', 'f' * 64])
+    assert result.exit_code == 1
+    assert 'not in local store' in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+
+def _catalog_record(
+    *,
+    doi: str,
+    sha: str,
+    fmt: Format = Format.PDF,
+    publisher: Publisher = Publisher.WILEY,
+    title: str | None = 'Example paper',
+    year: int | None = 2024,
+) -> AcquisitionRecord:
+    """Build a distinct AcquisitionRecord for the list-catalog tests.
+
+    Varies DOI / sha / format / bibliographic fields so a catalog can be
+    assembled from several of them; the fixed scalars mirror
+    :func:`_example_record`.
+    """
+    fmt_dir = {Format.PDF: 'pdf', Format.JATS_XML: 'jats', Format.ELSEVIER_XML: 'elsevier'}[fmt]
+    ext = 'pdf' if fmt is Format.PDF else 'xml'
+    return AcquisitionRecord(
+        doi=doi,
+        sha256=sha,
+        artifact_path=f'artifacts/{fmt_dir}/sha256/{sha[:2]}/{sha}.{ext}',
+        format=fmt,
+        publisher=publisher,
+        metadata=CrossRefMetadata(
+            doi=doi,
+            publisher_str=publisher.value,
+            title=title,
+            authors=('Doe, Jane',),
+            year=year,
+            type='journal-article',
+            license=None,
+        ),
+        fetched_url=f'https://example.org/{doi}',
+        fetched_at=datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC),
+        fetcher_version='0.1.0',
+        sdk_version='test 1.0.0',
+        byte_size=123,
+        origin='auto',
+        manual_provenance=None,
+    )
+
+
+def test_list_text_mode_lists_dois(runner: CliRunner, tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    _plant_record(
+        _catalog_record(doi='10.1002/alpha', sha='a' * 64, title='Alpha paper'),
+        store=store,
+    )
+    _plant_record(
+        _catalog_record(
+            doi='10.1016/beta', sha='b' * 64, publisher=Publisher.ELSEVIER, title='Beta paper'
+        ),
+        store=store,
+    )
+
+    result = runner.invoke(app, ['list'])
+
+    assert result.exit_code == 0, result.stderr
+    assert '10.1002/alpha' in result.stdout
+    assert '10.1016/beta' in result.stdout
+    assert 'Alpha paper' in result.stdout
+    assert 'Beta paper' in result.stdout
+    assert 'wiley' in result.stdout
+    assert 'elsevier' in result.stdout
+
+
+def test_list_quiet_emits_bare_dois_newest_first(runner: CliRunner, tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    # Plant the older entry first; newest-first ordering must surface the
+    # later-timestamped DOI at the top regardless of index append order.
+    _plant_record(
+        _catalog_record(doi='10.1002/older', sha='a' * 64),
+        store=store,
+        added_at='2026-05-01T00:00:00+00:00',
+    )
+    _plant_record(
+        _catalog_record(doi='10.1016/newer', sha='b' * 64),
+        store=store,
+        added_at='2026-05-09T00:00:00+00:00',
+    )
+
+    result = runner.invoke(app, ['list', '-q'])
+
+    assert result.exit_code == 0, result.stderr
+    # Bare DOIs only — no table chrome, newest first.
+    assert result.stdout.splitlines() == ['10.1016/newer', '10.1002/older']
+
+
+def test_list_json_mode_emits_catalog_with_artifact_status(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    store = ArtifactStore(tmp_path)
+    sha = 'a' * 64
+    _plant_record(_catalog_record(doi='10.1002/alpha', sha=sha, title='Alpha paper'), store=store)
+    # Simulate a completed extraction (but no normalization) for this sha.
+    document = store.document_dir(sha) / 'document.json'
+    document.parent.mkdir(parents=True, exist_ok=True)
+    document.write_text('{}', encoding='utf-8')
+
+    result = runner.invoke(app, ['list', '--json'])
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    row = payload[0]
+    assert row['doi'] == '10.1002/alpha'
+    assert row['title'] == 'Alpha paper'
+    assert row['year'] == 2024
+    assert row['publisher'] == 'wiley'
+    assert row['artifacts'] == [
+        {'format': 'pdf', 'sha256': sha, 'extracted': True, 'normalized': False}
+    ]
+
+
+def test_list_json_dual_format_reports_per_artifact(runner: CliRunner, tmp_path: Path) -> None:
+    """A DOI with both a PDF and a JATS artifact yields one row, two artifacts."""
+    store = ArtifactStore(tmp_path)
+    doi = '10.1002/dual'
+    pdf_sha = 'a' * 64
+    jats_sha = 'b' * 64
+    _plant_record(_catalog_record(doi=doi, sha=pdf_sha, fmt=Format.PDF), store=store)
+    _plant_record(_catalog_record(doi=doi, sha=jats_sha, fmt=Format.JATS_XML), store=store)
+    # Extract only the PDF side.
+    pdf_doc = store.document_dir(pdf_sha) / 'document.json'
+    pdf_doc.parent.mkdir(parents=True, exist_ok=True)
+    pdf_doc.write_text('{}', encoding='utf-8')
+
+    result = runner.invoke(app, ['list', '--json'])
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload) == 1
+    artifacts = {a['format']: a for a in payload[0]['artifacts']}
+    assert set(artifacts) == {'pdf', 'jats_xml'}
+    assert artifacts['pdf']['extracted'] is True
+    assert artifacts['jats_xml']['extracted'] is False
+
+
+def test_list_empty_store_text_mode_exits_0_with_hint(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['list'])
+    assert result.exit_code == 0
+    assert result.stdout == ''
+    assert 'local store is empty' in result.stderr
+
+
+def test_list_empty_store_json_mode_emits_empty_array(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['list', '--json'])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == []

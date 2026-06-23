@@ -17,3 +17,9 @@ wheels/
 # Stray logs from third-party SDKs (e.g. springernature-api-client writes
 # api_client.log to cwd on import).
 api_client.log
+
+# `litspectraits show-document` defaults to writing `<sha256>.html` into the
+# current directory (rendering-mvp-plan.md §4). Anchored to the repo root so a
+# render run from here never pollutes the tree; golden HTML lives under
+# tests/normalize/golden/ and is unaffected.
+/*.html

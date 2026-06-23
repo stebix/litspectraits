@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Final
 
 import structlog
+from attrs import frozen
 
 from litspectraits.errors import IntegrityError
 from litspectraits.manifest import AcquisitionRecord, Format, converter
@@ -54,6 +55,54 @@ _SHARD_PREFIX_LEN: Final = 2
 _INDEX_FILENAME: Final = 'by_doi.jsonl'
 
 _logger: Final = structlog.get_logger('litspectraits.store')
+
+
+@frozen
+class DOIIndexEntry:
+    """One DOI's roll-up of the append-only ``index/by_doi.jsonl``.
+
+    Produced by :meth:`ArtifactStore.iter_index`. The index records one
+    line per committed artifact, so a single DOI may span several lines
+    (dual-format PDF + XML, or re-ingests of the same format). This view
+    collapses them: :attr:`formats` keeps the most-recently-indexed sha
+    per format (same "last seen wins" rule as
+    :meth:`ArtifactStore.find_by_doi`), and :attr:`latest_added_at` is the
+    newest ``added_at`` across the DOI's lines.
+
+    Attributes
+    ----------
+    doi : str
+        The normalized DOI.
+    formats : dict[litspectraits.manifest.Format, str]
+        Format → latest artifact sha256. Never empty (a DOI only appears
+        here because at least one line referenced it).
+    latest_added_at : datetime.datetime | None
+        Newest ``added_at`` across this DOI's index lines, or ``None`` when
+        no line carried a parseable timestamp. Used purely for display /
+        sort ordering — it is not a load-bearing field, so a malformed
+        ``added_at`` degrades to ``None`` rather than raising (unlike a
+        malformed ``doi`` / ``sha256`` / ``format``, which is a corpus
+        integrity error and is raised loudly).
+    """
+
+    doi: str
+    formats: dict[Format, str]
+    latest_added_at: datetime | None
+
+
+def _parse_added_at(value: object) -> datetime | None:
+    """Parse an index line's ``added_at`` into a datetime, leniently.
+
+    Returns ``None`` for a missing, non-string, or unparseable value.
+    The timestamp is display/sort metadata only; unlike the load-bearing
+    ``doi`` / ``sha256`` / ``format`` columns it must not abort a listing.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 class ArtifactStore:
@@ -258,6 +307,61 @@ class ArtifactStore:
         if latest_sha is None:
             return None
         return self.read_manifest(latest_sha)
+
+    def iter_index(self) -> list[DOIIndexEntry]:
+        """Roll up ``index/by_doi.jsonl`` into one :class:`DOIIndexEntry` per DOI.
+
+        Walks the append-only index and groups its lines by DOI,
+        preserving *first-seen* order (the order in which each DOI was
+        first committed). Within a DOI, the last sha seen per format wins
+        — the same "most recent ingest" rule
+        :meth:`find_by_doi` applies — and ``latest_added_at`` is the max
+        ``added_at`` across the DOI's lines.
+
+        Returns an empty list when the index does not exist (a fresh
+        store). A line whose ``doi`` / ``sha256`` / ``format`` is missing
+        or malformed raises :class:`ValueError` rather than being skipped:
+        the index is invariant-load-bearing, so a corrupt entry wants
+        surfacing. A malformed ``added_at`` degrades to ``None`` (display
+        metadata only — see :func:`_parse_added_at`).
+
+        Callers that want a different order (e.g. newest-activity-first)
+        sort the returned list themselves; first-seen order is the stable
+        default so the dual-route diff harness keeps a deterministic
+        walk.
+        """
+        if not self._index_path.exists():
+            return []
+        order: list[str] = []
+        formats: dict[str, dict[Format, str]] = {}
+        latest: dict[str, datetime | None] = {}
+        with self._index_path.open(encoding='utf-8') as fp:
+            for line_number, raw_line in enumerate(fp, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    doi = entry['doi']
+                    sha = entry['sha256']
+                    fmt = Format(entry['format'])
+                except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                    raise ValueError(
+                        f'{self._index_path}: malformed entry on line {line_number}: {raw_line!r}'
+                    ) from exc
+                if doi not in formats:
+                    order.append(doi)
+                    formats[doi] = {}
+                    latest[doi] = None
+                formats[doi][fmt] = sha
+                added = _parse_added_at(entry.get('added_at'))
+                current = latest[doi]
+                if added is not None and (current is None or added > current):
+                    latest[doi] = added
+        return [
+            DOIIndexEntry(doi=doi, formats=formats[doi], latest_added_at=latest[doi])
+            for doi in order
+        ]
 
     def _validate_commit_inputs(self, *, src: Path, record: AcquisitionRecord) -> None:
         if not src.is_absolute():

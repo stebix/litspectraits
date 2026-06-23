@@ -44,16 +44,20 @@ These decisions are spread across the design docs and won't be obvious from any 
 
 ## Common commands
 
-The v3 ingest stack is being rebuilt — `uv run` is the only thing that works today. The planned CLI surface (per `docs/overview-v3.md` §10) is:
+The v3 ingest stack is being rebuilt — `uv run` is the only thing that works today. The current CLI surface (rooted in `docs/overview-v3.md` §10, plus the extract / normalize / render steps that have since landed) is:
 
 ```
-litspectraits ingest   <doi> [--cache-hit-ok]
-litspectraits extract  <doi-or-sha> [--reextract]
-litspectraits sideload <doi> <pdf-path> --license <str> [--source-url <url>] [--note <str>]
+litspectraits ingest        <doi> [--cache-hit-ok]
+litspectraits extract       <doi-or-sha> [--reextract]
+litspectraits normalize     <doi-or-sha> [--renormalize]
+litspectraits show-document <doi-or-sha> [--out <path>] [--open]
+litspectraits diff-routes   [--doi <doi>...] [--out <path>] [--compare-to <prev-report>]
+litspectraits sideload      <doi> <pdf-path> --license <str> [--source-url <url>] [--note <str>]
 litspectraits doctor
-litspectraits show     <doi>
+litspectraits show          <doi>
+litspectraits list          [-q | --json]
 ```
 
-`doctor` runs an egress-IP + per-publisher credentials preflight and is meant to be run before any batch ingest. `sideload` is **PDF-only** in v3. `ingest` **refetches by default** — `--cache-hit-ok` is the opt-in short-circuit when a manifest already exists for the DOI.
+`doctor` runs an egress-IP + per-publisher credentials preflight and is meant to be run before any batch ingest. `sideload` is **PDF-only** in v3. `ingest` **refetches by default** — `--cache-hit-ok` is the opt-in short-circuit when a manifest already exists for the DOI. The `extract → normalize → diff-routes` chain is deliberately split into composable, independently re-runnable steps; `show-document` renders a normalised `Document` to self-contained HTML for human inspection (faithful, single-route, raw-math — see `docs/rendering-mvp-plan.md`). `list` is the discovery counterpart to `show <doi>`: it enumerates every DOI in the local store (newest first) with title / year / publisher / format(s) / extract+normalize status, so the operator never needs the exact DOI in hand. `--quiet/-q` prints bare DOIs one per line for copy/pipe (e.g. `litspectraits list -q | fzf`); `--json` emits the full per-artifact catalog.
 
 When tests exist, run `uv run pytest`. For lint/typecheck: `uv run ruff check`, `uv run ruff format`, `uv run pyright`. There is no `Justfile` yet — `just` is mentioned in the infra doc as a future addition.
