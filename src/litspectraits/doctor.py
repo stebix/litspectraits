@@ -74,6 +74,13 @@ from litspectraits.errors import (
     MissingCredentialError,
     NotOpenAccessError,
 )
+
+# Module-level so ``litspectraits.doctor._docling_model_dirs`` stays a patchable
+# attribute (the doctor tests monkeypatch it) and the probe functions resolve it
+# through the module global rather than a local re-import that would shadow the
+# patch. The extract module is the single source of truth for which docling
+# weights the v3 pipeline requires and where they live.
+from litspectraits.extract.pdf import _docling_model_dirs, _model_dir_present
 from litspectraits.manifest import (
     AcquisitionRecord,
     CrossRefMetadata,
@@ -225,9 +232,7 @@ class DoctorReport:
             check.status in (CredStatus.OK, CredStatus.NOT_CONFIGURED)
             for check in self.cred_checks
         )
-        extract_ok = (
-            self.extract_check is None or not self.extract_check.has_required_failure
-        )
+        extract_ok = self.extract_check is None or not self.extract_check.has_required_failure
         return creds_ok and extract_ok
 
 
@@ -305,9 +310,7 @@ async def _check_egress_ip(*, client: httpx.AsyncClient, settings: Settings) -> 
         return IPCheck(status=IPStatus.UNCONFIGURED, ip=ip, expected_cidrs=(), error=None)
     if _ip_in_any(ip, cidrs):
         return IPCheck(status=IPStatus.OK, ip=ip, expected_cidrs=cidrs, error=None)
-    return IPCheck(
-        status=IPStatus.OUTSIDE_ALLOWLIST, ip=ip, expected_cidrs=cidrs, error=None
-    )
+    return IPCheck(status=IPStatus.OUTSIDE_ALLOWLIST, ip=ip, expected_cidrs=cidrs, error=None)
 
 
 def _ip_in_any(ip: str, cidrs: Iterable[str]) -> bool:
@@ -540,9 +543,7 @@ async def _check_extract_section(
 
     if smoke_extract:
         resolved_fixture = fixture_path or _packaged_fixture_path()
-        smoke_row = await _maybe_smoke_extract(
-            fixture_path=resolved_fixture, settings=settings
-        )
+        smoke_row = await _maybe_smoke_extract(fixture_path=resolved_fixture, settings=settings)
         rows.append(smoke_row)
 
     has_required_failure = any(
@@ -636,7 +637,7 @@ def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractCompon
 def _model_row(
     *, component: str, cache_dir: Path, ok_hint: str, missing_hint: str
 ) -> ExtractComponentCheck:
-    if cache_dir.is_dir() and any(cache_dir.iterdir()):
+    if _model_dir_present(cache_dir):
         return ExtractComponentCheck(
             component=component,
             required='yes',
@@ -651,47 +652,6 @@ def _model_row(
         status=ExtractStatus.MISSING,
         detail=missing_hint,
     )
-
-
-def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str, str]:
-    """Resolve ``(models_root, layout_folder, tableformer_folder, code_formula_folder)``.
-
-    Three required weights for the v3 pipeline. The layout folder name
-    comes from :data:`litspectraits.extract.pdf.LAYOUT_MODEL_REPO_FOLDER`
-    — the single source of truth for *which* layout model the converter
-    is configured with — so this probe and the extractor cannot drift.
-    TableFormer and code-formula folder names are pulled from docling's
-    own dunder-private ``_model_repo_folder`` accessors: those are
-    private but stable across the 2.x line, and tying to the symbol means
-    a docling bump that renames a repo folder surfaces as an
-    ``AttributeError`` here rather than a silent "models all missing" gate.
-
-    The root is ``model_cache_dir`` when set
-    (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`` — the same value the
-    extractor passes as ``PdfPipelineOptions.artifacts_path`` and
-    ``--download-models`` writes to), otherwise docling's default
-    ``settings.cache_dir / 'models'`` (``~/.cache/docling/models``).
-    """
-    from docling.datamodel.settings import (  # pyright: ignore[reportMissingImports]
-        settings as docling_settings,
-    )
-    from docling.models.stages.code_formula.code_formula_model import (  # pyright: ignore[reportMissingImports]
-        CodeFormulaModel,
-    )
-    from docling.models.stages.table_structure.table_structure_model import (  # pyright: ignore[reportMissingImports]
-        TableStructureModel,
-    )
-
-    from litspectraits.extract.pdf import LAYOUT_MODEL_REPO_FOLDER
-
-    if model_cache_dir is not None:
-        models_root = model_cache_dir
-    else:
-        models_root = Path(docling_settings.cache_dir) / 'models'
-    layout_folder = LAYOUT_MODEL_REPO_FOLDER
-    tableformer_folder = str(TableStructureModel._model_repo_folder)
-    code_formula_folder = str(CodeFormulaModel._model_repo_folder)
-    return models_root, layout_folder, tableformer_folder, code_formula_folder
 
 
 def _check_accelerator() -> ExtractComponentCheck:
@@ -828,9 +788,7 @@ def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) 
     )
 
 
-async def _maybe_smoke_extract(
-    *, fixture_path: Path, settings: Settings
-) -> ExtractComponentCheck:
+async def _maybe_smoke_extract(*, fixture_path: Path, settings: Settings) -> ExtractComponentCheck:
     """Run a live docling conversion against ``fixture_path``; time it.
 
     Stages the fixture into a throwaway tempdir so doctor remains
@@ -900,9 +858,7 @@ def _smoke_required(settings: Settings) -> bool:
 _SMOKE_DOI: Final = '10.0/doctor-smoke'
 
 
-def _stage_fixture_for_smoke(
-    *, fixture_path: Path, store: ArtifactStore
-) -> AcquisitionRecord:
+def _stage_fixture_for_smoke(*, fixture_path: Path, store: ArtifactStore) -> AcquisitionRecord:
     """Copy the fixture into a throwaway store and synthesize a manifest.
 
     Doctor's smoke-convert needs an :class:`AcquisitionRecord` to feed

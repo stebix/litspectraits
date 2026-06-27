@@ -256,6 +256,65 @@ def _preflight(*, record: AcquisitionRecord, store: ArtifactStore) -> Path:
     return artifact_path
 
 
+# Stage 1.5 — model-cache preflight -------------------------------------------
+
+
+def _docling_model_dirs(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str, str]:
+    """Resolve ``(models_root, layout_folder, tableformer_folder, code_formula_folder)``.
+
+    The three weight repos the v3 ``PdfPipelineOptions`` loads: the Egret-Large
+    layout region-detector (:data:`LAYOUT_MODEL_REPO_FOLDER` — the single source
+    of truth for *which* layout model the converter is configured with), the
+    TableFormer table-structure model, and the code/formula VLM that
+    ``do_formula_enrichment=True`` needs. TableFormer and code-formula folder
+    names are pulled from docling's own dunder-private ``_model_repo_folder``
+    accessors: private but stable across the 2.x line, and tying to the symbol
+    means a docling bump that renames a repo folder surfaces as an
+    ``AttributeError`` here rather than a silent "models all missing".
+
+    ``models_root`` is ``model_cache_dir`` when set
+    (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`` — the same value the extractor
+    passes as ``PdfPipelineOptions.artifacts_path`` and ``doctor
+    --download-models`` writes to), otherwise docling's default
+    ``settings.cache_dir / 'models'`` (``~/.cache/docling/models``).
+
+    docling is imported lazily, matching :func:`_load_docling`'s discipline so
+    the ``[extract]`` extra stays opt-in. Shared with ``doctor`` (which imports
+    this) so the extract preflight and the doctor model probe cannot drift on
+    *what* is required or *where* it lives.
+    """
+    from docling.datamodel.settings import (  # pyright: ignore[reportMissingImports]
+        settings as docling_settings,
+    )
+    from docling.models.stages.code_formula.code_formula_model import (  # pyright: ignore[reportMissingImports]
+        CodeFormulaModel,
+    )
+    from docling.models.stages.table_structure.table_structure_model import (  # pyright: ignore[reportMissingImports]
+        TableStructureModel,
+    )
+
+    if model_cache_dir is not None:
+        models_root = model_cache_dir
+    else:
+        models_root = Path(docling_settings.cache_dir) / 'models'
+    layout_folder = LAYOUT_MODEL_REPO_FOLDER
+    tableformer_folder = str(TableStructureModel._model_repo_folder)
+    code_formula_folder = str(CodeFormulaModel._model_repo_folder)
+    return models_root, layout_folder, tableformer_folder, code_formula_folder
+
+
+def _model_dir_present(path: Path) -> bool:
+    """A model repo dir counts as present iff it exists and holds ≥1 entry.
+
+    Existence-and-non-emptiness rather than per-file fingerprinting — docling's
+    HF snapshot layout shifts across releases, so "directory exists with at
+    least one entry" is the strongest invariant we can assert without coupling
+    to a weight filename the next minor bump may rename. Shared with ``doctor``
+    so the preflight and the doctor probe apply the identical test.
+    """
+    return path.is_dir() and any(path.iterdir())
+
+
 # Stage 2 — convert -----------------------------------------------------------
 
 
