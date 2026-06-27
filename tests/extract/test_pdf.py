@@ -11,6 +11,7 @@ asserts the import-error translation.
 import json
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from structlog.testing import capture_logs
@@ -23,6 +24,7 @@ from litspectraits.errors import (
     EmptyDocumentError,
     ExtractIntegrityError,
     MissingArtifactError,
+    MissingModelWeightsError,
     ParseDegradedError,
     SerializationError,
     WrongFormatForExtractorError,
@@ -108,6 +110,126 @@ async def test_missing_artifact_raises_missing_artifact_error(
     assert excinfo.value.context['sha256'] == record.sha256
     assert 'litspectraits ingest' in str(excinfo.value.context['hint'])
     assert fake_docling.load_calls == []
+
+
+# Stage 1.5 — model-cache preflight -------------------------------------------
+
+# Folder names are arbitrary here — ``missing_model_dirs`` keys its labels off a
+# hardcoded list in pdf.py, so only the *paths* depend on these.
+_FAKE_MODEL_FOLDERS: dict[str, str] = {
+    'layout': 'layout-repo',
+    'tableformer': 'tf-repo',
+    'code-formula': 'cf-repo',
+}
+
+
+def _patch_model_dirs(
+    monkeypatch: pytest.MonkeyPatch, models_root: Path, *, present: set[str]
+) -> None:
+    """Point ``_docling_model_dirs`` at ``models_root`` with fixed folder names.
+
+    Keeps the model-cache tests hermetic — no real docling import. Creates a
+    non-empty subdir for each component in ``present`` so ``_model_dir_present``
+    sees it; components absent from ``present`` surface as missing.
+    """
+    monkeypatch.setattr(
+        pdf_mod,
+        '_docling_model_dirs',
+        lambda *, model_cache_dir=None: (
+            models_root,
+            _FAKE_MODEL_FOLDERS['layout'],
+            _FAKE_MODEL_FOLDERS['tableformer'],
+            _FAKE_MODEL_FOLDERS['code-formula'],
+        ),
+    )
+    for label in present:
+        folder = models_root / _FAKE_MODEL_FOLDERS[label]
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'model.safetensors').write_bytes(b'weights')
+
+
+def test_model_dir_present_requires_existing_nonempty_dir(tmp_path: Path) -> None:
+    missing = tmp_path / 'absent'
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    populated = tmp_path / 'populated'
+    populated.mkdir()
+    (populated / 'config.json').write_bytes(b'{}')
+
+    assert pdf_mod._model_dir_present(missing) is False
+    assert pdf_mod._model_dir_present(empty) is False
+    assert pdf_mod._model_dir_present(populated) is True
+
+
+def test_check_model_cache_raises_when_weights_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned cache missing layout + code-formula fails fast with the gap named."""
+    _patch_model_dirs(monkeypatch, tmp_path, present={'tableformer'})
+    with pytest.raises(MissingModelWeightsError) as excinfo:
+        pdf_mod._check_model_cache(doi='10.1002/mrm.29027', model_cache_dir=tmp_path)
+    assert excinfo.value.doi == '10.1002/mrm.29027'
+    # Order matches the canonical layout → tableformer → code-formula sequence.
+    assert excinfo.value.context['missing'] == ['layout', 'code-formula']
+    assert excinfo.value.context['model_cache_dir'] == str(tmp_path)
+    assert 'doctor --download-models' in str(excinfo.value.context['hint'])
+
+
+def test_check_model_cache_noop_when_all_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_model_dirs(monkeypatch, tmp_path, present={'layout', 'tableformer', 'code-formula'})
+    assert pdf_mod.missing_model_dirs(tmp_path) == []
+    # Does not raise.
+    assert pdf_mod._check_model_cache(doi='10.1002/mrm.29027', model_cache_dir=tmp_path) is None
+
+
+def test_check_model_cache_noop_when_cache_dir_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``model_cache_dir=None`` is docling's auto-download path — never gated.
+
+    The preflight must short-circuit *before* resolving any model dir, so a
+    missing default cache still lets docling fetch on demand. We assert that by
+    making the resolver explode and checking it is never reached.
+    """
+
+    def _boom(*, model_cache_dir: Path | None = None) -> tuple[Path, str, str, str]:
+        raise AssertionError('resolver must not run when model_cache_dir is None')
+
+    monkeypatch.setattr(pdf_mod, '_docling_model_dirs', _boom)
+    assert pdf_mod._check_model_cache(doi='10.1002/mrm.29027', model_cache_dir=None) is None
+
+
+async def test_convert_filenotfound_rewrapped_as_missing_model_weights(
+    store: ArtifactStore,
+    fake_docling: FakeDocling,
+    make_acquisition_record: Callable[..., AcquisitionRecord],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backstop: a raw ``FileNotFoundError`` from convert becomes the typed error.
+
+    Covers what the preflight cannot: the ``model_cache_dir=None`` path (preflight
+    no-ops there), so docling's cryptic mid-convert failure is still re-wrapped
+    rather than escaping as a bare traceback.
+    """
+    record = make_acquisition_record(store=store)
+
+    def _boom(path: object) -> object:
+        raise FileNotFoundError('Missing safe tensors file: /cache/model.safetensors')
+
+    monkeypatch.setattr(fake_docling.converter, 'convert', _boom)
+    # Keep the backstop's gap-naming hermetic (no real docling import on the
+    # ``model_cache_dir=None`` recompute).
+    monkeypatch.setattr(
+        pdf_mod, 'missing_model_dirs', lambda mc: [('layout', Path('/cache/layout'))]
+    )
+
+    with pytest.raises(MissingModelWeightsError) as excinfo:
+        await extract_pdf(record, store)
+    assert 'safe tensors' in str(excinfo.value.context['docling_error'])
+    assert excinfo.value.context['missing'] == ['layout']
+    assert excinfo.value.context['model_cache_dir'] is None
+    # Nothing committed.
+    assert not store.document_dir(record.sha256).exists()
 
 
 # Stage 2 — convert -----------------------------------------------------------

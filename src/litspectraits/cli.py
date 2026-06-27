@@ -82,6 +82,7 @@ from litspectraits.errors import (
     MalformedDocumentError,
     MissingArtifactError,
     MissingCredentialError,
+    MissingModelWeightsError,
     NormalizeError,
     NormalizeIntegrityError,
     NotOpenAccessError,
@@ -156,6 +157,7 @@ _EXTRACT_EXIT_CODES: Final[dict[type[ExtractError], int]] = {
     DoclingImportError: 2,
     WrongFormatForExtractorError: 2,
     MissingArtifactError: 2,
+    MissingModelWeightsError: 2,
     # Conversion / parse-time failures.
     DoclingConversionError: 4,
     DoclingDegradedError: 4,
@@ -232,6 +234,11 @@ _EXTRACT_HINTS: Final[dict[type[ExtractError], str]] = {
         'should be unreachable in production — file a bug'
     ),
     MissingArtifactError: 'artifact file is gone; re-run `litspectraits ingest <doi>` to refetch',
+    MissingModelWeightsError: (
+        'docling model weights are missing from the configured cache; run '
+        '`litspectraits doctor --download-models` to populate it '
+        '(or check `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`)'
+    ),
     DoclingConversionError: 'docling rejected the PDF outright; inspect the artifact bytes',
     DoclingDegradedError: (
         'docling returned PARTIAL_SUCCESS; TableFormer or layout recognition failed — '

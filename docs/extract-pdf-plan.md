@@ -380,6 +380,7 @@ class ExtractError(RuntimeError):
 class DoclingImportError(ExtractError): ...        # [extract] extra not installed
 class WrongFormatForExtractorError(ExtractError): ...
 class MissingArtifactError(ExtractError): ...      # record points at a file that's gone
+class MissingModelWeightsError(ExtractError): ...  # pinned model cache missing required weights
 
 # Conversion
 class DoclingConversionError(ExtractError): ...    # ConversionStatus == FAILURE
@@ -404,6 +405,7 @@ malformed-output, 7 = integrity):
 | `DoclingImportError` | 2 |
 | `WrongFormatForExtractorError` | 2 |
 | `MissingArtifactError` | 2 |
+| `MissingModelWeightsError` | 2 |
 | `DoclingConversionError` | 4 |
 | `DoclingDegradedError` | 4 |
 | `EmptyDocumentError` | 6 |
@@ -542,7 +544,28 @@ consistency:
    layout, TableFormer, code/formula VLM — check the on-disk
    artifact directory exists and is non-empty. The layout folder name
    is read from `litspectraits.extract.pdf.LAYOUT_MODEL_REPO_FOLDER`
-   so the probe and the configured layout model can't drift.
+   so the probe and the configured layout model can't drift. The
+   dir-resolution (`_docling_model_dirs`) and the present-predicate
+   (`_model_dir_present`) live in `extract.pdf` and are imported by
+   `doctor`; the same pair backs the extract-path preflight below, so
+   `doctor` and `extract` can never disagree on what's required or
+   what counts as present.
+
+   **`extract` runs the same probe before converting.** `extract_pdf`
+   calls `_check_model_cache(...)` between the artifact preflight and
+   the docling load. When `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR` is
+   *set* and a required weight is missing, it raises
+   `MissingModelWeightsError` (exit 2) with the gap named and a
+   `doctor --download-models` hint — instead of letting docling crash
+   deep in `LayoutPredictor` with a raw `FileNotFoundError` whose
+   message misleadingly points at the cache *root* (the Egret spec's
+   `model_path` is empty). The check is a **no-op when the cache dir is
+   unset** (`None`): that is docling's own `~/.cache/docling/models`
+   lookup, where `LayoutModel` auto-downloads on demand, and gating it
+   would block that legitimate path. A convert-time
+   `except FileNotFoundError` backstop re-wraps anything the preflight
+   can't predict (the unset-cache path, a weight deleted mid-run, a
+   docling path quirk) into the same typed error.
 3. **Download-if-missing knob.** `doctor --download-models` fetches
    the three required v3 weights. It does **not** just call
    `download_models(with_layout=True, ...)` — that pulls the docling

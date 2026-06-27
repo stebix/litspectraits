@@ -218,6 +218,27 @@ class MissingArtifactError(ExtractError):
     """
 
 
+class MissingModelWeightsError(ExtractError):
+    """The pinned docling model cache is missing one or more required weights.
+
+    Raised by the PDF extractor's preflight
+    (:func:`litspectraits.extract.pdf._check_model_cache`) — and, as a
+    backstop, when docling itself raises ``FileNotFoundError`` mid-conversion
+    — when ``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR`` points at a directory that
+    does not hold every weight the v3 ``PdfPipelineOptions`` loads (Egret-Large
+    layout, TableFormer, code/formula VLM).
+
+    docling only auto-downloads weights when ``artifacts_path is None``; with a
+    pinned cache a missing model is a fatal misconfiguration, not something the
+    extractor will silently fetch (multi-GB pulls stay explicit). The operator
+    fix is ``litspectraits doctor --download-models`` (or correcting the env
+    var). Context carries ``model_cache_dir`` and the ``missing`` component
+    labels so the Rich panel and structured logs name the gap precisely —
+    unlike docling's own message, which (because the Egret spec's ``model_path``
+    is empty) misleadingly points at the cache *root*.
+    """
+
+
 class MalformedDocumentError(ExtractError):
     """Artifact passed magic-byte sniff at ingest but failed structural parse.
 

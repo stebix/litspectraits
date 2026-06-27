@@ -42,6 +42,7 @@ from litspectraits.errors import (
     MalformedDocumentError,
     MissingArtifactError,
     MissingCredentialError,
+    MissingModelWeightsError,
     ParseDegradedError,
     PublisherAPIError,
     RateLimitExhaustedError,
@@ -1088,6 +1089,15 @@ def test_extract_invalid_doi_exits_2(runner: CliRunner) -> None:
         (
             lambda doi: MissingArtifactError(
                 doi=doi, sha256='a' * 64, artifact_path='/gone', hint='re-ingest'
+            ),
+            2,
+        ),
+        (
+            lambda doi: MissingModelWeightsError(
+                doi=doi,
+                extractor='docling',
+                model_cache_dir='/cache',
+                missing=['layout', 'code-formula'],
             ),
             2,
         ),

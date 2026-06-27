@@ -40,6 +40,7 @@ from litspectraits.errors import (
     EmptyDocumentError,
     ExtractIntegrityError,
     MissingArtifactError,
+    MissingModelWeightsError,
     ParseDegradedError,
     SerializationError,
     WrongFormatForExtractorError,
@@ -77,6 +78,15 @@ DOCUMENT_TIMEOUT_S: Final[float] = 120.0
 # imports this constant for its model-cache probe so the configured layout
 # model and the doctor required-models list move in lockstep (ibid. §2, §3).
 LAYOUT_MODEL_REPO_FOLDER: Final = 'docling-project--docling-layout-egret-large'
+
+# Operator hint shared by the model-cache preflight and the convert-time
+# backstop. Points at ``doctor --download-models`` (the one sanctioned download
+# path) rather than fetching weights inline — multi-GB pulls stay explicit.
+_MODEL_CACHE_HINT: Final = (
+    'docling model weights missing from the cache — run '
+    '`litspectraits doctor --download-models` to populate it, or check '
+    'LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR'
+)
 
 _DIST_NAME: Final = 'docling'
 _DOCUMENT_FILENAME: Final = 'document.json'
@@ -202,9 +212,27 @@ async def extract_pdf(
         Existing ``document.json`` differs and ``reextract=False``.
     """
     artifact_path = _preflight(record=record, store=store)
+    _check_model_cache(doi=record.doi, model_cache_dir=model_cache_dir)
 
     sdk = _load_docling(doi=record.doi, model_cache_dir=model_cache_dir)
-    convert_result = await asyncio.to_thread(sdk.converter.convert, artifact_path)
+    try:
+        convert_result = await asyncio.to_thread(sdk.converter.convert, artifact_path)
+    except FileNotFoundError as exc:
+        # Backstop for the cases the preflight cannot cover: the
+        # ``model_cache_dir is None`` default-cache path (preflight no-ops
+        # there), a weight deleted between preflight and load, or a docling
+        # path quirk. The artifact's existence was already asserted in
+        # ``_preflight``, so a ``FileNotFoundError`` surfacing here is a missing
+        # model weight in practice — re-wrap it into the typed error instead of
+        # letting docling's raw (and misleading) traceback escape.
+        raise MissingModelWeightsError(
+            doi=record.doi,
+            extractor='docling',
+            model_cache_dir=str(model_cache_dir) if model_cache_dir is not None else None,
+            missing=[label for label, _ in missing_model_dirs(model_cache_dir)],
+            docling_error=str(exc),
+            hint=_MODEL_CACHE_HINT,
+        ) from exc
     _check_conversion_status(doi=record.doi, result=convert_result, status_cls=sdk.status_cls)
 
     document = convert_result.document
@@ -313,6 +341,56 @@ def _model_dir_present(path: Path) -> bool:
     so the preflight and the doctor probe apply the identical test.
     """
     return path.is_dir() and any(path.iterdir())
+
+
+def missing_model_dirs(model_cache_dir: Path | None) -> list[tuple[str, Path]]:
+    """Required model dirs ``(component_label, path)`` that are absent or empty.
+
+    An empty list means every weight the v3 pipeline loads is present under
+    ``model_cache_dir``. Consumed by the extract preflight
+    (:func:`_check_model_cache`) and by the convert-time backstop in
+    :func:`extract_pdf` to name the gap on the typed error.
+    """
+    models_root, layout_folder, tableformer_folder, code_formula_folder = _docling_model_dirs(
+        model_cache_dir=model_cache_dir
+    )
+    candidates = [
+        ('layout', models_root / layout_folder),
+        ('tableformer', models_root / tableformer_folder),
+        ('code-formula', models_root / code_formula_folder),
+    ]
+    return [(label, path) for label, path in candidates if not _model_dir_present(path)]
+
+
+def _check_model_cache(*, doi: str, model_cache_dir: Path | None) -> None:
+    """Assert a *pinned* docling weight cache holds every required model.
+
+    No-op when ``model_cache_dir is None``: that is docling's own
+    ``~/.cache/docling/models`` lookup, where a missing weight is *downloaded on
+    demand* (``LayoutModel`` only auto-downloads on the ``artifacts_path is
+    None`` branch). Hard-failing there would block the legitimate download path,
+    so the preflight guards only a pinned cache
+    (``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``), where docling never downloads
+    and a missing weight is a fatal misconfiguration.
+
+    Runs before :func:`_load_docling` so the operator gets a typed, actionable
+    :class:`~litspectraits.errors.MissingModelWeightsError` in milliseconds
+    instead of a raw ``FileNotFoundError`` from deep inside ``LayoutPredictor``
+    (whose message is itself misleading — the Egret spec's empty ``model_path``
+    makes docling point the predictor at the cache *root*).
+    """
+    if model_cache_dir is None:
+        return
+    missing = missing_model_dirs(model_cache_dir)
+    if missing:
+        raise MissingModelWeightsError(
+            doi=doi,
+            extractor='docling',
+            model_cache_dir=str(model_cache_dir),
+            missing=[label for label, _ in missing],
+            missing_paths=[str(path) for _, path in missing],
+            hint=_MODEL_CACHE_HINT,
+        )
 
 
 # Stage 2 — convert -----------------------------------------------------------
