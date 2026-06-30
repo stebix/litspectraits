@@ -399,6 +399,19 @@ class NormalizeError(RuntimeError):
         self.context = dict(context)
 
 
+class UnknownBackendError(NormalizeError):
+    """The upstream extract meta's ``backend_id`` does not resolve to a PDF adapter.
+
+    Raised by the normalize PDF dispatch (``docs/mineru-backend-spec.md``
+    §1, §8) when ``documents/sha256/<aa>/<sha>/meta.json`` carries a
+    ``backend_id`` no normalize adapter serves — or omits it entirely (a
+    pre-``backend_id`` extraction). Normalize refuses to guess which parser
+    produced ``document.json``; the fix is to (re-)extract with a wired
+    ``--backend`` so the meta records it. The XML routes never hit this —
+    they dispatch on :class:`~litspectraits.manifest.Format`, not backend.
+    """
+
+
 class NormalizeIntegrityError(NormalizeError):
     """Existing normalized ``document.json`` differs and ``--renormalize`` was not set.
 

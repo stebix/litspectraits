@@ -51,7 +51,7 @@ import tempfile
 import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, Literal, TypedDict
+from typing import Any, Final, Literal, TypedDict
 
 import attrs
 import dotenv
@@ -93,14 +93,17 @@ from litspectraits.errors import (
     PublisherAPIError,
     RateLimitExhaustedError,
     SerializationError,
+    UnknownBackendError,
     UnsupportedPublisherError,
     WrongFormatForExtractorError,
 )
 from litspectraits.extract import extract as run_extract
+from litspectraits.extract.backend_ids import DEFAULT_PDF_BACKEND, DOCLING_STANDARD, MINERU
 from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, converter
 from litspectraits.normalize import (
+    Document,
     DualFormatResult,
     NormalizedMeta,
     RenderContext,
@@ -110,6 +113,7 @@ from litspectraits.normalize import (
     format_dual_format_report,
     load_normalized_document,
     normalize_docling_document,
+    normalize_mineru_document,
     normalize_xml_document,
     render_html,
 )
@@ -219,6 +223,9 @@ _INGEST_HINTS: Final[dict[type[IngestError], str]] = {
 _NORMALIZE_EXIT_CODES: Final[dict[type[NormalizeError], int]] = {
     # Refused to overwrite a divergent on-disk normalisation.
     NormalizeIntegrityError: 7,
+    # Upstream extract meta's backend_id resolves to no adapter — an
+    # operator/config error, same exit code as extract's BackendNotApplicableError.
+    UnknownBackendError: 2,
 }
 
 
@@ -226,6 +233,10 @@ _NORMALIZE_HINTS: Final[dict[type[NormalizeError], str]] = {
     NormalizeIntegrityError: (
         're-normalised document differs from the existing one; '
         'pass `--renormalize` to overwrite if the change is intentional'
+    ),
+    UnknownBackendError: (
+        'the upstream extraction recorded no backend this normalizer serves; '
+        're-run `litspectraits extract <doi> --backend docling-standard|mineru`'
     ),
 }
 
@@ -754,6 +765,16 @@ def cmd_extract(
             'Sha is a 64-char lowercase hex string; anything else is parsed as a DOI.'
         ),
     ),
+    backend: str = typer.Option(
+        DEFAULT_PDF_BACKEND,
+        '--backend',
+        envvar='LITSPECTRAITS_PDF_BACKEND',
+        help=(
+            'PDF parsing backend: `docling-standard` (default; text-layer, exact '
+            'geometry) or `mineru`. Ignored on XML artifacts — a non-default value '
+            'there is a loud error. Overridable via LITSPECTRAITS_PDF_BACKEND.'
+        ),
+    ),
     reextract: bool = typer.Option(
         False,
         '--reextract',
@@ -766,20 +787,27 @@ def cmd_extract(
     """Extract structure from a previously-ingested artifact.
 
     Dispatches through :func:`litspectraits.extract.extract` to the
-    format-specific extractor (PDF / JATS / Elsevier). The artifact must
-    already be in the local store; run ``litspectraits ingest <doi>``
-    first if it isn't. No network calls.
+    format-specific extractor, and — for PDF — the ``--backend``-selected
+    parser (docling or MinerU; ``docs/mineru-backend-spec.md`` §1, §8). The
+    artifact must already be in the local store; run ``litspectraits ingest
+    <doi>`` first if it isn't. No network calls.
 
     Exit codes (``docs/extract-pdf-plan.md`` §5): 1 = record not in local
-    store; 2 = invalid input or extractor preflight; 4 = conversion
-    failure; 6 = malformed output / parse degraded / empty document /
-    serialization; 7 = integrity (re-extracted document differs and
-    ``--reextract`` was not passed).
+    store; 2 = invalid input / extractor preflight / unusable ``--backend``
+    (``BackendNotApplicableError``); 4 = conversion failure; 6 = malformed
+    output / parse degraded / empty document / serialization; 7 = integrity
+    (re-extracted document differs and ``--reextract`` was not passed).
     """
-    asyncio.run(_run_extract(target=target, reextract=reextract, json_output=json_output))
+    asyncio.run(
+        _run_extract(
+            target=target, backend=backend, reextract=reextract, json_output=json_output
+        )
+    )
 
 
-async def _run_extract(*, target: str, reextract: bool, json_output: bool) -> None:
+async def _run_extract(
+    *, target: str, backend: str, reextract: bool, json_output: bool
+) -> None:
     settings = _load_settings()
     store = ArtifactStore(settings.data_dir)
     err_console = _stderr_console()
@@ -789,7 +817,11 @@ async def _run_extract(*, target: str, reextract: bool, json_output: bool) -> No
 
     try:
         extract_record = await run_extract(
-            record, store, reextract=reextract, model_cache_dir=settings.docling_model_cache_dir
+            record,
+            store,
+            backend=backend,
+            reextract=reextract,
+            model_cache_dir=settings.docling_model_cache_dir,
         )
     except ExtractError as exc:
         _render_error_panel(exc, console=err_console, hints=_EXTRACT_HINTS)
@@ -895,12 +927,16 @@ def cmd_normalize(
 ) -> None:
     """Build the normalised :class:`Document` for a previously-extracted artifact.
 
-    Reads ``documents/sha256/<aa>/<sha>/document.json``, routes through the
-    format-appropriate adapter (docling for PDF, the XML adapter for
-    JATS / Elsevier), and atomically commits the result to
+    Reads ``documents/sha256/<aa>/<sha>/document.json`` and routes through
+    the adapter that matches the parser which produced it: for PDF, the
+    ``backend_id`` recorded in the extract ``meta.json`` (docling or MinerU;
+    ``docs/mineru-backend-spec.md`` §1, §8); for JATS / Elsevier, the XML
+    adapter keyed on format. The result is atomically committed to
     ``normalized/sha256/<aa>/<sha>/{document.json,meta.json}``
     (``docs/normalized-documents-discussion.md`` §3,
-    ``docs/dual-route-comparison-overview.md`` §9).
+    ``docs/dual-route-comparison-overview.md`` §9). There is no
+    ``--backend`` flag here by design — using it would let you normalize a
+    document with the wrong adapter; the backend is read, never chosen.
 
     The artifact must already be ingested *and* extracted — run
     ``litspectraits ingest`` then ``litspectraits extract`` first. The
@@ -911,7 +947,9 @@ def cmd_normalize(
     Exit codes:
 
     - 1: artifact not in local store, or upstream extraction missing.
-    - 2: invalid input shape, or docling SDK missing for a PDF target.
+    - 2: invalid input shape; docling SDK missing for a PDF target; or the
+      extract meta records no backend this normalizer serves
+      (:class:`~litspectraits.errors.UnknownBackendError`).
     - 7: re-normalisation diverges from existing bytes and ``--renormalize``
       was not passed (:class:`~litspectraits.errors.NormalizeIntegrityError`).
     """
@@ -942,6 +980,57 @@ def cmd_normalize(
         _render_normalize_meta_panel(record=record, meta=meta, console=out_console)
 
 
+def _normalize_pdf(
+    payload: dict[str, Any], *, store: ArtifactStore, record: AcquisitionRecord
+) -> Document:
+    """Dispatch a PDF ``document.json`` to the adapter matching its backend.
+
+    A PDF can be docling- or MinerU-parsed, so the adapter is selected on
+    the ``backend_id`` the extractor recorded in ``meta.json``
+    (``docs/mineru-backend-spec.md`` §1, §8) — not inferred from
+    :class:`~litspectraits.manifest.Format`. This keeps the normalize
+    adapter in lockstep with the extractor by construction: there is no way
+    to normalize a MinerU document with the docling adapter.
+
+    Raises
+    ------
+    litspectraits.errors.UnknownBackendError
+        The upstream meta carries no ``backend_id`` this normalizer serves
+        (an unknown id, or a pre-``backend_id`` extraction).
+    """
+    backend_id = _read_extract_backend_id(store=store, sha256=record.sha256)
+    if backend_id == DOCLING_STANDARD:
+        return normalize_docling_document(payload)
+    if backend_id == MINERU:
+        return normalize_mineru_document(payload)
+    raise UnknownBackendError(
+        doi=record.doi,
+        sha256=record.sha256,
+        backend_id=backend_id,
+        hint=(
+            f'extract meta.json carries no usable backend_id (got {backend_id!r}); '
+            f're-run `litspectraits extract {record.doi} --backend '
+            f'docling-standard|mineru` so normalize can match the parser'
+        ),
+    )
+
+
+def _read_extract_backend_id(*, store: ArtifactStore, sha256: str) -> str | None:
+    """Read ``backend_id`` from the upstream extract ``meta.json``.
+
+    Returns ``None`` when the field is absent (an extraction predating the
+    pluggable-backend seam) or non-string, so the caller fails loud with a
+    precise :class:`~litspectraits.errors.UnknownBackendError` rather than a
+    ``KeyError``. The meta's existence is already guaranteed by the
+    ``document.json`` check upstream; a genuinely missing meta surfaces as
+    the same :class:`FileNotFoundError` the commit path raises.
+    """
+    meta_path = store.document_dir(sha256) / 'meta.json'
+    meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    backend_id = meta.get('backend_id')
+    return backend_id if isinstance(backend_id, str) else None
+
+
 def _run_normalize(
     *, record: AcquisitionRecord, store: ArtifactStore, renormalize: bool
 ) -> NormalizedMeta:
@@ -961,7 +1050,7 @@ def _run_normalize(
     payload = json.loads(document_path.read_text(encoding='utf-8'))
 
     if record.format is Format.PDF:
-        doc = normalize_docling_document(payload)
+        doc = _normalize_pdf(payload, store=store, record=record)
     elif record.format is Format.JATS_XML:
         doc = normalize_xml_document(payload, route='jats')
     elif record.format is Format.ELSEVIER_XML:

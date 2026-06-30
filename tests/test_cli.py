@@ -47,6 +47,7 @@ from litspectraits.errors import (
     PublisherAPIError,
     RateLimitExhaustedError,
     SerializationError,
+    UnknownBackendError,
     UnsupportedPublisherError,
     WrongFormatForExtractorError,
 )
@@ -1016,8 +1017,123 @@ def test_extract_passes_reextract_flag_through_dispatch(
     result = runner.invoke(app, ['extract', '--reextract', record.doi])
     assert result.exit_code == 0
     # ``model_cache_dir`` rides along from Settings (None unless
-    # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR is set).
-    assert captured['kwargs'] == {'reextract': True, 'model_cache_dir': None}
+    # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR is set); ``backend`` defaults to
+    # docling-standard when neither --backend nor LITSPECTRAITS_PDF_BACKEND is set.
+    assert captured['kwargs'] == {
+        'backend': 'docling-standard',
+        'reextract': True,
+        'model_cache_dir': None,
+    }
+
+
+def test_extract_backend_flag_threads_through_dispatch(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--backend mineru`` reaches run_extract(backend='mineru')."""
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    captured: dict[str, object] = {}
+
+    async def _async_stub(*args: object, **kwargs: object) -> ExtractRecord:
+        captured['kwargs'] = kwargs
+        return extract_record
+
+    monkeypatch.setattr('litspectraits.cli.run_extract', _async_stub)
+
+    result = runner.invoke(app, ['extract', '--backend', 'mineru', record.doi])
+    assert result.exit_code == 0
+    kwargs = captured['kwargs']
+    assert isinstance(kwargs, dict)
+    assert kwargs['backend'] == 'mineru'
+
+
+# ---------------------------------------------------------------------------
+# normalize — PDF backend dispatch (docs/mineru-backend-spec.md §1, §8)
+# ---------------------------------------------------------------------------
+
+
+def _plant_extract_meta(
+    record: AcquisitionRecord, *, store: ArtifactStore, backend_id: str | None
+) -> None:
+    """Write a minimal extract ``meta.json`` carrying ``backend_id``.
+
+    ``backend_id=None`` simulates a pre-pluggable-backend extraction (the
+    field absent), which the normalize dispatch must reject loudly.
+    """
+    meta_dir = store.document_dir(record.sha256)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, object] = {
+        'extractor': 'docling',
+        'format': 'pdf',
+        'source_sha256': record.sha256,
+    }
+    if backend_id is not None:
+        meta['backend_id'] = backend_id
+    (meta_dir / 'meta.json').write_text(json.dumps(meta), encoding='utf-8')
+
+
+def _forbid_call(_payload: object) -> object:
+    raise AssertionError('the wrong normalize adapter was dispatched')
+
+
+def test_normalize_pdf_dispatches_docling_on_backend_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``backend_id='docling-standard'`` routes to the docling adapter."""
+    from litspectraits.cli import _normalize_pdf
+
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_extract_meta(record, store=store, backend_id='docling-standard')
+    sentinel = object()
+    monkeypatch.setattr('litspectraits.cli.normalize_docling_document', lambda _p: sentinel)
+    monkeypatch.setattr('litspectraits.cli.normalize_mineru_document', _forbid_call)
+
+    result = _normalize_pdf({'irrelevant': True}, store=store, record=record)
+    assert result is sentinel
+
+
+def test_normalize_pdf_dispatches_mineru_on_backend_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``backend_id='mineru'`` routes to the MinerU adapter, not docling."""
+    from litspectraits.cli import _normalize_pdf
+
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_extract_meta(record, store=store, backend_id='mineru')
+    sentinel = object()
+    monkeypatch.setattr('litspectraits.cli.normalize_mineru_document', lambda _p: sentinel)
+    monkeypatch.setattr('litspectraits.cli.normalize_docling_document', _forbid_call)
+
+    result = _normalize_pdf({'irrelevant': True}, store=store, record=record)
+    assert result is sentinel
+
+
+def test_normalize_pdf_missing_backend_id_raises(tmp_path: Path) -> None:
+    """A pre-backend_id extraction (field absent) fails loud, not silently docling."""
+    from litspectraits.cli import _normalize_pdf
+
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_extract_meta(record, store=store, backend_id=None)
+
+    with pytest.raises(UnknownBackendError):
+        _normalize_pdf({'irrelevant': True}, store=store, record=record)
+
+
+def test_normalize_pdf_unknown_backend_id_raises(tmp_path: Path) -> None:
+    """An id no normalize adapter serves (e.g. unwired docling-vlm) fails loud."""
+    from litspectraits.cli import _normalize_pdf
+
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_extract_meta(record, store=store, backend_id='docling-vlm')
+
+    with pytest.raises(UnknownBackendError):
+        _normalize_pdf({'irrelevant': True}, store=store, record=record)
 
 
 def test_extract_by_sha256_resolves_via_read_manifest(
