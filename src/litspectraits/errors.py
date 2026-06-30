@@ -209,6 +209,28 @@ class WrongFormatForExtractorError(ExtractError):
     """
 
 
+class MineruImportError(ExtractError):
+    """The ``[mineru]`` extra is not installed; ``import mineru`` failed.
+
+    Mirror of :class:`DoclingImportError` for the MinerU PDF backend
+    (``docs/mineru-backend-spec.md`` §6). The MinerU extra is opt-in and
+    kept separate from ``[extract]`` because the two pull overlapping but
+    independently-pinned model stacks; a docling-only corpus never needs
+    it. Operator hint: ``uv sync --extra mineru``.
+    """
+
+
+class BackendNotApplicableError(ExtractError):
+    """A ``--backend`` was requested that cannot serve this artifact.
+
+    Two cases (``docs/mineru-backend-spec.md`` §1, §6): a non-default PDF
+    backend was selected for a non-PDF (JATS / Elsevier) artifact, where
+    backend choice is meaningless; or an unknown backend id was passed.
+    Both are operator-configuration errors caught before any conversion
+    work, never a silent fall-through to the default backend.
+    """
+
+
 class MissingArtifactError(ExtractError):
     """``record.artifact_path`` points at a file that no longer exists.
 
@@ -272,6 +294,19 @@ class DoclingDegradedError(ExtractError):
     where the corpus's measurement values live. Silently committing a
     half-extracted document is the kind of failure we cannot detect
     downstream (``extract-pdf-plan.md`` §2.2, §3 stage 2).
+    """
+
+
+class MineruConversionError(ExtractError):
+    """MinerU's ``do_parse`` failed or produced an empty parse.
+
+    The MinerU analogue of :class:`DoclingConversionError`
+    (``docs/mineru-backend-spec.md`` §3). MinerU has no ``ConversionStatus``
+    enum, so the failure surfaces as "``do_parse`` raised" or "the
+    ``middle.json`` it wrote carries no ``pdf_info``". The downstream
+    structural-floor checks (:class:`EmptyDocumentError` /
+    :class:`ParseDegradedError`) are shared with the docling path and fire
+    after this one passes.
     """
 
 

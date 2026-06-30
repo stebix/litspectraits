@@ -68,6 +68,7 @@ from litspectraits.doctor import run_doctor
 from litspectraits.doi import InvalidDOIError, normalize
 from litspectraits.errors import (
     AuthRejectedError,
+    BackendNotApplicableError,
     DoclingConversionError,
     DoclingDegradedError,
     DoclingImportError,
@@ -80,6 +81,8 @@ from litspectraits.errors import (
     IntegrityError,
     MalformedArtifactError,
     MalformedDocumentError,
+    MineruConversionError,
+    MineruImportError,
     MissingArtifactError,
     MissingCredentialError,
     MissingModelWeightsError,
@@ -155,12 +158,15 @@ _INGEST_EXIT_CODES: Final[dict[type[IngestError], int]] = {
 _EXTRACT_EXIT_CODES: Final[dict[type[ExtractError], int]] = {
     # Configuration / dispatch errors (operator must change inputs or env).
     DoclingImportError: 2,
+    MineruImportError: 2,
+    BackendNotApplicableError: 2,
     WrongFormatForExtractorError: 2,
     MissingArtifactError: 2,
     MissingModelWeightsError: 2,
     # Conversion / parse-time failures.
     DoclingConversionError: 4,
     DoclingDegradedError: 4,
+    MineruConversionError: 4,
     # Post-extraction "malformed output" failures. ``MalformedDocumentError``
     # was added in step 10c (post-dating ``extract-pdf-plan.md`` §5's
     # original table); it sits in the same bucket as ``EmptyDocumentError``
@@ -229,6 +235,15 @@ _EXTRACT_HINTS: Final[dict[type[ExtractError], str]] = {
         '`docling` is not installed; run `uv sync --extra extract` to install it '
         '(or extract only Springer/Elsevier artifacts, which use lxml)'
     ),
+    MineruImportError: (
+        '`mineru` is not installed; run `uv sync --extra mineru` to install it '
+        '(or select `--backend docling-standard`)'
+    ),
+    BackendNotApplicableError: (
+        'the requested --backend cannot serve this artifact (non-PDF format, or unknown id); '
+        'drop --backend for XML artifacts, or pick an installed PDF backend'
+    ),
+    MineruConversionError: 'MinerU failed to parse the PDF; inspect the artifact bytes',
     WrongFormatForExtractorError: (
         'dispatch routed this record to the wrong extractor; '
         'should be unreachable in production — file a bug'

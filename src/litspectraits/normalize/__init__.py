@@ -43,6 +43,7 @@ from litspectraits.normalize.diff import (
 )
 from litspectraits.normalize.docling_adapter import normalize_docling_document
 from litspectraits.normalize.hooks import converter
+from litspectraits.normalize.mineru_adapter import normalize_mineru_document
 from litspectraits.normalize.models import (
     BBox,
     Block,
@@ -116,6 +117,7 @@ __all__ = [
     'load_normalized_document',
     'load_normalized_meta',
     'normalize_docling_document',
+    'normalize_mineru_document',
     'normalize_xml_document',
     'render_html',
 ]

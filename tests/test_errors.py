@@ -17,6 +17,7 @@ import pytest
 
 from litspectraits.errors import (
     AuthRejectedError,
+    BackendNotApplicableError,
     DoclingConversionError,
     DoclingDegradedError,
     DoclingImportError,
@@ -29,6 +30,8 @@ from litspectraits.errors import (
     IntegrityError,
     MalformedArtifactError,
     MalformedDocumentError,
+    MineruConversionError,
+    MineruImportError,
     MissingArtifactError,
     MissingCredentialError,
     ParseDegradedError,
@@ -43,11 +46,14 @@ _DOI = '10.1002/mrm.27973'
 
 _EXTRACT_CLASSES = [
     DoclingImportError,
+    MineruImportError,
+    BackendNotApplicableError,
     WrongFormatForExtractorError,
     MissingArtifactError,
     MalformedDocumentError,
     DoclingConversionError,
     DoclingDegradedError,
+    MineruConversionError,
     EmptyDocumentError,
     ParseDegradedError,
     SerializationError,
