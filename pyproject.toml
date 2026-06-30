@@ -26,12 +26,16 @@ springer = ['springernature-api-client>=0.0.9']
 # dependencies. Version bounds mirror docling-ibm-models' own constraints.
 extract = ['docling>=2.0', 'torch>=2.2.2,<3', 'torchvision<1']
 # Second PDF backend (docs/mineru-backend-spec.md). Kept separate from
-# [extract]: MinerU pulls its own torch/torchvision-backed model stack, and
-# whether it co-resolves with docling under the CUDA-12.6 `[tool.uv.sources]`
-# pin (driver 550.x ceiling) is the gating open question — verify
-# `uv sync --extra mineru` in isolation before promoting MinerU to canonical
-# (spec §9, §11 B-5). Declaring the extra does not install it.
-mineru = ['mineru>=2.0']
+# [extract]: MinerU pulls its own torch/torchvision-backed model stack.
+# `mineru[pipeline]` is required, not bare `mineru` — the bare package ships
+# only the CLI/`do_parse` shim with no model backend (no torch), so it imports
+# but cannot parse. The `pipeline` engine reads the PDF text layer (exact
+# geometry → `geometry_fidelity='exact'`, the spec's canonical target) and is
+# leaner than `[core]` (no gradio/vllm). The `vlm` engine is an additive
+# follow-on. Its `torch<3,>=2.6.0` co-resolves with docling's `torch>=2.2.2,<3`
+# under the CUDA-12.6 `[tool.uv.sources]` pin (verified: both share torch
+# 2.11+cu126). Declaring the extra does not install it.
+mineru = ['mineru[pipeline]>=2.0']
 all = [
     'litspectraits[wiley,springer,extract]',
 ]
