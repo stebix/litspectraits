@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 import litspectraits.extract._dispatch as dispatch_mod
-from litspectraits.errors import MissingArtifactError
+from litspectraits.errors import BackendNotApplicableError, MissingArtifactError
 from litspectraits.extract import extract
+from litspectraits.extract.backend_ids import DEFAULT_PDF_BACKEND, MINERU
 from litspectraits.manifest import (
     AcquisitionRecord,
     CrossRefMetadata,
@@ -179,6 +180,88 @@ async def test_branch_propagates_missing_artifact_error(
     record = _acquisition_record(fmt=fmt, publisher=publisher)
     with pytest.raises(MissingArtifactError):
         await extract(record, store)
+
+
+async def test_pdf_mineru_backend_routes_to_extract_mineru(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``backend='mineru'`` on a PDF reaches ``extract_mineru``, not docling."""
+    captured: dict[str, object] = {}
+
+    async def _fake_mineru(
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
+    ) -> object:
+        del store, model_cache_dir
+        captured['record'] = record
+        captured['reextract'] = reextract
+        return 'sentinel-mineru'
+
+    async def _fail_pdf(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('docling must not run when backend=mineru')
+
+    monkeypatch.setattr(dispatch_mod, 'extract_mineru', _fake_mineru)
+    monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fail_pdf)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+
+    result = await extract(record, store, backend=MINERU, reextract=True)
+
+    assert result == 'sentinel-mineru'
+    assert captured['record'] is record
+    assert captured['reextract'] is True
+
+
+async def test_pdf_unknown_backend_raises_backend_not_applicable(
+    store: ArtifactStore,
+) -> None:
+    """An unknown PDF backend id fails loud before any conversion work."""
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+    with pytest.raises(BackendNotApplicableError):
+        await extract(record, store, backend='no-such-backend')
+
+
+@pytest.mark.parametrize(
+    ('fmt', 'publisher'),
+    [
+        (Format.JATS_XML, Publisher.SPRINGER_NATURE),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER),
+    ],
+)
+async def test_non_default_backend_on_xml_raises(
+    fmt: Format, publisher: Publisher, store: ArtifactStore
+) -> None:
+    """``--backend`` is meaningless on XML; an explicit choice is rejected."""
+    record = _acquisition_record(fmt=fmt, publisher=publisher)
+    with pytest.raises(BackendNotApplicableError):
+        await extract(record, store, backend=MINERU)
+
+
+async def test_default_backend_on_xml_is_tolerated(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default backend means "unset" — it must not trip the XML guard."""
+    captured: dict[str, object] = {}
+
+    async def _fake_jats(
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+    ) -> object:
+        del store, reextract
+        captured['record'] = record
+        return 'sentinel-jats'
+
+    monkeypatch.setattr(dispatch_mod, 'extract_jats', _fake_jats)
+    record = _acquisition_record(fmt=Format.JATS_XML, publisher=Publisher.SPRINGER_NATURE)
+
+    result = await extract(record, store, backend=DEFAULT_PDF_BACKEND)
+
+    assert result == 'sentinel-jats'
+    assert captured['record'] is record
 
 
 def test_dispatch_branches_cover_every_format() -> None:

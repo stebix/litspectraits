@@ -1,7 +1,13 @@
-"""Format → extractor dispatch (``docs/overview-v3.md`` §11).
+"""Format → backend → extractor dispatch (``docs/overview-v3.md`` §11).
 
-A three-way ``match`` on :attr:`AcquisitionRecord.format`. All three legs
-are now wired (PDF step 10b, JATS step 10c, Elsevier step 10d).
+A ``match`` on :attr:`AcquisitionRecord.format`. All three legs are wired
+(PDF step 10b, JATS step 10c, Elsevier step 10d). The PDF leg is further
+*backend-dispatched* (``docs/mineru-backend-spec.md`` §1): one
+:attr:`Format.PDF` artifact can be parsed by docling or MinerU, selected
+by ``backend`` (CLI ``--backend`` / ``LITSPECTRAITS_PDF_BACKEND``). The XML
+legs carry no pluggable backend — a non-default ``backend`` on an XML
+artifact is a loud :class:`~litspectraits.errors.BackendNotApplicableError`,
+never a silent ignore.
 
 The :class:`~litspectraits.errors.ExtractError` taxonomy is the
 load-bearing piece of step 10a — every leaf extractor plugs into a
@@ -10,8 +16,16 @@ dispatcher that already speaks the right error language.
 
 from pathlib import Path
 
+from litspectraits.errors import BackendNotApplicableError
+from litspectraits.extract.backend_ids import (
+    DEFAULT_PDF_BACKEND,
+    DOCLING_STANDARD,
+    MINERU,
+    PDF_BACKEND_IDS,
+)
 from litspectraits.extract.elsevier import extract_elsevier
 from litspectraits.extract.jats import extract_jats
+from litspectraits.extract.mineru import extract_mineru
 from litspectraits.extract.pdf import extract_pdf
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
@@ -21,10 +35,11 @@ async def extract(
     record: AcquisitionRecord,
     store: ArtifactStore,
     *,
+    backend: str = DEFAULT_PDF_BACKEND,
     reextract: bool = False,
     model_cache_dir: Path | None = None,
 ) -> ExtractRecord:
-    """Dispatch ``record`` to the format-specific extractor.
+    """Dispatch ``record`` to the format- and backend-specific extractor.
 
     Parameters
     ----------
@@ -36,13 +51,20 @@ async def extract(
         Used by leaf extractors to read the artifact and stage
         ``documents/sha256/<aa>/<sha>/`` outputs atomically (same tmp → rename pattern
         as ingest).
+    backend : str, default :data:`DEFAULT_PDF_BACKEND`
+        PDF parsing backend id (``'docling-standard'`` / ``'mineru'``).
+        Consulted **only** on the :attr:`Format.PDF` leg. A non-default
+        value on an XML artifact, or an unknown id on a PDF, raises
+        :class:`~litspectraits.errors.BackendNotApplicableError` before any
+        conversion work. The default means "no explicit choice" and so is
+        tolerated (ignored) on the XML legs.
     reextract : bool, default False
         Whether to overwrite an existing extraction whose serialized
         ``document.json`` differs from the one we are about to write.
         Surfaces as :class:`~litspectraits.errors.ExtractIntegrityError`
         when ``False`` and bytes differ.
     model_cache_dir : pathlib.Path | None, default None
-        Docling model-weights directory; only consulted on the
+        Model-weights directory; only consulted on the
         :attr:`Format.PDF` leg (the XML extractors carry no model). See
         :func:`litspectraits.extract.pdf.extract_pdf`.
 
@@ -55,13 +77,74 @@ async def extract(
     ------
     litspectraits.errors.ExtractError
         Any extractor-side failure. The class itself is the contract.
+    litspectraits.errors.BackendNotApplicableError
+        ``backend`` cannot serve ``record`` (non-default on XML, or an
+        unknown PDF backend id).
     """
     match record.format:
         case Format.PDF:
-            return await extract_pdf(
-                record, store, reextract=reextract, model_cache_dir=model_cache_dir
+            return await _dispatch_pdf_backend(
+                record,
+                store,
+                backend=backend,
+                reextract=reextract,
+                model_cache_dir=model_cache_dir,
             )
         case Format.JATS_XML:
+            _reject_backend_on_non_pdf(record=record, backend=backend)
             return await extract_jats(record, store, reextract=reextract)
         case Format.ELSEVIER_XML:
+            _reject_backend_on_non_pdf(record=record, backend=backend)
             return await extract_elsevier(record, store, reextract=reextract)
+
+
+async def _dispatch_pdf_backend(
+    record: AcquisitionRecord,
+    store: ArtifactStore,
+    *,
+    backend: str,
+    reextract: bool,
+    model_cache_dir: Path | None,
+) -> ExtractRecord:
+    """Route a PDF artifact to the selected backend extractor.
+
+    An ``if`` chain rather than ``match`` on purpose: ``case CONSTANT:``
+    binds a capture pattern instead of matching the constant's value, so a
+    typo'd backend id would silently match the first branch. Comparing to
+    the :mod:`litspectraits.extract.backend_ids` constants keeps the
+    vocabulary single-sourced and fails loud on anything unknown.
+    """
+    if backend == DOCLING_STANDARD:
+        return await extract_pdf(
+            record, store, reextract=reextract, model_cache_dir=model_cache_dir
+        )
+    if backend == MINERU:
+        return await extract_mineru(
+            record, store, reextract=reextract, model_cache_dir=model_cache_dir
+        )
+    raise BackendNotApplicableError(
+        doi=record.doi,
+        backend=backend,
+        format=record.format.value,
+        valid_backends=list(PDF_BACKEND_IDS),
+        hint=f'unknown PDF backend {backend!r}; valid ids: {", ".join(PDF_BACKEND_IDS)}',
+    )
+
+
+def _reject_backend_on_non_pdf(*, record: AcquisitionRecord, backend: str) -> None:
+    """Fail loud when a backend was explicitly chosen for a non-PDF artifact.
+
+    The default backend means "unset" — an XML artifact extracted without a
+    ``--backend`` flag must not trip this. Only an *explicit* non-default
+    choice is the operator-configuration error.
+    """
+    if backend != DEFAULT_PDF_BACKEND:
+        raise BackendNotApplicableError(
+            doi=record.doi,
+            backend=backend,
+            format=record.format.value,
+            hint=(
+                f'--backend selects a PDF parser, but this artifact is '
+                f'{record.format.value}; drop --backend for XML formats'
+            ),
+        )
