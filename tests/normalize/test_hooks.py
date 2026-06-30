@@ -127,6 +127,7 @@ def _docling_document() -> Document:
                 page=2,
                 bbox=BBox(x0=72.0, y0=100.0, x1=540.0, y1=130.0),
                 page_char_range=CharRange(start=0, end=12),
+                geometry_fidelity='exact',
             ),
         ),
         EquationBlock(

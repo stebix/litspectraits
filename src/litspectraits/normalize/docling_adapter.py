@@ -442,9 +442,7 @@ def _table_cell_to_attrs(cell: Any) -> TableCell:
 # ---------------------------------------------------------------------------
 
 
-def _picture_to_figure_block(
-    item: Any, *, doc: Any, section_path: tuple[str, ...]
-) -> FigureBlock:
+def _picture_to_figure_block(item: Any, *, doc: Any, section_path: tuple[str, ...]) -> FigureBlock:
     return FigureBlock(
         id=item.self_ref,
         label=None,  # same reasoning as TableBlock.label.
@@ -599,6 +597,10 @@ def _provenance_from(item: Any) -> Provenance:
         page=int(primary.page_no),
         bbox=bbox,
         page_char_range=page_char_range,
+        # docling reads the deterministic PDF text-layer geometry, so its
+        # bbox is exact (docs/mineru-backend-spec.md §2.2). docling-vlm,
+        # when wired, will stamp 'approximate' here instead.
+        geometry_fidelity='exact',
     )
 
 

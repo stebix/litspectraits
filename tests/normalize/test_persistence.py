@@ -155,7 +155,10 @@ def _make_docling_document_with_equation() -> Document:
             ),
         ),
         provenance=Provenance(
-            route='docling', page=2, bbox=BBox(x0=10.0, y0=20.0, x1=110.0, y1=80.0)
+            route='docling',
+            page=2,
+            bbox=BBox(x0=10.0, y0=20.0, x1=110.0, y1=80.0),
+            geometry_fidelity='exact',
         ),
         section_path=('Methods',),
     )

@@ -251,6 +251,7 @@ def _docling_document_with_one_table() -> Any:
             page=1,
             bbox=BBox(x0=10.0, y0=20.0, x1=110.0, y1=80.0),
             page_char_range=None,
+            geometry_fidelity='exact',
         ),
         section_path=('Methods',),
     )

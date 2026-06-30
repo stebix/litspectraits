@@ -54,6 +54,7 @@ def _docling_prov(page: int = 1) -> Provenance:
         page=page,
         bbox=BBox(x0=50.0, y0=60.0, x1=500.0, y1=80.0),
         page_char_range=CharRange(start=0, end=10),
+        geometry_fidelity='exact',
     )
 
 
@@ -492,6 +493,7 @@ def _golden_docling() -> Document:
             page=3,
             bbox=BBox(x0=50.0, y0=60.0, x1=500.0, y1=80.0),
             page_char_range=CharRange(start=0, end=34),
+            geometry_fidelity='exact',
         ),
         section_path=('Methods', 'MRI'),
         inline_refs=(InlineRef(char_range=CharRange(20, 24), surface_form='[12]'),),
@@ -511,6 +513,7 @@ def _golden_docling() -> Document:
             page=4,
             bbox=BBox(x0=40.0, y0=100.0, x1=520.0, y1=300.0),
             page_char_range=CharRange(start=0, end=10),
+            geometry_fidelity='exact',
         ),
         section_path=('Methods',),
     )
@@ -524,6 +527,7 @@ def _golden_docling() -> Document:
             page=5,
             bbox=BBox(x0=60.0, y0=200.0, x1=300.0, y1=220.0),
             page_char_range=CharRange(start=0, end=11),
+            geometry_fidelity='exact',
         ),
         section_path=('Methods',),
     )
