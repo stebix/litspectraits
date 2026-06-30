@@ -468,6 +468,8 @@ async def test_happy_path_writes_document_and_meta_with_expected_counts(
     # meta.json carries the extraction stats + pipeline knobs.
     meta = json.loads(meta_path.read_text())
     assert meta['extractor'] == Extractor.DOCLING.value
+    # The pluggable-backend discriminator that normalize dispatches on.
+    assert meta['backend_id'] == 'docling-standard'
     assert meta['source_sha256'] == record.sha256
     assert meta['format'] == Format.PDF.value
     assert meta['n_pages'] == 4

@@ -254,6 +254,8 @@ def test_meta_records_all_required_fields(store: ArtifactStore, upstream_meta_pa
 
     assert meta.source_artifact_sha == _FAKE_ARTIFACT_SHA
     assert meta.route == 'jats'
+    # XML extractor meta carries no backend_id -> None (no pluggable parser).
+    assert meta.backend_id is None
     assert meta.normaliser_version == NORMALIZER_VERSION
     assert meta.whitespace_rule == WHITESPACE_RULE
     assert meta.source_extractor_meta_sha == file_sha256(upstream_meta_path)
@@ -261,6 +263,37 @@ def test_meta_records_all_required_fields(store: ArtifactStore, upstream_meta_pa
     assert meta.normalized_at.tzinfo is not None
     assert meta.schema_name == META_SCHEMA_NAME
     assert meta.schema_version == META_SCHEMA_VERSION
+
+
+def test_backend_id_carries_through_from_pdf_extract_meta(store: ArtifactStore) -> None:
+    """A PDF extract meta's ``backend_id`` propagates into the NormalizedMeta.
+
+    This is the extract -> normalize seam from
+    ``docs/mineru-backend-spec.md`` §2.5: the backend that produced
+    ``document.json`` is recorded on the normalised sidecar, not re-derived.
+    """
+    target_dir = store.document_dir(_FAKE_ARTIFACT_SHA)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    pdf_meta = {
+        'extractor': 'docling',
+        'backend_id': 'docling-standard',
+        'format': 'pdf',
+        'source_sha256': _FAKE_ARTIFACT_SHA,
+        'pipeline': {'table_mode': 'accurate'},
+    }
+    (target_dir / 'meta.json').write_text(
+        json.dumps(pdf_meta, indent=2, sort_keys=True) + '\n'
+    )
+
+    meta = commit_normalized_document(
+        doc=_make_docling_document_with_equation(),
+        doi=_FAKE_DOI,
+        source_artifact_sha=_FAKE_ARTIFACT_SHA,
+        store=store,
+    )
+
+    assert meta.route == 'docling'
+    assert meta.backend_id == 'docling-standard'
 
 
 def test_meta_route_matches_document_for_each_adapter(
@@ -478,6 +511,7 @@ def test_meta_dataclass_round_trips_through_cattrs(
     meta = NormalizedMeta(
         source_artifact_sha=_FAKE_ARTIFACT_SHA,
         route='jats',
+        backend_id=None,
         normaliser_version='1.0',
         whitespace_rule=WHITESPACE_RULE,
         source_extractor_meta_sha='deadbeef' * 8,

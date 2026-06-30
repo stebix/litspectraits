@@ -45,6 +45,7 @@ from litspectraits.errors import (
     SerializationError,
     WrongFormatForExtractorError,
 )
+from litspectraits.extract.backend_ids import DOCLING_STANDARD
 from litspectraits.manifest import AcquisitionRecord, Extractor, ExtractRecord, Format
 from litspectraits.store import ArtifactStore
 
@@ -828,6 +829,12 @@ def _build_meta(
     """
     return {
         'extractor': Extractor.DOCLING.value,
+        # The pluggable-backend discriminator (docs/mineru-backend-spec.md §1):
+        # flows extract -> normalize through meta.json so `normalize` selects the
+        # adapter matching the parser that produced document.json, without
+        # inferring a parser from Format. docling's text-layer pipeline is
+        # `docling-standard`; the MinerU backend stamps `mineru` here.
+        'backend_id': DOCLING_STANDARD,
         'extractor_version': f'{_DIST_NAME} {sdk.version}',
         'format': record.format.value,
         'source_sha256': record.sha256,

@@ -80,7 +80,10 @@ output bytes.
 """
 
 META_SCHEMA_NAME: Final = 'litspectraits-normalized-meta'
-META_SCHEMA_VERSION: Final = '1'
+# '2' adds `backend_id` (docs/mineru-backend-spec.md §2.5): the meta now
+# records which PDF backend produced the upstream document.json, carried
+# through from the extract meta. Bump on any NormalizedMeta field-set change.
+META_SCHEMA_VERSION: Final = '2'
 
 DOCUMENT_FILENAME: Final = 'document.json'
 META_FILENAME: Final = 'meta.json'
@@ -111,8 +114,16 @@ class NormalizedMeta:
         key under ``normalized/<sha256>/``.
     route : Route
         :class:`Document` route discriminator (``'jats'``, ``'elsevier'``,
-        or ``'docling'``). Mirrors :attr:`Document.route` so a reader
-        can dispatch without parsing ``document.json``.
+        ``'docling'``, or ``'mineru'``). Mirrors :attr:`Document.route` so a
+        reader can dispatch without parsing ``document.json``.
+    backend_id : str | None
+        The PDF backend that produced the upstream ``document.json``
+        (``'docling-standard'`` / ``'mineru'``), carried through from the
+        extract ``meta.json``'s ``backend_id`` field
+        (``docs/mineru-backend-spec.md`` §1, §2.5). ``None`` on XML routes,
+        which have no pluggable parser — ``route`` already fully identifies
+        them. This records which parser is behind a PDF-route Document
+        without re-reading the extract meta.
     normaliser_version : str
         :data:`NORMALIZER_VERSION` at the moment of commit. Lets a
         future "rebuild stale normalisations" sweep filter by version
@@ -141,6 +152,7 @@ class NormalizedMeta:
 
     source_artifact_sha: str
     route: Route
+    backend_id: str | None
     normaliser_version: str
     whitespace_rule: str
     source_extractor_meta_sha: str
@@ -229,11 +241,19 @@ def commit_normalized_document(
             f'run `litspectraits extract` for sha256={source_artifact_sha} first'
         )
     source_extractor_meta_sha = file_sha256(source_meta_path)
+    # The PDF backend that produced the upstream document.json, recorded for
+    # provenance (docs/mineru-backend-spec.md §2.5). XML extractor metas carry
+    # no `backend_id` -> None; the route already identifies them. The fail-loud
+    # check that a PDF route *must* have a backend_id lives at the normalize
+    # dispatch seam (where backend_id is load-bearing), not here.
+    upstream_meta = json.loads(source_meta_path.read_text(encoding='utf-8'))
+    backend_id = upstream_meta.get('backend_id')
 
     normalized_at = datetime.now(tz=UTC)
     meta = NormalizedMeta(
         source_artifact_sha=source_artifact_sha,
         route=doc.route,
+        backend_id=backend_id,
         normaliser_version=NORMALIZER_VERSION,
         whitespace_rule=WHITESPACE_RULE,
         source_extractor_meta_sha=source_extractor_meta_sha,
