@@ -653,9 +653,7 @@ def _plant_extraction(
     (doc_dir / 'meta.json').write_text(json.dumps(meta), encoding='utf-8')
 
 
-def test_show_extraction_row_reflects_extractor_version(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_show_extraction_row_reflects_extractor_version(runner: CliRunner, tmp_path: Path) -> None:
     """Regression: the extraction row shows the real version, not '?'.
 
     The extract meta keys the version under ``extractor_version`` (it has no
@@ -1117,6 +1115,18 @@ def test_extract_backend_flag_threads_through_dispatch(
     assert kwargs['backend'] == 'mineru'
     # The chosen backend is surfaced in the panel's `backend` row.
     assert 'mineru' in result.stdout
+
+
+def test_extract_invalid_backend_rejected_at_parse_time(runner: CliRunner) -> None:
+    """An unwired --backend id is a click usage error, before target resolution.
+
+    Exit 2 matches the dispatch-level ``BackendNotApplicableError`` code but
+    fires earlier — no DOI/sha need exist locally — and lists the wired ids.
+    """
+    result = runner.invoke(app, ['extract', '--backend', 'banana', '10.1002/never.ingested'])
+    assert result.exit_code == 2
+    assert 'docling-standard' in result.stderr
+    assert 'mineru' in result.stderr
 
 
 # ---------------------------------------------------------------------------

@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
 
 import attrs
+import click
 import dotenv
 import typer
 from rich.console import Console
@@ -98,7 +99,12 @@ from litspectraits.errors import (
     WrongFormatForExtractorError,
 )
 from litspectraits.extract import extract as run_extract
-from litspectraits.extract.backend_ids import DEFAULT_PDF_BACKEND, DOCLING_STANDARD, MINERU
+from litspectraits.extract.backend_ids import (
+    DEFAULT_PDF_BACKEND,
+    DOCLING_STANDARD,
+    MINERU,
+    PDF_BACKEND_IDS,
+)
 from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, converter
@@ -769,10 +775,12 @@ def cmd_extract(
         DEFAULT_PDF_BACKEND,
         '--backend',
         envvar='LITSPECTRAITS_PDF_BACKEND',
+        click_type=click.Choice(PDF_BACKEND_IDS),
         help=(
-            'PDF parsing backend: `docling-standard` (default; text-layer, exact '
-            'geometry) or `mineru`. Ignored on XML artifacts — a non-default value '
-            'there is a loud error. Overridable via LITSPECTRAITS_PDF_BACKEND.'
+            'PDF parsing backend (default docling-standard: text-layer, exact '
+            'geometry). Ignored on XML artifacts — a non-default value there is a '
+            'loud error. Also settable via LITSPECTRAITS_PDF_BACKEND. An unwired '
+            'id is rejected here at parse time.'
         ),
     ),
     reextract: bool = typer.Option(
