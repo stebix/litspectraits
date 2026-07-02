@@ -677,6 +677,30 @@ def test_show_extraction_row_reflects_extractor_version(
     assert 'docling ?' not in result.stdout
 
 
+def test_show_extraction_row_reflects_backend_id(runner: CliRunner, tmp_path: Path) -> None:
+    """The extraction row surfaces the specific backend id, not just the tool.
+
+    ``backend_id`` is what ``normalize`` dispatches on and (for a future
+    docling-vlm) can differ from the coarse ``extractor`` enum value.
+    """
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _plant_extraction(
+        record,
+        store=store,
+        meta={
+            'extractor': 'mineru',
+            'extractor_version': 'mineru 3.4.0',
+            'backend_id': 'mineru',
+        },
+    )
+
+    result = runner.invoke(app, ['show', record.doi])
+    assert result.exit_code == 0
+    assert 'mineru 3.4.0' in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
@@ -1013,6 +1037,8 @@ def test_extract_text_mode_renders_record_panel(
     assert record.doi in result.stdout
     assert extract_record.sha256 in result.stdout
     assert Extractor.DOCLING.value in result.stdout
+    # The resolved backend id is surfaced as its own row (default here).
+    assert 'docling-standard' in result.stdout
     # Comma-formatted counts (matches the `{n:,}` rendering).
     assert '38,421' in result.stdout
 
@@ -1029,10 +1055,13 @@ def test_extract_json_mode_emits_machine_readable_payload(
     result = runner.invoke(app, ['extract', '--json', record.doi])
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    # DOI is injected at the top level (parity with `ingest --json`).
+    # DOI + backend_id are injected at the top level (parity with `ingest --json`);
+    # backend_id is the resolved PDF backend, defaulting to docling-standard.
     assert payload['doi'] == record.doi
-    # Stripping the injected DOI must leave a clean ExtractRecord payload.
+    assert payload['backend_id'] == 'docling-standard'
+    # Stripping the injected keys must leave a clean ExtractRecord payload.
     payload.pop('doi')
+    payload.pop('backend_id')
     assert converter.structure(payload, ExtractRecord) == extract_record
 
 
@@ -1086,6 +1115,8 @@ def test_extract_backend_flag_threads_through_dispatch(
     kwargs = captured['kwargs']
     assert isinstance(kwargs, dict)
     assert kwargs['backend'] == 'mineru'
+    # The chosen backend is surfaced in the panel's `backend` row.
+    assert 'mineru' in result.stdout
 
 
 # ---------------------------------------------------------------------------

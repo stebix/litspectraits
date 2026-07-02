@@ -828,10 +828,10 @@ async def _run_extract(
         raise typer.Exit(_EXTRACT_EXIT_CODES.get(type(exc), 1)) from exc
 
     if json_output:
-        _emit_extract_record_json(record=record, extract_record=extract_record)
+        _emit_extract_record_json(record=record, extract_record=extract_record, backend=backend)
     else:
         _render_extract_record_panel(
-            record=record, extract_record=extract_record, console=out_console
+            record=record, extract_record=extract_record, backend=backend, console=out_console
         )
 
 
@@ -864,14 +864,28 @@ def _resolve_extract_target(
     return record
 
 
-def _emit_extract_record_json(*, record: AcquisitionRecord, extract_record: ExtractRecord) -> None:
-    """Print the ExtractRecord as JSON on stdout, with DOI injected.
+def _emit_extract_record_json(
+    *, record: AcquisitionRecord, extract_record: ExtractRecord, backend: str
+) -> None:
+    """Print the ExtractRecord as JSON on stdout, with DOI + backend injected.
 
     The on-disk :class:`ExtractRecord` is keyed by sha (to align with
     ``documents/sha256/<aa>/<sha>/``); injecting ``doi`` at the top level keeps
     operator workflows that pipe ``--json`` through ``jq`` self-contained.
+
+    ``backend_id`` is the resolved PDF-backend id this extraction ran under
+    (``docling-standard`` / ``mineru``) — the same value written to the
+    extract ``meta.json`` that ``normalize`` later dispatches on. It is not
+    a field of :class:`ExtractRecord` (whose coarse ``extractor`` enum does
+    not distinguish e.g. docling-standard from a future docling-vlm), so a
+    ``--json`` consumer sees which parser produced the document only if we
+    surface it here (``docs/mineru-backend-spec.md`` §1, §8).
     """
-    payload = {'doi': record.doi, **converter.unstructure(extract_record)}
+    payload = {
+        'doi': record.doi,
+        'backend_id': backend,
+        **converter.unstructure(extract_record),
+    }
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
@@ -879,6 +893,7 @@ def _render_extract_record_panel(
     *,
     record: AcquisitionRecord,
     extract_record: ExtractRecord,
+    backend: str,
     console: Console,
 ) -> None:
     table = Table(title=f'extracted — {record.doi}', show_header=False, expand=False)
@@ -887,6 +902,9 @@ def _render_extract_record_panel(
     table.add_row('doi', record.doi)
     table.add_row('sha256', extract_record.sha256)
     table.add_row('extractor', extract_record.extractor.value)
+    # The specific backend id (``docling-standard`` / ``mineru``) — finer than
+    # the coarse ``extractor`` enum and the seam ``normalize`` dispatches on.
+    table.add_row('backend', backend)
     table.add_row('version', extract_record.extractor_version)
     table.add_row('extracted_at', extract_record.extracted_at.isoformat())
     table.add_row('n_text_blocks', f'{extract_record.n_text_blocks:,}')
@@ -1470,7 +1488,14 @@ def _brief_extractor(meta_path: Path) -> str:
     # the extract meta has no bare ``version`` key, so the old lookup always
     # rendered '?'. Fall back to the coarse ``extractor`` enum value, then '?',
     # so a partial meta still renders something legible.
-    return str(meta.get('extractor_version') or meta.get('extractor') or '?')
+    version = meta.get('extractor_version') or meta.get('extractor') or '?'
+    # ``backend_id`` is the specific PDF backend (``docling-standard`` /
+    # ``mineru``) — finer than ``extractor`` and the seam ``normalize``
+    # dispatches on. Absent on pre-backend_id extractions and on XML metas.
+    backend_id = meta.get('backend_id')
+    if backend_id:
+        return f'{backend_id}, {version}'
+    return str(version)
 
 
 def _render_invalid_doi(exc: InvalidDOIError, *, console: Console) -> None:
