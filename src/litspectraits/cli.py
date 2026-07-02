@@ -647,6 +647,10 @@ class _CatalogArtifact(TypedDict):
     sha256: str
     extracted: bool
     normalized: bool
+    # The PDF backend that produced the extraction (``docling-standard`` /
+    # ``mineru``); ``None`` when not extracted, an XML artifact, or a
+    # pre-backend_id extraction. Read from the extract ``meta.json``.
+    backend: str | None
 
 
 class _CatalogRow(TypedDict):
@@ -689,6 +693,7 @@ def _catalog_row(entry: DOIIndexEntry, *, store: ArtifactStore) -> _CatalogRow:
             'sha256': sha,
             'extracted': (store.document_dir(sha) / 'document.json').is_file(),
             'normalized': (store.normalized_dir(sha) / 'document.json').is_file(),
+            'backend': _artifact_backend(store=store, sha256=sha),
         }
         for fmt, sha in sorted(entry.formats.items(), key=lambda item: item[0].value)
     ]
@@ -702,6 +707,42 @@ def _catalog_row(entry: DOIIndexEntry, *, store: ArtifactStore) -> _CatalogRow:
         ),
         'artifacts': artifacts,
     }
+
+
+def _artifact_backend(*, store: ArtifactStore, sha256: str) -> str | None:
+    """Read ``backend_id`` from an artifact's extract ``meta.json``, if any.
+
+    Returns ``None`` when the artifact is not extracted, its meta is missing /
+    unreadable, or the meta carries no string ``backend_id`` (XML metas,
+    pre-backend_id extractions). A damaged store must not abort the whole
+    listing — ``list`` is the tool an operator reaches for to *diagnose* one —
+    so any read error degrades to ``None`` rather than raising.
+    """
+    meta_path = store.document_dir(sha256) / 'meta.json'
+    try:
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    except OSError, ValueError:
+        return None
+    backend_id = meta.get('backend_id')
+    return backend_id if isinstance(backend_id, str) else None
+
+
+def _extracted_cell(artifacts: list[_CatalogArtifact]) -> str:
+    """The 'extracted' status cell, annotated with the PDF backend when known.
+
+    A DOI holds at most one PDF artifact (one sha per format), so when that
+    PDF is extracted we suffix its backend id — the discriminator ``list``
+    otherwise hides. XML-only rows and un-extracted PDFs render the bare
+    ✓/✗/``n/total`` status; the full per-artifact breakdown is in ``--json``.
+    """
+    status = _aggregate_status(artifacts, key='extracted')
+    backend = next(
+        (a['backend'] for a in artifacts if a['format'] == Format.PDF.value and a['backend']),
+        None,
+    )
+    if backend is None:
+        return status
+    return f'{status} [dim]{backend}[/dim]'
 
 
 def _render_catalog_table(rows: list[_CatalogRow], *, console: Console) -> None:
@@ -724,7 +765,7 @@ def _render_catalog_table(rows: list[_CatalogRow], *, console: Console) -> None:
             str(year) if year is not None else '-',
             row['publisher'],
             ', '.join(artifact['format'] for artifact in artifacts),
-            _aggregate_status(artifacts, key='extracted'),
+            _extracted_cell(artifacts),
             _aggregate_status(artifacts, key='normalized'),
         )
     console.print(table)

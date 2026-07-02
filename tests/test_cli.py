@@ -1610,7 +1610,14 @@ def test_list_json_mode_emits_catalog_with_artifact_status(
     assert row['year'] == 2024
     assert row['publisher'] == 'wiley'
     assert row['artifacts'] == [
-        {'format': 'pdf', 'sha256': sha, 'extracted': True, 'normalized': False}
+        {
+            'format': 'pdf',
+            'sha256': sha,
+            'extracted': True,
+            'normalized': False,
+            # No meta.json was planted, so the backend is unknown.
+            'backend': None,
+        }
     ]
 
 
@@ -1636,6 +1643,29 @@ def test_list_json_dual_format_reports_per_artifact(runner: CliRunner, tmp_path:
     assert set(artifacts) == {'pdf', 'jats_xml'}
     assert artifacts['pdf']['extracted'] is True
     assert artifacts['jats_xml']['extracted'] is False
+
+
+def test_list_reflects_pdf_backend_in_json_and_table(runner: CliRunner, tmp_path: Path) -> None:
+    """The PDF backend id shows in `list --json` and the table's extracted cell."""
+    store = ArtifactStore(tmp_path)
+    sha = 'a' * 64
+    record = _catalog_record(doi='10.1002/beta', sha=sha, title='Beta paper')
+    _plant_record(record, store=store)
+    _plant_extraction(
+        record,
+        store=store,
+        meta={'extractor': 'mineru', 'extractor_version': 'mineru 3.4.0', 'backend_id': 'mineru'},
+    )
+
+    json_result = runner.invoke(app, ['list', '--json'])
+    assert json_result.exit_code == 0, json_result.stderr
+    artifact = json.loads(json_result.stdout)[0]['artifacts'][0]
+    assert artifact['backend'] == 'mineru'
+
+    table_result = runner.invoke(app, ['list'])
+    assert table_result.exit_code == 0, table_result.stderr
+    # The backend is folded into the extracted cell.
+    assert 'mineru' in table_result.stdout
 
 
 def test_list_empty_store_text_mode_exits_0_with_hint(runner: CliRunner) -> None:
