@@ -48,7 +48,7 @@ The v3 ingest stack is being rebuilt — `uv run` is the only thing that works t
 
 ```
 litspectraits ingest        <doi> [--cache-hit-ok]
-litspectraits extract       <doi-or-sha> [--reextract]
+litspectraits extract       <doi-or-sha> [--backend docling-standard|mineru] [--reextract]
 litspectraits normalize     <doi-or-sha> [--renormalize]
 litspectraits show-document <doi-or-sha> [--out <path>] [--open]
 litspectraits diff-routes   [--doi <doi>...] [--out <path>] [--compare-to <prev-report>]
