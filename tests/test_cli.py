@@ -638,6 +638,45 @@ def test_show_invalid_doi_exits_2(runner: CliRunner) -> None:
     assert 'Invalid DOI' in result.stderr
 
 
+def _plant_extraction(
+    record: AcquisitionRecord, *, store: ArtifactStore, meta: dict[str, object]
+) -> None:
+    """Plant a minimal ``document.json`` + ``meta.json`` for ``record``.
+
+    Enough for the ``show`` / ``list`` extraction probes to fire; the bytes
+    are irrelevant (the CLI never parses them, only checks existence and
+    reads a handful of meta keys).
+    """
+    doc_dir = store.document_dir(record.sha256)
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    (doc_dir / 'document.json').write_text('{}', encoding='utf-8')
+    (doc_dir / 'meta.json').write_text(json.dumps(meta), encoding='utf-8')
+
+
+def test_show_extraction_row_reflects_extractor_version(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Regression: the extraction row shows the real version, not '?'.
+
+    The extract meta keys the version under ``extractor_version`` (it has no
+    bare ``version`` key), so the old ``meta.get('version')`` lookup always
+    rendered ``extracted (docling ?)``.
+    """
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _plant_extraction(
+        record,
+        store=store,
+        meta={'extractor': 'docling', 'extractor_version': 'docling 2.0.0'},
+    )
+
+    result = runner.invoke(app, ['show', record.doi])
+    assert result.exit_code == 0
+    assert 'docling 2.0.0' in result.stdout
+    assert 'docling ?' not in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------

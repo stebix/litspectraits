@@ -1466,9 +1466,11 @@ def _brief_extractor(meta_path: Path) -> str:
         meta = json.loads(meta_path.read_text(encoding='utf-8'))
     except OSError, ValueError:
         return 'meta unreadable'
-    name = meta.get('extractor', '?')
-    version = meta.get('version', '?')
-    return f'{name} {version}'
+    # ``extractor_version`` already carries the dist name (e.g. 'docling 2.0.0');
+    # the extract meta has no bare ``version`` key, so the old lookup always
+    # rendered '?'. Fall back to the coarse ``extractor`` enum value, then '?',
+    # so a partial meta still renders something legible.
+    return str(meta.get('extractor_version') or meta.get('extractor') or '?')
 
 
 def _render_invalid_doi(exc: InvalidDOIError, *, console: Console) -> None:
