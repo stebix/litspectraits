@@ -441,7 +441,11 @@ class Completeness:
     has_structured_refs: bool
     has_inline_ref_ids: bool
     has_equations: bool
-    table_source: Literal['publisher', 'tableformer']
+    # 'publisher' — table structure from XML markup (exact); 'tableformer' —
+    # docling's table model; 'mineru' — MinerU's table model (parsed from its
+    # HTML output). All three are "where the cell grid came from"; only
+    # 'publisher' is markup-exact (docs/mineru-backend-spec.md §2, §4).
+    table_source: Literal['publisher', 'tableformer', 'mineru']
 
 
 @frozen

@@ -120,9 +120,7 @@ def install_retriever(
 
     def _fake_retriever_for(publisher: Publisher) -> _FakeRetriever:
         if publisher not in registry:
-            raise AssertionError(
-                f'no fake retriever registered for {publisher.value!r}'
-            )
+            raise AssertionError(f'no fake retriever registered for {publisher.value!r}')
         return registry[publisher]
 
     monkeypatch.setattr('litspectraits.doctor.retriever_for', _fake_retriever_for)
@@ -140,9 +138,7 @@ def _mock_ipify(respx_mock: MockRouter, *, ip: str = '203.0.113.5') -> None:
 
 
 @pytest.fixture(autouse=True)
-def mute_extract_section(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def mute_extract_section(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Default-mute the extract section for the existing IP/cred tests.
 
     These tests pre-date the §8 extract section and only assert on IP +
@@ -672,13 +668,50 @@ def _ok_extract_components(*, with_smoke: bool = False) -> tuple[ExtractComponen
     return tuple(components)
 
 
+def _install_fake_mineru_models(
+    monkeypatch: pytest.MonkeyPatch, *, vlm: str = '', pipeline: str = ''
+) -> None:
+    """Inject a fake ``get_local_models_dir`` so the MinerU model probe is deterministic.
+
+    The reframe makes the **vlm** weight family a *required* component
+    (``docs/mineru-primary-promotion.md`` §4), so a section-level test that
+    left the probe reading the real machine cache would pass or fail on
+    whatever weights happen to be present locally. Injecting the resolver
+    pins the (vlm, pipeline) roots explicitly — a populated dir string for
+    "present", ``''`` for "missing".
+    """
+    import sys
+    import types
+
+    fake = types.ModuleType('mineru.utils.models_download_utils')
+    fake.get_local_models_dir = lambda: {'vlm': vlm, 'pipeline': pipeline}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'mineru.utils.models_download_utils', fake)
+
+
+def _populated_dir(base: Path, name: str) -> str:
+    """Make a non-empty dir under ``base`` and return its path string.
+
+    ``_model_dir_present`` treats "exists and non-empty" as present, so a
+    single sentinel file is enough to make the MinerU model probe report OK.
+    """
+    d = base / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'weights').write_bytes(b'.')
+    return str(d)
+
+
 def test_check_docling_extra_returns_ok_when_importable() -> None:
-    """The dev venv has ``[extract]`` installed; probe must report OK."""
+    """The dev venv has ``[extract]`` installed; probe reports OK but optional.
+
+    docling is the opt-in alternative backend now, so an installed docling is
+    OK yet ``is_required=False`` — its presence or absence never flips the
+    exit code (``docs/mineru-primary-promotion.md`` §4).
+    """
     from litspectraits.doctor import _check_docling_extra
 
     row = _check_docling_extra()
     assert row.status is ExtractStatus.OK
-    assert row.is_required is True
+    assert row.is_required is False
     assert row.detail.startswith('docling ')
 
 
@@ -705,7 +738,12 @@ def test_check_docling_extra_returns_not_installed_when_import_fails(
 def test_check_docling_models_missing_when_cache_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Empty model cache surfaces all three required rows as MISSING."""
+    """Empty docling cache surfaces all three rows as MISSING but informational.
+
+    docling dropped to the opt-in alternative in the promotion, so its model
+    rows are ``is_required=False`` — a missing docling cache is reported but
+    never flips the exit code.
+    """
     from litspectraits.doctor import _check_docling_models
 
     monkeypatch.setattr(
@@ -720,7 +758,7 @@ def test_check_docling_models_missing_when_cache_empty(
     rows = _check_docling_models(model_cache_dir=None)
     assert len(rows) == 3
     assert all(row.status is ExtractStatus.MISSING for row in rows)
-    assert all(row.is_required for row in rows)
+    assert not any(row.is_required for row in rows)
     assert any('--download-models' in row.detail for row in rows)
 
 
@@ -811,21 +849,177 @@ def test_check_ocr_engines_is_always_off() -> None:
     assert row.required == 'no'
 
 
-@pytest.mark.extract_real
-async def test_check_extract_section_short_circuits_when_extra_missing(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No ``[extract]`` extra → single row; ``has_required_failure`` stays False.
+def test_check_mineru_extra_missing_when_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``[mineru]`` extra → MISSING + required (primary backend, flips exit).
 
-    Pins the §8 exit-code policy verbatim: "exit 0 if the extra is not
-    installed; the section is rendered as a single greyed row noting
-    the install hint, exit code unaffected."
+    Inverse of the old posture: MinerU is the primary PDF backend now, so its
+    absence is a real gap, and since it rides in ``[extract]`` the hint points
+    there (``docs/mineru-primary-promotion.md`` §4).
+    """
+    import sys
+
+    from litspectraits.doctor import _check_mineru_extra
+
+    monkeypatch.setitem(sys.modules, 'mineru', None)
+    row = _check_mineru_extra()
+    assert row.status is ExtractStatus.MISSING
+    assert row.is_required is True
+    assert 'uv sync --extra extract' in row.detail
+
+
+def test_check_mineru_extra_ok_when_installed() -> None:
+    """MinerU is installed in this environment → OK, and required (primary)."""
+    from litspectraits.doctor import _check_mineru_extra
+
+    row = _check_mineru_extra()
+    assert row.status is ExtractStatus.OK
+    assert row.detail.startswith('mineru ')
+    assert row.is_required is True
+
+
+def test_check_mineru_models_ok_when_configured_root_populated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured, non-empty pipeline model root → OK (non-downloading probe)."""
+    import sys
+    import types
+
+    from litspectraits.doctor import _check_mineru_models
+
+    root = tmp_path / 'mineru-models'
+    root.mkdir()
+    (root / 'weights.onnx').write_bytes(b'fake')
+
+    fake_utils = types.ModuleType('mineru.utils.models_download_utils')
+    fake_utils.get_local_models_dir = lambda: {'pipeline': str(root), 'vlm': ''}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'mineru.utils.models_download_utils', fake_utils)
+
+    row = _check_mineru_models(kind='pipeline')
+    assert row.status is ExtractStatus.OK
+    assert str(root) in row.detail
+    assert row.is_required is False
+
+
+def test_check_mineru_models_missing_when_root_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured root that is empty / absent → MISSING with a download hint."""
+    import sys
+    import types
+
+    from litspectraits.doctor import _check_mineru_models
+
+    fake_utils = types.ModuleType('mineru.utils.models_download_utils')
+    fake_utils.get_local_models_dir = lambda: {'pipeline': '', 'vlm': ''}  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, 'mineru.utils.models_download_utils', fake_utils)
+
+    row = _check_mineru_models(kind='pipeline')
+    assert row.status is ExtractStatus.MISSING
+    assert '--download-models' in row.detail
+    assert row.is_required is False
+
+
+def test_check_mineru_models_off_when_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``[mineru]`` extra → OFF row (cannot import the probe helper)."""
+    import sys
+
+    from litspectraits.doctor import _check_mineru_models
+
+    monkeypatch.setitem(sys.modules, 'mineru', None)
+    monkeypatch.setitem(sys.modules, 'mineru.utils.models_download_utils', None)
+    row = _check_mineru_models(kind='pipeline')
+    assert row.status is ExtractStatus.OFF
+    assert row.is_required is False
+
+
+def test_check_mineru_models_vlm_kind_reads_vlm_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``kind='vlm'`` reads the ``vlm`` entry, independently of ``pipeline``.
+
+    vlm-engine / hybrid-engine need the vlm weight family; a populated
+    pipeline cache alone must not make this row report OK.
+    """
+    import sys
+    import types
+
+    from litspectraits.doctor import _check_mineru_models
+
+    vlm_root = tmp_path / 'mineru-vlm'
+    vlm_root.mkdir()
+    (vlm_root / 'weights.safetensors').write_bytes(b'fake')
+
+    fake_utils = types.ModuleType('mineru.utils.models_download_utils')
+    fake_utils.get_local_models_dir = lambda: {  # type: ignore[attr-defined]
+        'pipeline': '',
+        'vlm': str(vlm_root),
+    }
+    monkeypatch.setitem(sys.modules, 'mineru.utils.models_download_utils', fake_utils)
+
+    vlm_row = _check_mineru_models(kind='vlm')
+    assert vlm_row.status is ExtractStatus.OK
+    assert str(vlm_root) in vlm_row.detail
+    # vlm backs the default engine → required; pipeline is opt-in →
+    # informational (``docs/mineru-primary-promotion.md`` §4).
+    assert vlm_row.is_required is True
+
+    pipeline_row = _check_mineru_models(kind='pipeline')
+    assert pipeline_row.status is ExtractStatus.MISSING
+    assert pipeline_row.is_required is False
+
+
+def test_maybe_download_mineru_models_pulls_both_weight_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both ``download_pipeline_models`` and ``download_vlm_models`` are invoked.
+
+    ``hybrid-engine`` needs pipeline's layout/OCR weights *and* vlm's
+    formula/table weights, so ``--download-models`` must not stop at one —
+    fully stubbed so this test never touches the network.
+    """
+    import sys
+    import types
+
+    from litspectraits.doctor import _maybe_download_mineru_models
+
+    calls: list[tuple[str, str]] = []
+    fake_module = types.ModuleType('mineru.cli.models_download')
+    fake_module.download_pipeline_models = lambda source: calls.append(  # type: ignore[attr-defined]
+        ('pipeline', source)
+    )
+    fake_module.download_vlm_models = lambda source: calls.append(  # type: ignore[attr-defined]
+        ('vlm', source)
+    )
+    monkeypatch.setitem(sys.modules, 'mineru.cli.models_download', fake_module)
+    monkeypatch.delenv('MINERU_MODEL_SOURCE', raising=False)
+
+    _maybe_download_mineru_models()
+
+    assert calls == [('pipeline', 'huggingface'), ('vlm', 'huggingface')]
+
+
+@pytest.mark.extract_real
+async def test_check_extract_section_docling_absent_still_passes_on_mineru(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``[extract]`` docling extra → greyed row, but the MinerU path passes.
+
+    Pins the reframe (``docs/mineru-primary-promotion.md`` §4): docling is the
+    opt-in alternative, so an absent docling extra is healthy and never flips
+    the exit code, while a present ``[mineru]`` extra + vlm weights carry the
+    (now green) required path on their own. The MinerU model roots are stubbed
+    so the outcome doesn't depend on the machine's real weight cache.
     """
     import sys
 
     from litspectraits.doctor import _check_extract_section
 
     monkeypatch.setitem(sys.modules, 'docling', None)
+    _install_fake_mineru_models(
+        monkeypatch,
+        vlm=_populated_dir(tmp_path, 'vlm'),
+        pipeline=_populated_dir(tmp_path, 'pipeline'),
+    )
     report = await _check_extract_section(
         settings=settings,
         download_models=False,
@@ -833,24 +1027,35 @@ async def test_check_extract_section_short_circuits_when_extra_missing(
         fixture_path=None,
     )
     assert report.has_required_failure is False
-    assert len(report.components) == 1
-    assert report.components[0].component == 'docling[extract]'
-    assert report.components[0].status is ExtractStatus.NOT_INSTALLED
+    by_component = {row.component: row for row in report.components}
+    # docling row: greyed, opt-in, not a failure.
+    assert by_component['docling[extract]'].status is ExtractStatus.NOT_INSTALLED
+    assert by_component['docling[extract]'].is_required is False
+    # MinerU rows present and carrying the required path. The extra + vlm
+    # weights are required; the pipeline weights stay informational.
+    assert by_component['mineru'].status is ExtractStatus.OK
+    assert by_component['mineru'].is_required is True
+    assert by_component['mineru vlm weights'].is_required is True
+    assert by_component['mineru pipeline weights'].is_required is False
 
 
 @pytest.mark.extract_real
-async def test_check_extract_section_flags_required_failure_when_model_missing(
+async def test_check_extract_section_flags_required_failure_when_vlm_missing(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Extra installed + required model missing + no ``--download-models`` ⇒ fail.
+    """Missing **vlm** weights ⇒ required failure; missing docling models do not.
 
-    Pins the second leg of the §8 exit-code policy: "exit 1 if the
-    extra is installed AND a required model is missing AND
-    ``--download-models`` was not requested."
+    Pins the inverted exit-code policy after the promotion
+    (``docs/mineru-primary-promotion.md`` §4): the vlm weight family backs the
+    default engine and drives the failure, while docling's models — now the
+    opt-in alternative — are reported MISSING but informational, so they do not
+    independently flip the exit code.
     """
     from litspectraits.doctor import _check_extract_section
 
-    # Empty model cache.
+    # vlm weights absent (the required family); docling cache also empty (to
+    # prove its absence does *not* count).
+    _install_fake_mineru_models(monkeypatch, vlm='', pipeline='')
     monkeypatch.setattr(
         'litspectraits.doctor._docling_model_dirs',
         lambda **_: (
@@ -868,18 +1073,31 @@ async def test_check_extract_section_flags_required_failure_when_model_missing(
     )
     assert report.has_required_failure is True
     components = {row.component: row for row in report.components}
+    # The vlm row is the required MISSING that drives the failure.
+    assert components['mineru vlm weights'].status is ExtractStatus.MISSING
+    assert components['mineru vlm weights'].is_required is True
+    # docling models are MISSING but informational — they do not count.
     assert components['layout model'].status is ExtractStatus.MISSING
-    assert components['TableFormer'].status is ExtractStatus.MISSING
-    assert components['code-formula'].status is ExtractStatus.MISSING
+    assert components['layout model'].is_required is False
 
 
 @pytest.mark.extract_real
 async def test_check_extract_section_clears_when_models_present(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Populating the cache flips all required rows to OK; ``has_required_failure`` False."""
+    """Populated caches → all rows OK; ``has_required_failure`` False.
+
+    Both the required MinerU vlm cache and the (optional) docling cache are
+    populated; the MinerU roots are stubbed so the outcome doesn't depend on
+    the machine's real weights.
+    """
     from litspectraits.doctor import _check_extract_section
 
+    _install_fake_mineru_models(
+        monkeypatch,
+        vlm=_populated_dir(tmp_path, 'vlm'),
+        pipeline=_populated_dir(tmp_path, 'pipeline'),
+    )
     models_root = tmp_path / 'models'
     for folder in ('layout-folder', 'tableformer-folder', 'codeformula-folder'):
         d = models_root / folder
@@ -898,6 +1116,7 @@ async def test_check_extract_section_clears_when_models_present(
     )
     assert report.has_required_failure is False
     components = {row.component: row for row in report.components}
+    assert components['mineru vlm weights'].status is ExtractStatus.OK
     assert components['layout model'].status is ExtractStatus.OK
     assert components['TableFormer'].status is ExtractStatus.OK
     assert components['code-formula'].status is ExtractStatus.OK
@@ -911,10 +1130,20 @@ async def test_check_extract_section_runs_download_when_flagged(
 
     Stubs ``_maybe_download_models`` to populate the cache so the
     post-download presence check flips to OK without actually pulling
-    docling weights.
+    docling weights. Also stubs ``_maybe_download_mineru_models`` — the
+    mineru extra is installed in this environment (§7 probes it
+    unconditionally alongside docling), so leaving it unstubbed would make
+    this test perform a real, multi-GB MinerU weight download on every run.
     """
     from litspectraits.doctor import _check_extract_section
 
+    # vlm/pipeline weights resolve as present so the required gate is green
+    # without a real download; the mineru download helper is stubbed below.
+    _install_fake_mineru_models(
+        monkeypatch,
+        vlm=_populated_dir(tmp_path, 'vlm'),
+        pipeline=_populated_dir(tmp_path, 'pipeline'),
+    )
     models_root = tmp_path / 'models'
     model_folders = ('layout-folder', 'tableformer-folder', 'codeformula-folder')
     monkeypatch.setattr(
@@ -933,6 +1162,15 @@ async def test_check_extract_section_runs_download_when_flagged(
             (d / 'weights').write_bytes(b'fake')
 
     monkeypatch.setattr('litspectraits.doctor._maybe_download_models', _fake_download)
+    mineru_download_calls = 0
+
+    def _fake_mineru_download() -> None:
+        nonlocal mineru_download_calls
+        mineru_download_calls += 1
+
+    monkeypatch.setattr(
+        'litspectraits.doctor._maybe_download_mineru_models', _fake_mineru_download
+    )
 
     report = await _check_extract_section(
         settings=settings,
@@ -941,6 +1179,7 @@ async def test_check_extract_section_runs_download_when_flagged(
         fixture_path=None,
     )
     assert download_calls == [False]  # force=False per §8
+    assert mineru_download_calls == 1
     assert report.has_required_failure is False
 
 
@@ -948,37 +1187,34 @@ async def test_check_extract_section_runs_download_when_flagged(
 async def test_check_extract_section_runs_smoke_when_flagged(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``smoke_extract=True`` calls ``extract_pdf`` against the staged fixture.
+    """``smoke_extract=True`` runs ``extract_mineru`` (the default backend).
 
-    Stubs ``extract_pdf`` so we don't depend on docling models being
-    downloaded; asserts that the fixture flowed through ``ArtifactStore``
-    and that the resulting row is OK.
+    Stubs ``extract_mineru`` so we don't fire a real (GPU-heavy) vlm-engine
+    convert; asserts that the fixture flowed through ``ArtifactStore`` with the
+    default engine/effort and that the resulting row is OK. The MinerU model
+    roots are stubbed present so the required gate stays green.
     """
     from litspectraits.doctor import _check_extract_section
+    from litspectraits.extract.mineru import DEFAULT_MINERU_EFFORT, DEFAULT_MINERU_ENGINE
 
-    # Make models present so the required gate stays green.
-    models_root = tmp_path / 'models'
-    for folder in ('layout-folder', 'tableformer-folder', 'codeformula-folder'):
-        d = models_root / folder
-        d.mkdir(parents=True)
-        (d / 'weights').write_bytes(b'fake')
-    monkeypatch.setattr(
-        'litspectraits.doctor._docling_model_dirs',
-        lambda **_: (models_root, 'layout-folder', 'tableformer-folder', 'codeformula-folder'),
+    _install_fake_mineru_models(
+        monkeypatch,
+        vlm=_populated_dir(tmp_path, 'vlm'),
+        pipeline=_populated_dir(tmp_path, 'pipeline'),
     )
 
     fixture_path = tmp_path / 'synthetic.pdf'
     fixture_path.write_bytes(b'%PDF-1.4\n%fake bytes for smoke wiring')
 
-    called: list[str] = []
+    called: list[tuple[str, str, str]] = []
 
-    async def _fake_extract_pdf(
-        record, _store, *, reextract: bool, model_cache_dir: Path | None = None
+    async def _fake_extract_mineru(
+        record, _store, *, reextract: bool, engine: str, effort: str
     ) -> None:
-        called.append(record.doi)
-        del reextract, model_cache_dir
+        called.append((record.doi, engine, effort))
+        del reextract
 
-    monkeypatch.setattr('litspectraits.extract.pdf.extract_pdf', _fake_extract_pdf)
+    monkeypatch.setattr('litspectraits.extract.mineru.extract_mineru', _fake_extract_mineru)
 
     report = await _check_extract_section(
         settings=settings,
@@ -986,10 +1222,8 @@ async def test_check_extract_section_runs_smoke_when_flagged(
         smoke_extract=True,
         fixture_path=fixture_path,
     )
-    assert called == ['10.0/doctor-smoke']
-    smoke_row = next(
-        (row for row in report.components if row.component == 'smoke convert'), None
-    )
+    assert called == [('10.0/doctor-smoke', DEFAULT_MINERU_ENGINE, DEFAULT_MINERU_EFFORT)]
+    smoke_row = next((row for row in report.components if row.component == 'smoke convert'), None)
     assert smoke_row is not None
     assert smoke_row.status is ExtractStatus.OK
     assert smoke_row.detail.endswith('(synthetic.pdf)')
@@ -1006,6 +1240,11 @@ async def test_check_extract_section_smoke_missing_fixture_returns_missing_row(
     """
     from litspectraits.doctor import _check_extract_section
 
+    _install_fake_mineru_models(
+        monkeypatch,
+        vlm=_populated_dir(tmp_path, 'vlm'),
+        pipeline=_populated_dir(tmp_path, 'pipeline'),
+    )
     models_root = tmp_path / 'models'
     for folder in ('layout-folder', 'tableformer-folder', 'codeformula-folder'):
         d = models_root / folder
@@ -1022,9 +1261,7 @@ async def test_check_extract_section_smoke_missing_fixture_returns_missing_row(
         smoke_extract=True,
         fixture_path=tmp_path / 'does-not-exist.pdf',
     )
-    smoke_row = next(
-        (row for row in report.components if row.component == 'smoke convert'), None
-    )
+    smoke_row = next((row for row in report.components if row.component == 'smoke convert'), None)
     assert smoke_row is not None
     assert smoke_row.status is ExtractStatus.MISSING
     assert 'fixture not found' in smoke_row.detail

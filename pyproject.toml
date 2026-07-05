@@ -20,24 +20,34 @@ dependencies = [
 [project.optional-dependencies]
 wiley = ['wiley-tdm>=1.0']
 springer = ['springernature-api-client>=0.0.9']
-# torch / torchvision are pulled in transitively by docling-ibm-models, but
-# they are listed here explicitly so the `[tool.uv.sources]` pin to the
-# CUDA-12.6 wheel index takes effect — uv only honours `sources` for direct
-# dependencies. Version bounds mirror docling-ibm-models' own constraints.
-extract = ['docling>=2.0', 'torch>=2.2.2,<3', 'torchvision<1']
-# Second PDF backend (docs/mineru-backend-spec.md). Kept separate from
-# [extract]: MinerU pulls its own torch/torchvision-backed model stack.
-# `mineru[pipeline]` is required, not bare `mineru` — the bare package ships
-# only the CLI/`do_parse` shim with no model backend (no torch), so it imports
-# but cannot parse. The `pipeline` engine reads the PDF text layer (exact
-# geometry → `geometry_fidelity='exact'`, the spec's canonical target) and is
-# leaner than `[core]` (no gradio/vllm). The `vlm` engine is an additive
-# follow-on. Its `torch<3,>=2.6.0` co-resolves with docling's `torch>=2.2.2,<3`
-# under the CUDA-12.6 `[tool.uv.sources]` pin (verified: both share torch
-# 2.11+cu126). Declaring the extra does not install it.
-mineru = ['mineru[pipeline]>=2.0']
+# The default extraction install. As of the MinerU-primary promotion
+# (docs/mineru-primary-promotion.md §3) this pulls BOTH the primary MinerU
+# backend and the docling fallback, so `uv sync --extra extract` yields a
+# working default path — a bare `litspectraits extract <doi>` runs MinerU's
+# vlm-engine, and `--backend docling-standard` remains available. torch /
+# torchvision arrive transitively via docling-ibm-models and MinerU, but they
+# are listed explicitly so the `[tool.uv.sources]` pin to the CUDA-12.6 wheel
+# index takes effect — uv only honours `sources` for direct dependencies.
+# Version bounds mirror docling-ibm-models' own constraints.
+extract = ['docling>=2.0', 'torch>=2.2.2,<3', 'torchvision<1', 'mineru[pipeline,vlm]>=2.0']
+# Standalone MinerU — the same primary PDF backend as in `[extract]`, but
+# without docling, for a MinerU-only machine (the two backends are independent
+# extras). `mineru[pipeline]` is required, not bare `mineru` — the bare package
+# ships only the CLI/`do_parse` shim with no model backend (no torch), so it
+# imports but cannot parse. The `pipeline` engine reads the PDF text layer
+# (exact geometry → `geometry_fidelity='exact'`) and is leaner than `[core]`
+# (no gradio/vllm). `[vlm]` (transformers-backed inference) backs the default
+# --mineru-engine vlm-engine and hybrid-engine — deliberately not
+# `[vllm]`/`[lmdeploy]`, MinerU's faster-but-heavier serving engines;
+# `get_vlm_engine('auto', ...)` falls back to plain `transformers` when neither
+# is importable, so `[vlm]` alone is a working (if slower) default. Both
+# `[pipeline]`'s and `[vlm]`'s torch bounds (`torch<3,>=2.6.0`) co-resolve with
+# docling's `torch>=2.2.2,<3` under the CUDA-12.6 `[tool.uv.sources]` pin
+# (verified: all three share torch 2.11+cu126). Declaring the extra does not
+# install it.
+mineru = ['mineru[pipeline,vlm]>=2.0']
 all = [
-    'litspectraits[wiley,springer,extract]',
+    'litspectraits[wiley,springer,extract,mineru]',
 ]
 
 [project.scripts]

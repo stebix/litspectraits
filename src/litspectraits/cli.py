@@ -45,6 +45,8 @@ mixing diagnostics into stdout would break that consumer silently.
 
 import asyncio
 import json
+import logging
+import os
 import re
 import shutil
 import tempfile
@@ -62,8 +64,18 @@ from rich.panel import Panel
 from rich.table import Table
 
 from litspectraits import __version__
-from litspectraits._logging import configure_logging
-from litspectraits.config import MissingConfigError, Settings
+from litspectraits._logging import (
+    DEFAULT_LEVEL_NAME,
+    LEVEL_NAMES,
+    configure_logging,
+    level_to_int,
+    tame_third_party_logging,
+)
+from litspectraits.config import (
+    MissingConfigError,
+    Settings,
+    apply_mineru_model_cache_env,
+)
 from litspectraits.doctor import render as render_doctor_report
 from litspectraits.doctor import run_doctor
 from litspectraits.doi import InvalidDOIError, normalize
@@ -105,6 +117,13 @@ from litspectraits.extract.backend_ids import (
     MINERU,
     PDF_BACKEND_IDS,
 )
+from litspectraits.extract.mineru import (
+    DEFAULT_MINERU_EFFORT,
+    DEFAULT_MINERU_ENGINE,
+    HYBRID_ENGINE,
+    MINERU_EFFORTS,
+    MINERU_ENGINES,
+)
 from litspectraits.http import http_client
 from litspectraits.ingest import ingest as run_ingest
 from litspectraits.manifest import AcquisitionRecord, ExtractRecord, Format, converter
@@ -124,6 +143,7 @@ from litspectraits.normalize import (
     render_html,
 )
 from litspectraits.normalize import converter as normalize_converter
+from litspectraits.progress import command_progress
 from litspectraits.sideload import sideload as run_sideload
 from litspectraits.store import ArtifactStore, DOIIndexEntry
 
@@ -304,15 +324,101 @@ _EXTRACT_HINTS: Final[dict[type[ExtractError], str]] = {
 # ---------------------------------------------------------------------------
 
 
+# The console log level resolved by ``_startup``, shared with the spinner
+# gate (:func:`_spinner_enabled`). A module global rather than Typer context
+# state because the CLI is one command per process and the resolver runs in
+# the callback before any command body. Defaults to WARNING so imports before
+# the first ``_startup`` (there are none in practice) still have a sane value.
+_resolved_level: int = logging.WARNING
+
+
 @app.callback()
-def _startup() -> None:
-    """Run before every command — load ``.env`` and configure logging.
+def _startup(
+    log_level: str | None = typer.Option(
+        None,
+        '--log-level',
+        click_type=click.Choice(LEVEL_NAMES),
+        help=(
+            'Console log verbosity. Defaults to $LITSPECTRAITS_LOG_LEVEL, '
+            f'else {DEFAULT_LEVEL_NAME!r}. One of: {", ".join(LEVEL_NAMES)}.'
+        ),
+    ),
+    verbose: int = typer.Option(
+        0,
+        '--verbose',
+        '-v',
+        count=True,
+        help=(
+            'Increase verbosity: -v = info, -vv = debug. Wins when more verbose than --log-level.'
+        ),
+    ),
+) -> None:
+    """Run before every command — load ``.env``, resolve verbosity, configure logging.
 
     Idempotent: ``configure_logging`` no-ops on subsequent calls and
     ``dotenv.load_dotenv()`` does not overwrite already-set vars.
+
+    ``apply_mineru_model_cache_env`` runs here, after ``.env`` is loaded and
+    before any command body (and therefore before the MinerU /
+    ``huggingface_hub`` imports those bodies trigger), so a
+    ``LITSPECTRAITS_MINERU_MODEL_CACHE_DIR`` set in ``.env`` relocates the
+    MinerU weight cache for ``doctor`` and ``extract --backend mineru`` alike.
+
+    The console log level is resolved *here* (not from :class:`Settings`)
+    because logging must be live before ``Settings.from_env`` — which can
+    itself raise a config error we want rendered cleanly. ``$LITSPECTRAITS_LOG_LEVEL``
+    is read directly rather than via a Typer ``envvar=`` because ``.env`` is
+    loaded inside this body, *after* Typer would resolve ``envvar=`` at parse
+    time. ``tame_third_party_logging`` then gates the loguru / tqdm / docling
+    channels that bypass the structlog handler.
     """
+    global _resolved_level
     dotenv.load_dotenv()
-    configure_logging()
+    apply_mineru_model_cache_env()
+    _resolved_level = _resolve_log_level(flag=log_level, verbose=verbose)
+    configure_logging(level=_resolved_level)
+    tame_third_party_logging(_resolved_level)
+
+
+def _resolve_log_level(*, flag: str | None, verbose: int) -> int:
+    """Resolve the console log level from flag, env, and ``-v`` count.
+
+    Precedence: ``--log-level`` flag (validated by ``click.Choice``), else
+    ``$LITSPECTRAITS_LOG_LEVEL``, else :data:`DEFAULT_LEVEL_NAME`. ``-v`` /
+    ``-vv`` can only make the result *more* verbose than that base — never
+    quieter — so ``--log-level error -v`` still yields INFO.
+
+    A malformed ``$LITSPECTRAITS_LOG_LEVEL`` degrades to WARNING here so
+    logging still initialises; the precise loud error is raised later by
+    :meth:`Settings.from_env` (via ``_parse_log_level``) when the command
+    body loads settings.
+    """
+    base_name = (flag or os.environ.get('LITSPECTRAITS_LOG_LEVEL') or DEFAULT_LEVEL_NAME).strip()
+    try:
+        base = level_to_int(base_name)
+    except KeyError:
+        base = logging.WARNING
+    if verbose >= 2:
+        return min(base, logging.DEBUG)
+    if verbose == 1:
+        return min(base, logging.INFO)
+    return base
+
+
+def _spinner_enabled(*, json_output: bool) -> bool:
+    """Whether a live progress spinner should run for this invocation.
+
+    Off under ``--json`` (programmatic output), off when logs are streaming
+    (level at or below INFO — a live spinner and streaming log lines fight
+    over the terminal), and off when ``stderr`` is not an interactive
+    terminal (pipes, CI, ``CliRunner``). The three gates keep the spinner to
+    exactly the case it helps: a human watching an otherwise-quiet run.
+    """
+    if json_output:
+        return False
+    if _resolved_level <= logging.INFO:
+        return False
+    return _stderr_console().is_terminal
 
 
 # ---------------------------------------------------------------------------
@@ -340,14 +446,19 @@ async def _run_ingest(*, doi: str, cache_hit_ok: bool, json_output: bool) -> Non
     err_console = _stderr_console()
     out_console = _stdout_console()
     try:
-        async with http_client(settings) as client:
-            record = await run_ingest(
-                doi,
-                settings=settings,
-                store=store,
-                client=client,
-                cache_hit_ok=cache_hit_ok,
-            )
+        with command_progress(
+            f'Ingesting {doi}…',
+            enabled=_spinner_enabled(json_output=json_output),
+            console=err_console,
+        ):
+            async with http_client(settings) as client:
+                record = await run_ingest(
+                    doi,
+                    settings=settings,
+                    store=store,
+                    client=client,
+                    cache_hit_ok=cache_hit_ok,
+                )
     except InvalidDOIError as exc:
         _render_invalid_doi(exc, console=err_console)
         raise typer.Exit(2) from exc
@@ -429,17 +540,22 @@ async def _run_sideload(
     err_console = _stderr_console()
     out_console = _stdout_console()
     try:
-        async with http_client(settings) as client:
-            record = await run_sideload(
-                doi,
-                pdf_path,
-                license_assertion=license_assertion,
-                source_url=source_url,
-                note=note,
-                settings=settings,
-                store=store,
-                client=client,
-            )
+        with command_progress(
+            f'Sideloading {doi}…',
+            enabled=_spinner_enabled(json_output=json_output),
+            console=err_console,
+        ):
+            async with http_client(settings) as client:
+                record = await run_sideload(
+                    doi,
+                    pdf_path,
+                    license_assertion=license_assertion,
+                    source_url=source_url,
+                    note=note,
+                    settings=settings,
+                    store=store,
+                    client=client,
+                )
     except InvalidDOIError as exc:
         _render_invalid_doi(exc, console=err_console)
         raise typer.Exit(2) from exc
@@ -508,8 +624,13 @@ async def _run_smoke(*, doi: str, keep: bool, json_output: bool) -> None:
     try:
         store = ArtifactStore(smoke_dir)
         try:
-            async with http_client(settings) as client:
-                record = await run_ingest(doi, settings=settings, store=store, client=client)
+            with command_progress(
+                f'Smoke-ingesting {doi}…',
+                enabled=_spinner_enabled(json_output=json_output),
+                console=err_console,
+            ):
+                async with http_client(settings) as client:
+                    record = await run_ingest(doi, settings=settings, store=store, client=client)
         except InvalidDOIError as exc:
             _render_invalid_doi(exc, console=err_console)
             raise typer.Exit(2) from exc
@@ -818,10 +939,35 @@ def cmd_extract(
         envvar='LITSPECTRAITS_PDF_BACKEND',
         click_type=click.Choice(PDF_BACKEND_IDS),
         help=(
-            'PDF parsing backend (default docling-standard: text-layer, exact '
-            'geometry). Ignored on XML artifacts — a non-default value there is a '
-            'loud error. Also settable via LITSPECTRAITS_PDF_BACKEND. An unwired '
+            'PDF parsing backend (default mineru: VLM parse, best formula/table '
+            'recovery). docling-standard is the opt-in text-layer fallback. '
+            'Ignored on XML artifacts — a non-default value there is a loud '
+            'error. Also settable via LITSPECTRAITS_PDF_BACKEND. An unwired '
             'id is rejected here at parse time.'
+        ),
+    ),
+    mineru_engine: str = typer.Option(
+        DEFAULT_MINERU_ENGINE,
+        '--mineru-engine',
+        envvar='LITSPECTRAITS_MINERU_ENGINE',
+        click_type=click.Choice(MINERU_ENGINES),
+        help=(
+            'MinerU local backend, only with --backend mineru: vlm-engine '
+            '(default; VLM parse, model-predicted geometry), pipeline '
+            '(text-layer, exact geometry), hybrid-engine (text-layer + VLM '
+            'formula/table, tunable via --mineru-effort). Rejected with any '
+            'other --backend. Also settable via LITSPECTRAITS_MINERU_ENGINE.'
+        ),
+    ),
+    mineru_effort: str = typer.Option(
+        DEFAULT_MINERU_EFFORT,
+        '--mineru-effort',
+        envvar='LITSPECTRAITS_MINERU_EFFORT',
+        click_type=click.Choice(MINERU_EFFORTS),
+        help=(
+            'MinerU hybrid-engine effort: medium (default) or high. Only '
+            'consulted when --mineru-engine hybrid-engine; MinerU ignores it '
+            'otherwise. Also settable via LITSPECTRAITS_MINERU_EFFORT.'
         ),
     ),
     reextract: bool = typer.Option(
@@ -837,25 +983,39 @@ def cmd_extract(
 
     Dispatches through :func:`litspectraits.extract.extract` to the
     format-specific extractor, and — for PDF — the ``--backend``-selected
-    parser (docling or MinerU; ``docs/mineru-backend-spec.md`` §1, §8). The
-    artifact must already be in the local store; run ``litspectraits ingest
-    <doi>`` first if it isn't. No network calls.
+    parser (docling or MinerU; ``docs/mineru-backend-spec.md`` §1, §8). When
+    ``--backend mineru``, ``--mineru-engine`` / ``--mineru-effort`` further
+    select which MinerU local backend runs (§11 Q-D/Q-E). The artifact must
+    already be in the local store; run ``litspectraits ingest <doi>`` first
+    if it isn't. No network calls.
 
     Exit codes (``docs/extract-pdf-plan.md`` §5): 1 = record not in local
     store; 2 = invalid input / extractor preflight / unusable ``--backend``
-    (``BackendNotApplicableError``); 4 = conversion failure; 6 = malformed
-    output / parse degraded / empty document / serialization; 7 = integrity
-    (re-extracted document differs and ``--reextract`` was not passed).
+    or ``--mineru-engine``/``--mineru-effort`` (``BackendNotApplicableError``);
+    4 = conversion failure; 6 = malformed output / parse degraded / empty
+    document / serialization; 7 = integrity (re-extracted document differs
+    and ``--reextract`` was not passed).
     """
     asyncio.run(
         _run_extract(
-            target=target, backend=backend, reextract=reextract, json_output=json_output
+            target=target,
+            backend=backend,
+            mineru_engine=mineru_engine,
+            mineru_effort=mineru_effort,
+            reextract=reextract,
+            json_output=json_output,
         )
     )
 
 
 async def _run_extract(
-    *, target: str, backend: str, reextract: bool, json_output: bool
+    *,
+    target: str,
+    backend: str,
+    mineru_engine: str,
+    mineru_effort: str,
+    reextract: bool,
+    json_output: bool,
 ) -> None:
     settings = _load_settings()
     store = ArtifactStore(settings.data_dir)
@@ -865,23 +1025,55 @@ async def _run_extract(
     record = _resolve_extract_target(target=target, store=store, err_console=err_console)
 
     try:
-        extract_record = await run_extract(
-            record,
-            store,
-            backend=backend,
-            reextract=reextract,
-            model_cache_dir=settings.docling_model_cache_dir,
-        )
+        with command_progress(
+            _extract_progress_label(record=record, backend=backend, mineru_engine=mineru_engine),
+            enabled=_spinner_enabled(json_output=json_output),
+            console=err_console,
+        ):
+            extract_record = await run_extract(
+                record,
+                store,
+                backend=backend,
+                mineru_engine=mineru_engine,
+                mineru_effort=mineru_effort,
+                reextract=reextract,
+                model_cache_dir=settings.docling_model_cache_dir,
+            )
     except ExtractError as exc:
         _render_error_panel(exc, console=err_console, hints=_EXTRACT_HINTS)
         raise typer.Exit(_EXTRACT_EXIT_CODES.get(type(exc), 1)) from exc
 
     if json_output:
-        _emit_extract_record_json(record=record, extract_record=extract_record, backend=backend)
+        _emit_extract_record_json(
+            record=record,
+            extract_record=extract_record,
+            backend=backend,
+            mineru_engine=mineru_engine,
+            mineru_effort=mineru_effort,
+        )
     else:
         _render_extract_record_panel(
-            record=record, extract_record=extract_record, backend=backend, console=out_console
+            record=record,
+            extract_record=extract_record,
+            backend=backend,
+            mineru_engine=mineru_engine,
+            mineru_effort=mineru_effort,
+            console=out_console,
         )
+
+
+def _extract_progress_label(*, record: AcquisitionRecord, backend: str, mineru_engine: str) -> str:
+    """Human-readable spinner label for an extraction in flight.
+
+    PDF extractions name the backend (and the MinerU engine) since that is
+    what governs the wait; XML extractions name the format. Only ever shown
+    while the extraction runs — the result panel supersedes it.
+    """
+    if record.format is not Format.PDF:
+        return f'Extracting {record.doi} ({record.format.value})…'
+    if backend == MINERU:
+        return f'Extracting {record.doi} with MinerU ({mineru_engine})…'
+    return f'Extracting {record.doi} with {backend}…'
 
 
 def _resolve_extract_target(
@@ -914,7 +1106,12 @@ def _resolve_extract_target(
 
 
 def _emit_extract_record_json(
-    *, record: AcquisitionRecord, extract_record: ExtractRecord, backend: str
+    *,
+    record: AcquisitionRecord,
+    extract_record: ExtractRecord,
+    backend: str,
+    mineru_engine: str,
+    mineru_effort: str,
 ) -> None:
     """Print the ExtractRecord as JSON on stdout, with DOI + backend injected.
 
@@ -928,13 +1125,19 @@ def _emit_extract_record_json(
     a field of :class:`ExtractRecord` (whose coarse ``extractor`` enum does
     not distinguish e.g. docling-standard from a future docling-vlm), so a
     ``--json`` consumer sees which parser produced the document only if we
-    surface it here (``docs/mineru-backend-spec.md`` §1, §8).
+    surface it here (``docs/mineru-backend-spec.md`` §1, §8). ``mineru_engine``
+    / ``mineru_effort`` are surfaced the same way, only when ``backend ==
+    'mineru'`` — mirroring ``meta.json``'s ``effort: None`` rule, a JSON
+    consumer never sees a knob that did not actually apply to this run.
     """
-    payload = {
+    payload: dict[str, object] = {
         'doi': record.doi,
         'backend_id': backend,
         **converter.unstructure(extract_record),
     }
+    if backend == MINERU:
+        payload['mineru_engine'] = mineru_engine
+        payload['mineru_effort'] = mineru_effort if mineru_engine == HYBRID_ENGINE else None
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
@@ -943,6 +1146,8 @@ def _render_extract_record_panel(
     record: AcquisitionRecord,
     extract_record: ExtractRecord,
     backend: str,
+    mineru_engine: str,
+    mineru_effort: str,
     console: Console,
 ) -> None:
     table = Table(title=f'extracted — {record.doi}', show_header=False, expand=False)
@@ -954,6 +1159,10 @@ def _render_extract_record_panel(
     # The specific backend id (``docling-standard`` / ``mineru``) — finer than
     # the coarse ``extractor`` enum and the seam ``normalize`` dispatches on.
     table.add_row('backend', backend)
+    if backend == MINERU:
+        table.add_row('mineru_engine', mineru_engine)
+        if mineru_engine == HYBRID_ENGINE:
+            table.add_row('mineru_effort', mineru_effort)
     table.add_row('version', extract_record.extractor_version)
     table.add_row('extracted_at', extract_record.extracted_at.isoformat())
     table.add_row('n_text_blocks', f'{extract_record.n_text_blocks:,}')
@@ -1027,7 +1236,12 @@ def cmd_normalize(
 
     record = _resolve_extract_target(target=target, store=store, err_console=err_console)
     try:
-        meta = _run_normalize(record=record, store=store, renormalize=renormalize)
+        with command_progress(
+            f'Normalising {record.doi}…',
+            enabled=_spinner_enabled(json_output=json_output),
+            console=err_console,
+        ):
+            meta = _run_normalize(record=record, store=store, renormalize=renormalize)
     except FileNotFoundError as exc:
         err_console.print(
             f'[bold yellow]upstream extraction missing:[/bold yellow] {exc}. '
@@ -1361,16 +1575,19 @@ def cmd_doctor(
         False,
         '--download-models/--no-download-models',
         help=(
-            'Pull docling layout + TableFormer weights if missing. '
-            'Multi-GB; off by default — operator must opt in explicitly.'
+            'Pull both MinerU weight families (pipeline and vlm, covering all '
+            'three --mineru-engine choices) and — when the [extract] docling '
+            'extra is installed — docling layout + TableFormer + code-formula '
+            'weights. Multi-GB; off by default — operator must opt in explicitly.'
         ),
     ),
     smoke_extract: bool = typer.Option(
         False,
         '--smoke-extract/--no-smoke-extract',
         help=(
-            'Run a live docling conversion against the packaged synthetic PDF. '
-            'Off by default to keep `doctor` from spinning up the layout model.'
+            'Run a live MinerU vlm-engine conversion (the default backend) '
+            'against the packaged synthetic PDF. Off by default — it needs the '
+            'vlm weights and likely a GPU.'
         ),
     ),
 ) -> None:
@@ -1383,13 +1600,18 @@ def cmd_doctor(
     """
     settings = _load_settings()
     out_console = _stdout_console()
-    report = asyncio.run(
-        _run_doctor(
-            settings=settings,
-            download_models=download_models,
-            smoke_extract=smoke_extract,
+    with command_progress(
+        'Running preflight checks…',
+        enabled=_spinner_enabled(json_output=False),
+        console=_stderr_console(),
+    ):
+        report = asyncio.run(
+            _run_doctor(
+                settings=settings,
+                download_models=download_models,
+                smoke_extract=smoke_extract,
+            )
         )
-    )
     render_doctor_report(report, console=out_console)
     if not report.ok:
         raise typer.Exit(1)

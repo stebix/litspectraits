@@ -12,11 +12,13 @@ to stderr.
 """
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from litspectraits._smoke_dois import SMOKE_DOI
@@ -1029,13 +1031,16 @@ def test_extract_text_mode_renders_record_panel(
     _plant_record(record, store=store)
     _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
 
-    result = runner.invoke(app, ['extract', record.doi])
+    # Explicit docling-standard: the mock record is a docling extraction, so
+    # the panel's backend row matches its extractor row. (Bare `extract` now
+    # defaults to mineru — see test_extract_passes_reextract_flag_through_dispatch.)
+    result = runner.invoke(app, ['extract', '--backend', 'docling-standard', record.doi])
     assert result.exit_code == 0
     # Key fields rendered on stdout via the Rich table.
     assert record.doi in result.stdout
     assert extract_record.sha256 in result.stdout
     assert Extractor.DOCLING.value in result.stdout
-    # The resolved backend id is surfaced as its own row (default here).
+    # The resolved backend id is surfaced as its own row.
     assert 'docling-standard' in result.stdout
     # Comma-formatted counts (matches the `{n:,}` rendering).
     assert '38,421' in result.stdout
@@ -1050,11 +1055,14 @@ def test_extract_json_mode_emits_machine_readable_payload(
     _plant_record(record, store=store)
     _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
 
-    result = runner.invoke(app, ['extract', '--json', record.doi])
+    # Explicit docling-standard keeps the payload a clean docling extraction
+    # (no mineru_engine/effort keys to strip); bare `extract` now defaults to
+    # mineru, covered by test_extract_passes_reextract_flag_through_dispatch.
+    result = runner.invoke(app, ['extract', '--backend', 'docling-standard', '--json', record.doi])
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     # DOI + backend_id are injected at the top level (parity with `ingest --json`);
-    # backend_id is the resolved PDF backend, defaulting to docling-standard.
+    # backend_id is the resolved PDF backend.
     assert payload['doi'] == record.doi
     assert payload['backend_id'] == 'docling-standard'
     # Stripping the injected keys must leave a clean ExtractRecord payload.
@@ -1083,10 +1091,14 @@ def test_extract_passes_reextract_flag_through_dispatch(
     result = runner.invoke(app, ['extract', '--reextract', record.doi])
     assert result.exit_code == 0
     # ``model_cache_dir`` rides along from Settings (None unless
-    # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR is set); ``backend`` defaults to
-    # docling-standard when neither --backend nor LITSPECTRAITS_PDF_BACKEND is set.
+    # LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR is set); ``backend`` defaults to the
+    # promoted mineru when neither --backend nor LITSPECTRAITS_PDF_BACKEND is set;
+    # ``mineru_engine``/``mineru_effort`` default to vlm-engine/medium
+    # (docs/mineru-primary-promotion.md §1), always threaded through.
     assert captured['kwargs'] == {
-        'backend': 'docling-standard',
+        'backend': 'mineru',
+        'mineru_engine': 'vlm-engine',
+        'mineru_effort': 'medium',
         'reextract': True,
         'model_cache_dir': None,
     }
@@ -1127,6 +1139,147 @@ def test_extract_invalid_backend_rejected_at_parse_time(runner: CliRunner) -> No
     assert result.exit_code == 2
     assert 'docling-standard' in result.stderr
     assert 'mineru' in result.stderr
+
+
+def test_extract_mineru_engine_and_effort_flags_thread_through_dispatch(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--mineru-engine``/``--mineru-effort`` reach ``run_extract`` verbatim."""
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    captured: dict[str, object] = {}
+
+    async def _async_stub(*args: object, **kwargs: object) -> ExtractRecord:
+        captured['kwargs'] = kwargs
+        return extract_record
+
+    monkeypatch.setattr('litspectraits.cli.run_extract', _async_stub)
+
+    result = runner.invoke(
+        app,
+        [
+            'extract',
+            '--backend',
+            'mineru',
+            '--mineru-engine',
+            'hybrid-engine',
+            '--mineru-effort',
+            'high',
+            record.doi,
+        ],
+    )
+    assert result.exit_code == 0
+    kwargs = captured['kwargs']
+    assert isinstance(kwargs, dict)
+    assert kwargs['mineru_engine'] == 'hybrid-engine'
+    assert kwargs['mineru_effort'] == 'high'
+    # Surfaced in the panel too, since --backend mineru makes them applicable.
+    assert 'hybrid-engine' in result.stdout
+    assert 'high' in result.stdout
+
+
+def test_extract_invalid_mineru_engine_rejected_at_parse_time(runner: CliRunner) -> None:
+    """An unwired --mineru-engine id is a click usage error, before target resolution."""
+    result = runner.invoke(
+        app,
+        ['extract', '--mineru-engine', 'banana', '10.1002/never.ingested'],
+    )
+    assert result.exit_code == 2
+    assert 'pipeline' in result.stderr
+    assert 'vlm-engine' in result.stderr
+    assert 'hybrid-engine' in result.stderr
+
+
+def test_extract_invalid_mineru_effort_rejected_at_parse_time(runner: CliRunner) -> None:
+    """An unwired --mineru-effort id is a click usage error, before target resolution."""
+    result = runner.invoke(
+        app,
+        ['extract', '--mineru-effort', 'banana', '10.1002/never.ingested'],
+    )
+    assert result.exit_code == 2
+    assert 'medium' in result.stderr
+    assert 'high' in result.stderr
+
+
+def test_extract_mineru_effort_row_hidden_for_non_hybrid_engine(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mineru_effort`` is only rendered/emitted when the engine is hybrid.
+
+    Mirrors the ``meta.json`` rule (``effort`` recorded as ``None`` outside
+    ``hybrid-engine``) so the panel and ``--json`` output never claim a knob
+    mattered when MinerU itself ignored it.
+    """
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
+
+    text_result = runner.invoke(app, ['extract', '--backend', 'mineru', record.doi])
+    assert text_result.exit_code == 0
+    assert 'mineru_engine' in text_result.stdout
+    assert 'mineru_effort' not in text_result.stdout
+
+    json_result = runner.invoke(app, ['extract', '--backend', 'mineru', '--json', record.doi])
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.stdout)
+    # Default engine is the promoted vlm-engine; effort is None (non-hybrid).
+    assert payload['mineru_engine'] == 'vlm-engine'
+    assert payload['mineru_effort'] is None
+
+
+def test_extract_mineru_knobs_absent_from_json_for_docling_backend(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The docling backend never surfaces MinerU-only knobs.
+
+    Must be requested explicitly now that mineru is the default backend —
+    a bare `extract` would surface the knobs.
+    """
+    record = _example_record()
+    extract_record = _example_extract_record(sha256=record.sha256)
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+    _patch_extract(monkeypatch, lambda *a, **kw: extract_record)
+
+    result = runner.invoke(app, ['extract', '--backend', 'docling-standard', '--json', record.doi])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert 'mineru_engine' not in payload
+    assert 'mineru_effort' not in payload
+
+
+def test_extract_mineru_engine_with_docling_backend_rejected_end_to_end(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``--mineru-engine`` with a non-mineru ``--backend`` fails loud through dispatch.
+
+    Runs against the real (un-mocked) ``run_extract``: the
+    ``BackendNotApplicableError`` guard fires before any artifact bytes are
+    touched, so no PDF/model fixture is needed. Pins the guard against an
+    *explicit* ``--backend docling-standard`` — the bare default is now mineru,
+    which would make ``--mineru-engine`` applicable.
+    """
+    record = _example_record()
+    store = ArtifactStore(tmp_path)
+    _plant_record(record, store=store)
+
+    result = runner.invoke(
+        app,
+        [
+            'extract',
+            '--backend',
+            'docling-standard',
+            '--mineru-engine',
+            'hybrid-engine',
+            record.doi,
+        ],
+    )
+    assert result.exit_code == 2
+    assert 'only applies with --backend mineru' in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1679,3 +1832,94 @@ def test_list_empty_store_json_mode_emits_empty_array(runner: CliRunner) -> None
     result = runner.invoke(app, ['list', '--json'])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == []
+
+
+# ---------------------------------------------------------------------------
+# log level resolution + spinner gating
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_log_level_defaults_to_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.delenv('LITSPECTRAITS_LOG_LEVEL', raising=False)
+    assert cli._resolve_log_level(flag=None, verbose=0) == logging.WARNING
+
+
+def test_resolve_log_level_env_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setenv('LITSPECTRAITS_LOG_LEVEL', 'error')
+    assert cli._resolve_log_level(flag=None, verbose=0) == logging.ERROR
+
+
+def test_resolve_log_level_flag_beats_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setenv('LITSPECTRAITS_LOG_LEVEL', 'error')
+    assert cli._resolve_log_level(flag='debug', verbose=0) == logging.DEBUG
+
+
+def test_resolve_log_level_verbose_only_raises_verbosity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    # -v cannot make a quiet base quieter: error + -v => info, not error.
+    assert cli._resolve_log_level(flag='error', verbose=1) == logging.INFO
+    assert cli._resolve_log_level(flag='error', verbose=2) == logging.DEBUG
+    # ...but never louder than the base when the base is already more verbose.
+    assert cli._resolve_log_level(flag='debug', verbose=1) == logging.DEBUG
+
+
+def test_resolve_log_level_bad_env_degrades_to_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setenv('LITSPECTRAITS_LOG_LEVEL', 'chatty')
+    assert cli._resolve_log_level(flag=None, verbose=0) == logging.WARNING
+
+
+def test_spinner_enabled_off_under_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setattr(cli, '_resolved_level', logging.WARNING)
+    monkeypatch.setattr(cli, '_stderr_console', lambda: Console(stderr=True, force_terminal=True))
+    assert cli._spinner_enabled(json_output=True) is False
+
+
+def test_spinner_enabled_off_when_verbose(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    # At INFO or below the console streams log lines; a spinner would fight them.
+    monkeypatch.setattr(cli, '_resolved_level', logging.INFO)
+    monkeypatch.setattr(cli, '_stderr_console', lambda: Console(stderr=True, force_terminal=True))
+    assert cli._spinner_enabled(json_output=False) is False
+
+
+def test_spinner_enabled_off_without_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setattr(cli, '_resolved_level', logging.WARNING)
+    monkeypatch.setattr(cli, '_stderr_console', lambda: Console(stderr=True, force_terminal=False))
+    assert cli._spinner_enabled(json_output=False) is False
+
+
+def test_spinner_enabled_on_quiet_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litspectraits import cli
+
+    monkeypatch.setattr(cli, '_resolved_level', logging.WARNING)
+    monkeypatch.setattr(cli, '_stderr_console', lambda: Console(stderr=True, force_terminal=True))
+    assert cli._spinner_enabled(json_output=False) is True
+
+
+def test_global_log_level_flag_is_accepted(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['--log-level', 'info', 'version'])
+    assert result.exit_code == 0
+
+
+def test_global_verbose_flag_is_accepted(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['-vv', 'version'])
+    assert result.exit_code == 0
+
+
+def test_bad_log_level_flag_rejected(runner: CliRunner) -> None:
+    result = runner.invoke(app, ['--log-level', 'chatty', 'version'])
+    assert result.exit_code != 0

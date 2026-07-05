@@ -46,19 +46,25 @@ class Publisher(StrEnum):
 class Extractor(StrEnum):
     """Extraction implementation identifier (§11, ``extract-pdf-plan.md`` §6).
 
-    One-to-one with :class:`Format` today:
+    Format → extractor is one-to-one for the XML routes, but
+    :attr:`Format.PDF` now has two backends (``docs/mineru-backend-spec.md``
+    §1):
 
-    - :attr:`DOCLING` ↔ :attr:`Format.PDF`
+    - :attr:`DOCLING` / :attr:`MINERU` ↔ :attr:`Format.PDF`
     - :attr:`JATS` ↔ :attr:`Format.JATS_XML`
     - :attr:`ELSEVIER` ↔ :attr:`Format.ELSEVIER_XML`
 
     Recorded explicitly on :class:`ExtractRecord` (rather than derived from
-    ``format`` at read time) so a future PDF-extractor swap — e.g.
-    docling → some alternative — only changes this value, leaving the
-    schema shape and the ``documents/sha256/<aa>/<sha>/`` layout untouched.
+    ``format`` at read time) so a PDF-backend swap — docling → MinerU —
+    only changes this value, leaving the schema shape and the
+    ``documents/sha256/<aa>/<sha>/`` layout untouched. The finer-grained
+    *backend id* (``docling-standard`` vs ``mineru``) is the discriminator
+    that flows extract → normalize through ``meta.json``; this enum is the
+    coarser "which library parsed it" tag.
     """
 
     DOCLING = 'docling'
+    MINERU = 'mineru'
     JATS = 'jats'
     ELSEVIER = 'elsevier'
 

@@ -806,6 +806,7 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "docling" },
+    { name = "mineru", extra = ["pipeline", "vlm"] },
     { name = "springernature-api-client" },
     { name = "torch" },
     { name = "torchvision" },
@@ -813,11 +814,12 @@ all = [
 ]
 extract = [
     { name = "docling" },
+    { name = "mineru", extra = ["pipeline", "vlm"] },
     { name = "torch" },
     { name = "torchvision" },
 ]
 mineru = [
-    { name = "mineru", extra = ["pipeline"] },
+    { name = "mineru", extra = ["pipeline", "vlm"] },
 ]
 springer = [
     { name = "springernature-api-client" },
@@ -842,9 +844,10 @@ requires-dist = [
     { name = "cattrs", specifier = ">=24.1" },
     { name = "docling", marker = "extra == 'extract'", specifier = ">=2.0" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
-    { name = "litspectraits", extras = ["wiley", "springer", "extract"], marker = "extra == 'all'" },
+    { name = "litspectraits", extras = ["wiley", "springer", "extract", "mineru"], marker = "extra == 'all'" },
     { name = "lxml", specifier = ">=5.3" },
-    { name = "mineru", extras = ["pipeline"], marker = "extra == 'mineru'", specifier = ">=2.0" },
+    { name = "mineru", extras = ["pipeline", "vlm"], marker = "extra == 'extract'", specifier = ">=2.0" },
+    { name = "mineru", extras = ["pipeline", "vlm"], marker = "extra == 'mineru'", specifier = ">=2.0" },
     { name = "platformdirs", specifier = ">=4.3" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "rich", specifier = ">=13.9" },
@@ -1071,6 +1074,11 @@ pipeline = [
     { name = "shapely" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "transformers" },
+]
+vlm = [
+    { name = "accelerate" },
+    { name = "torch" },
     { name = "transformers" },
 ]
 

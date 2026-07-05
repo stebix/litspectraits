@@ -16,18 +16,22 @@ Three checks, all read-only by default:
    :class:`AuthRejectedError`, :class:`EntitlementDowngradeError`, etc.
    The staged file is discarded on success — doctor never touches the
    real artifact store.
-3. **Extract components** (``extract-pdf-plan.md`` §8) — probe the
-   ``[extract]`` extra, the docling model cache, and the accelerator
-   ``AcceleratorDevice.AUTO`` will resolve to. The model-cache location
-   honors ``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``
+3. **Extract components** (``extract-pdf-plan.md`` §8,
+   ``mineru-primary-promotion.md`` §4) — probe **MinerU** first (the
+   primary backend: its ``[mineru]`` extra + the vlm weight family that
+   backs the default ``vlm-engine``, both *required*), then docling as
+   the opt-in alternative (its ``[extract]`` extra + model cache +
+   accelerator, all informational). docling's model-cache location honors
+   ``LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR``
    (:attr:`~litspectraits.config.Settings.docling_model_cache_dir`) —
    when set, it is both the directory probed for weights and the
    ``output_dir`` ``--download-models`` writes to; otherwise docling's
-   own ``~/.cache/docling/models`` applies. Two opt-ins ride on top of
-   this section: ``--download-models`` fetches the three required v3
-   weights — the Egret-Large layout model, TableFormer, and the
-   code/formula VLM — and ``--smoke-extract`` runs a live docling
-   conversion against the packaged synthetic fixture.
+   own ``~/.cache/docling/models`` applies (MinerU resolves its own weights
+   via ``~/mineru.json`` / ``HF_HOME``). Two opt-ins ride on top of this
+   section: ``--download-models`` fetches both MinerU weight families and
+   the three docling v3 weights (Egret-Large layout, TableFormer,
+   code/formula VLM), and ``--smoke-extract`` runs a live MinerU
+   ``vlm-engine`` conversion against the packaged synthetic fixture.
    Both side-effects are off by default — plain ``doctor`` stays
    read-only and network-free for the extract section.
 
@@ -49,6 +53,7 @@ see the per-publisher rows.
 
 import asyncio
 import ipaddress
+import os
 import tempfile
 import time
 from collections.abc import Iterable
@@ -194,11 +199,12 @@ class ExtractReport:
     """Aggregate of the extract-section rows.
 
     :attr:`has_required_failure` is the contract for the CLI's exit-code
-    logic: True when the ``[extract]`` extra **is** installed and at
-    least one required component (layout model, TableFormer, opted-in
-    smoke convert) is missing or failed. False when the extra is not
-    installed at all — the extract section is opt-in
-    (``extract-pdf-plan.md`` §8 "exit code unaffected").
+    logic: True when a *required* component is missing or failed — the
+    primary ``[mineru]`` extra or the vlm weight family that backs the
+    default ``vlm-engine`` (``docs/mineru-primary-promotion.md`` §4).
+    docling and the MinerU ``pipeline`` weights are informational, so
+    their absence leaves this False. The opted-in smoke convert is also
+    informational.
     """
 
     components: tuple[ExtractComponentCheck, ...]
@@ -483,6 +489,21 @@ _COMPONENT_CODE_FORMULA: Final = 'code-formula'
 _COMPONENT_ACCEL: Final = 'accelerator'
 _COMPONENT_OCR: Final = 'OCR engines'
 _COMPONENT_SMOKE: Final = 'smoke convert'
+# MinerU — the primary PDF backend (docs/mineru-primary-promotion.md §4).
+# Reported first and required: an absent [mineru] extra or vlm weight cache
+# flips the exit code, the inverse of the old posture. docling is the opt-in
+# alternative below.
+_COMPONENT_MINERU_EXTRA: Final = 'mineru'
+# Two weight caches, one per MINERU_ENGINES weight family: 'vlm' backs the
+# default vlm-engine (and hybrid-engine) and is REQUIRED; 'pipeline' backs the
+# opt-in --mineru-engine pipeline (and, with vlm, hybrid-engine) and stays
+# informational. doctor reports them separately rather than folding that into
+# one row so a --mineru-engine pipeline/hybrid-engine operator can see exactly
+# which cache is missing.
+_COMPONENT_MINERU_MODELS_PIPELINE: Final = 'mineru pipeline weights'
+_COMPONENT_MINERU_MODELS_VLM: Final = 'mineru vlm weights'
+# MinerU weight-download source; honours MINERU_MODEL_SOURCE, else HuggingFace.
+_MINERU_DEFAULT_MODEL_SOURCE: Final = 'huggingface'
 
 # Packaged fixture used by ``doctor --smoke-extract``. Lives under
 # ``src/litspectraits/_fixtures/`` (not ``tests/``) so the bytes ship in
@@ -501,50 +522,70 @@ async def _check_extract_section(
 ) -> ExtractReport:
     """Orchestrate the §8 checks; return a single :class:`ExtractReport`.
 
-    Short-circuits when the ``[extract]`` extra isn't installed: only
-    the extra-row is emitted, ``has_required_failure`` stays False
-    (extra is opt-in), and ``--download-models`` / ``--smoke-extract``
-    are silently no-ops on that path. Operators who explicitly asked
-    for those flags get a deterministic "you need the extra first"
-    table row rather than a stray :class:`ImportError`.
+    MinerU leads — it is the primary PDF backend
+    (``docs/mineru-primary-promotion.md`` §4), so the ``[mineru]`` extra and
+    the **vlm** weight family (which backs the default ``vlm-engine``) are
+    *required*: their absence flips ``has_required_failure`` and, in turn, the
+    CLI exit code. docling is probed second as the opt-in alternative — an
+    absent ``[extract]`` extra or docling cache is healthy and never flips the
+    exit code.
 
-    Model-presence checks run before the optional download so the
-    initial state is recorded; after a successful download we re-probe
-    so the final table reflects on-disk truth, not the pre-download
+    Short-circuits when the primary ``[mineru]`` extra isn't installed: the
+    extra row itself carries the required failure and the vlm/pipeline model +
+    smoke rows are skipped (``--download-models`` / ``--smoke-extract`` become
+    deterministic "install the extra first" no-ops rather than a stray
+    :class:`ImportError`). Model-presence checks run before the optional
+    download so the initial state is recorded; after a successful download we
+    re-probe so the final table reflects on-disk truth, not the pre-download
     state.
     """
     model_cache_dir = settings.docling_model_cache_dir
-    extra_row = _check_docling_extra()
-    if extra_row.status is ExtractStatus.NOT_INSTALLED:
-        rows: list[ExtractComponentCheck] = [extra_row]
-        if download_models or smoke_extract:
-            rows.append(
-                ExtractComponentCheck(
-                    component=_COMPONENT_SMOKE if smoke_extract else _COMPONENT_LAYOUT,
-                    required='no',
-                    is_required=False,
-                    status=ExtractStatus.SKIPPED,
-                    detail='skipped — [extract] extra not installed',
-                )
-            )
-        return ExtractReport(components=tuple(rows), has_required_failure=False)
+    rows: list[ExtractComponentCheck] = []
 
-    if download_models:
-        # Synchronous, multi-GB I/O; off the event loop.
-        await asyncio.to_thread(
-            _maybe_download_models, force=False, model_cache_dir=model_cache_dir
+    # MinerU — the primary backend (``docs/mineru-primary-promotion.md`` §4).
+    # The [mineru] extra + the vlm weight family are required; their absence is
+    # a real gap that flips the exit code (the inverse of the old posture).
+    mineru_extra_row = _check_mineru_extra()
+    rows.append(mineru_extra_row)
+    if mineru_extra_row.status is ExtractStatus.OK:
+        if download_models:
+            await asyncio.to_thread(_maybe_download_mineru_models)
+        # vlm backs the default engine (required); pipeline is consulted only
+        # by the opt-in --mineru-engine pipeline (informational).
+        rows.append(_check_mineru_models(kind='vlm'))
+        rows.append(_check_mineru_models(kind='pipeline'))
+        if smoke_extract:
+            resolved_fixture = fixture_path or _packaged_fixture_path()
+            rows.append(
+                await _maybe_smoke_extract(fixture_path=resolved_fixture, settings=settings)
+            )
+    elif download_models or smoke_extract:
+        # The absent [mineru] extra row already carries the required failure; a
+        # requested download/smoke is a deterministic skip layered on top.
+        rows.append(
+            ExtractComponentCheck(
+                component=_COMPONENT_SMOKE if smoke_extract else _COMPONENT_MINERU_MODELS_VLM,
+                required='no',
+                is_required=False,
+                status=ExtractStatus.SKIPPED,
+                detail='skipped — [mineru] extra not installed',
+            )
         )
 
-    model_rows = _check_docling_models(model_cache_dir=model_cache_dir)
-    accel_row = _check_accelerator()
-    ocr_row = _check_ocr_engines()
-
-    rows = [extra_row, *model_rows, accel_row, ocr_row]
-
-    if smoke_extract:
-        resolved_fixture = fixture_path or _packaged_fixture_path()
-        smoke_row = await _maybe_smoke_extract(fixture_path=resolved_fixture, settings=settings)
-        rows.append(smoke_row)
+    # docling — the opt-in alternative. An absent extra / cache is healthy; its
+    # rows are informational (is_required=False) and never flip the exit code,
+    # so a docling-less machine still passes doctor on the MinerU path alone.
+    docling_extra_row = _check_docling_extra()
+    rows.append(docling_extra_row)
+    if docling_extra_row.status is not ExtractStatus.NOT_INSTALLED:
+        if download_models:
+            # Synchronous, multi-GB I/O; off the event loop.
+            await asyncio.to_thread(
+                _maybe_download_models, force=False, model_cache_dir=model_cache_dir
+            )
+        rows.extend(_check_docling_models(model_cache_dir=model_cache_dir))
+        rows.append(_check_accelerator())
+        rows.append(_check_ocr_engines())
 
     has_required_failure = any(
         row.is_required and row.status is not ExtractStatus.OK for row in rows
@@ -553,14 +594,20 @@ async def _check_extract_section(
 
 
 def _check_docling_extra() -> ExtractComponentCheck:
-    """Probe whether ``[extract]`` is installed; report version on hit."""
+    """Probe whether ``[extract]`` is installed; report version on hit.
+
+    docling is the **opt-in alternative** to the primary MinerU backend now
+    (``docs/mineru-primary-promotion.md`` §4), so ``is_required`` is ``False``
+    whether or not it is installed — an absent or present docling never flips
+    the exit code.
+    """
     try:
         import docling  # noqa: F401  pyright: ignore[reportMissingImports]
     except ImportError:
         return ExtractComponentCheck(
             component=_COMPONENT_EXTRA,
-            required='yes',
-            is_required=False,  # extra is opt-in per §8
+            required='no',
+            is_required=False,  # docling is the opt-in fallback backend
             status=ExtractStatus.NOT_INSTALLED,
             detail='install with `uv sync --extra extract`',
         )
@@ -570,8 +617,8 @@ def _check_docling_extra() -> ExtractComponentCheck:
         version = 'unknown'
     return ExtractComponentCheck(
         component=_COMPONENT_EXTRA,
-        required='yes',
-        is_required=True,
+        required='no',
+        is_required=False,
         status=ExtractStatus.OK,
         detail=f'docling {version}',
     )
@@ -637,18 +684,21 @@ def _check_docling_models(*, model_cache_dir: Path | None) -> list[ExtractCompon
 def _model_row(
     *, component: str, cache_dir: Path, ok_hint: str, missing_hint: str
 ) -> ExtractComponentCheck:
+    # docling is the opt-in alternative backend now, so its model rows are
+    # informational (``is_required=False``): a missing docling cache never
+    # flips the exit code (``docs/mineru-primary-promotion.md`` §4).
     if _model_dir_present(cache_dir):
         return ExtractComponentCheck(
             component=component,
-            required='yes',
-            is_required=True,
+            required='no',
+            is_required=False,
             status=ExtractStatus.OK,
             detail=ok_hint,
         )
     return ExtractComponentCheck(
         component=component,
-        required='yes',
-        is_required=True,
+        required='no',
+        is_required=False,
         status=ExtractStatus.MISSING,
         detail=missing_hint,
     )
@@ -715,6 +765,122 @@ def _check_ocr_engines() -> ExtractComponentCheck:
         status=ExtractStatus.OFF,
         detail='do_ocr=False (v3 default; scanned PDFs surface as EmptyDocumentError)',
     )
+
+
+def _check_mineru_extra() -> ExtractComponentCheck:
+    """Probe whether the ``[mineru]`` extra is installed; report version on hit.
+
+    Reported as ``MISSING`` (not ``OFF``) when absent: MinerU is now the
+    primary PDF backend (``docs/mineru-primary-promotion.md`` §4), so a machine
+    without it is a real gap that flips the exit code — the inverse of the old
+    opt-in posture. Since mineru rides in the ``[extract]`` extra as of the
+    promotion, the fix hint points there.
+    """
+    try:
+        import mineru  # noqa: F401  pyright: ignore[reportMissingImports]
+    except ImportError:
+        return ExtractComponentCheck(
+            component=_COMPONENT_MINERU_EXTRA,
+            required='yes',
+            is_required=True,
+            status=ExtractStatus.MISSING,
+            detail='primary PDF backend; install with `uv sync --extra extract`',
+        )
+    try:
+        version = metadata.version('mineru')
+    except metadata.PackageNotFoundError:  # pragma: no cover — defensive
+        version = 'unknown'
+    return ExtractComponentCheck(
+        component=_COMPONENT_MINERU_EXTRA,
+        required='yes',
+        is_required=True,
+        status=ExtractStatus.OK,
+        detail=f'mineru {version}',
+    )
+
+
+def _check_mineru_models(*, kind: str) -> ExtractComponentCheck:
+    """Probe one MinerU weight cache (non-downloading).
+
+    ``kind`` is ``'pipeline'`` or ``'vlm'`` — the two keys
+    ``get_local_models_dir()`` returns, one per weight family
+    (``docs/mineru-backend-spec.md`` §7). ``'vlm'`` backs the default
+    ``vlm-engine`` (and, with ``'pipeline'``, hybrid-engine), so it is
+    **required** now that MinerU is the primary backend
+    (``docs/mineru-primary-promotion.md`` §4) — its absence flips the exit
+    code. ``'pipeline'`` backs only the opt-in ``--mineru-engine pipeline``, so
+    it stays informational (``is_required=False``). Reads MinerU's *configured*
+    local model root (from its own ``~/mineru.json`` config) rather than
+    ``auto_download_…``, so the probe never triggers a multi-GB pull. The
+    "directory exists and is non-empty" invariant mirrors
+    :func:`_model_dir_present` for docling.
+    """
+    is_required = kind == 'vlm'
+    required = 'yes' if is_required else 'no'
+    component = (
+        _COMPONENT_MINERU_MODELS_PIPELINE if kind == 'pipeline' else _COMPONENT_MINERU_MODELS_VLM
+    )
+    try:
+        from mineru.utils.models_download_utils import (  # pyright: ignore[reportMissingImports]
+            get_local_models_dir,
+        )
+    except ImportError:
+        return ExtractComponentCheck(
+            component=component,
+            required=required,
+            is_required=is_required,
+            status=ExtractStatus.OFF,
+            detail='[mineru] extra not installed',
+        )
+    try:
+        local_dirs = get_local_models_dir()
+        raw = (local_dirs.get(kind) if isinstance(local_dirs, dict) else None) or ''
+    except Exception as exc:  # pragma: no cover — defensive; a probe never crashes
+        return ExtractComponentCheck(
+            component=component,
+            required=required,
+            is_required=is_required,
+            status=ExtractStatus.MISSING,
+            detail=f'could not resolve MinerU {kind} model root: {exc}',
+        )
+    root = Path(raw) if raw else None
+    if root is not None and _model_dir_present(root):
+        return ExtractComponentCheck(
+            component=component,
+            required=required,
+            is_required=is_required,
+            status=ExtractStatus.OK,
+            detail=f'{kind} weights at {root}',
+        )
+    return ExtractComponentCheck(
+        component=component,
+        required=required,
+        is_required=is_required,
+        status=ExtractStatus.MISSING,
+        detail='missing — `litspectraits doctor --download-models`',
+    )
+
+
+def _maybe_download_mineru_models() -> None:
+    """Download both MinerU weight families via MinerU's own helpers.
+
+    Synchronous; the caller dispatches via :func:`asyncio.to_thread`. The
+    source honours ``MINERU_MODEL_SOURCE`` (``huggingface`` / ``modelscope``
+    / ``auto``), defaulting to HuggingFace. MinerU writes its own
+    ``~/mineru.json`` recording where each family landed — which is exactly
+    what :func:`_check_mineru_models` then reads. Both are pulled
+    unconditionally (pipeline for ``--mineru-engine pipeline``/hybrid-engine,
+    vlm for vlm-engine/hybrid-engine) since ``--download-models`` has no
+    ``--mineru-engine`` of its own to scope the pull to.
+    """
+    from mineru.cli.models_download import (  # pyright: ignore[reportMissingImports]
+        download_pipeline_models,
+        download_vlm_models,
+    )
+
+    source = os.environ.get('MINERU_MODEL_SOURCE') or _MINERU_DEFAULT_MODEL_SOURCE
+    download_pipeline_models(source)
+    download_vlm_models(source)
 
 
 def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) -> None:
@@ -789,17 +955,20 @@ def _maybe_download_models(*, force: bool, model_cache_dir: Path | None = None) 
 
 
 async def _maybe_smoke_extract(*, fixture_path: Path, settings: Settings) -> ExtractComponentCheck:
-    """Run a live docling conversion against ``fixture_path``; time it.
+    """Run a live MinerU ``vlm-engine`` conversion against ``fixture_path``; time it.
 
-    Stages the fixture into a throwaway tempdir so doctor remains
-    read-only with respect to the operator's real ``data_dir``. The
-    fixture is sniffed, hashed, written into an
-    :class:`AcquisitionRecord`, and run through
-    :func:`litspectraits.extract.extract_pdf` exactly as the production
-    extractor would. Any :class:`ExtractError` is captured and folded
-    into the row's status / detail; we never let it propagate, because
-    the surrounding ``doctor`` invocation must finish rendering the
-    other rows.
+    Retargeted to the **default path** (MinerU / ``vlm-engine``) now that
+    MinerU is the primary backend (``docs/mineru-primary-promotion.md`` §4) —
+    the smoke is heavy (needs the vlm weights and likely a GPU), which is why
+    it stays opt-in. Stages the fixture into a throwaway tempdir so doctor
+    remains read-only with respect to the operator's real ``data_dir``. The
+    fixture is sniffed, hashed, written into an :class:`AcquisitionRecord`, and
+    run through :func:`litspectraits.extract.mineru.extract_mineru` with the
+    default engine/effort exactly as a bare ``extract`` would. MinerU resolves
+    its own weights, so no ``model_cache_dir`` is threaded through. Any
+    :class:`ExtractError` is captured and folded into the row's status /
+    detail; we never let it propagate, because the surrounding ``doctor``
+    invocation must finish rendering the other rows.
     """
     if not fixture_path.is_file():
         return ExtractComponentCheck(
@@ -810,8 +979,13 @@ async def _maybe_smoke_extract(*, fixture_path: Path, settings: Settings) -> Ext
             detail=f'fixture not found: {fixture_path}',
         )
 
-    # Local import keeps the docling dependency optional at module load.
-    from litspectraits.extract.pdf import extract_pdf
+    # Local import keeps the extractor module resolvable without eagerly
+    # importing the heavy ``mineru`` package at doctor module load.
+    from litspectraits.extract.mineru import (
+        DEFAULT_MINERU_EFFORT,
+        DEFAULT_MINERU_ENGINE,
+        extract_mineru,
+    )
 
     with tempfile.TemporaryDirectory(prefix='litspectraits-doctor-smoke-') as td_str:
         td = Path(td_str)
@@ -819,11 +993,12 @@ async def _maybe_smoke_extract(*, fixture_path: Path, settings: Settings) -> Ext
         record = _stage_fixture_for_smoke(fixture_path=fixture_path, store=store)
         start = time.monotonic()
         try:
-            await extract_pdf(
+            await extract_mineru(
                 record,
                 store,
                 reextract=False,
-                model_cache_dir=settings.docling_model_cache_dir,
+                engine=DEFAULT_MINERU_ENGINE,
+                effort=DEFAULT_MINERU_EFFORT,
             )
         except ExtractError as exc:
             return ExtractComponentCheck(

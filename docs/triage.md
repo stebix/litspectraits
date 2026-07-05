@@ -808,3 +808,47 @@ harness loader prerequisites of `docs/dual-route-comparison-overview.md`
   `WHITESPACE_RULE` id, bump `NORMALIZER_VERSION`, and rebuild the
   affected normalisations. Until then, passthrough is the honest
   record.
+
+---
+
+## Step MinerU-primary promotion (steps 4–6, 2026-07-04)
+
+### MP-1 — Gated `vlm-engine` smoke validated end-to-end on the real Wiley PDF
+
+- **Title** — the default path (`extract` → `mineru`/`vlm-engine` → `normalize`)
+  validated against the real `10.1002/mrm.27665` middle.json, not just mocked
+  `do_parse`.
+- `[x]` Reviewed — validated 2026-07-04.
+- **Where:** `tests/smoke/test_mineru_vlm_e2e.py`
+  (`smoke` + `requires_wiley_creds`); `extract/mineru.py`,
+  `normalize/mineru_adapter.py`; spec `docs/mineru-primary-promotion.md` §6.
+- **Decision:** shipped the gated smoke test (full ingest → bare extract →
+  normalize on a `tmp_path` store). Because the real Wiley PDF was already in
+  the local store, the extract→normalize legs were *also* validated offline via
+  a fresh real `vlm-engine` re-extract (5m48s, A100) into a throwaway store —
+  no live Wiley fetch needed. Findings:
+  - real `vlm-engine` stamps `middle.json._backend == 'vlm'` (≠ `'pipeline'`);
+    the adapter's `_engine_fidelity` maps it to `'approximate'` correctly, so
+    **all 98 normalized blocks are `geometry_fidelity='approximate'`, never
+    `'exact'`** — the §6 risk (adapter built on `pipeline` fixtures) did not
+    materialize; no adapter fix was needed.
+  - `route == 'mineru'`, `schema_version == 2`, title recovered verbatim
+    ("Sparsity and locally low rank regularization for MR fingerprinting").
+  - aux outputs land on real vlm: `document.md` (56 429 B) + `images/` (30
+    figures), and `meta.aux_outputs == {"images_dir": "images", "markdown":
+    "document.md"}`. The committed `document.md` is **byte-identical** to the
+    human-reviewed `mrm27665-vlm.md` reference.
+  - formula/table recovery (the point of the promotion): 12 `EquationBlock`s
+    with LaTeX — incl. eq. 5 `\hat{x} = \operatorname{argmin}_{x} \frac{1}{2}
+    \|\mathbf{AU}_{r}\mathbf{FCx}...` (the `U_r` term) — and 3 `TableBlock`s
+    parsed to real cell grids (NRMSE R=1..4, tube comparisons, literature
+    table).
+- **Why:** every unit test upstream mocks `do_parse`; this is the only layer
+  that exercises the real vlm `middle.json`/`.md`/`images` shape through the
+  extractor + adapter, and the byte-identical markdown confirms the parse
+  matches the reviewed reference.
+- **Revisit when:** MinerU renames the `_backend` tag (the adapter treats
+  anything ≠ `'pipeline'` as approximate — a rename to e.g. `'vlm2'` stays
+  correct, but a rename *to* `'pipeline'` for a VLM engine would silently
+  mis-grade); or the hallucination guard (spec §11 Q-E) lands and the canonical
+  path stops trusting the autoregressive formula/table heads verbatim.

@@ -13,7 +13,8 @@ import pytest
 import litspectraits.extract._dispatch as dispatch_mod
 from litspectraits.errors import BackendNotApplicableError, MissingArtifactError
 from litspectraits.extract import extract
-from litspectraits.extract.backend_ids import DEFAULT_PDF_BACKEND, MINERU
+from litspectraits.extract.backend_ids import DEFAULT_PDF_BACKEND, DOCLING_STANDARD, MINERU
+from litspectraits.extract.mineru import DEFAULT_MINERU_EFFORT, DEFAULT_MINERU_ENGINE
 from litspectraits.manifest import (
     AcquisitionRecord,
     CrossRefMetadata,
@@ -58,18 +59,24 @@ def store(tmp_path: Path) -> ArtifactStore:
     return ArtifactStore(data_dir=tmp_path)
 
 
+# ``backend`` selects the leg's default-signature leaf: the PDF leg now
+# defaults to ``extract_mineru`` (different signature), so the docling leaf is
+# reached by passing ``docling-standard`` explicitly; the XML legs tolerate the
+# default (mineru) backend since it means "unset" there. MinerU routing has its
+# own dedicated tests below.
 @pytest.mark.parametrize(
-    ('fmt', 'publisher', 'fake_attr'),
+    ('fmt', 'publisher', 'fake_attr', 'backend'),
     [
-        (Format.PDF, Publisher.WILEY, 'extract_pdf'),
-        (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats'),
-        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier'),
+        (Format.PDF, Publisher.WILEY, 'extract_pdf', DOCLING_STANDARD),
+        (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats', DEFAULT_PDF_BACKEND),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier', DEFAULT_PDF_BACKEND),
     ],
 )
 async def test_branch_routes_through_leaf_extractor(
     fmt: Format,
     publisher: Publisher,
     fake_attr: str,
+    backend: str,
     store: ArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -91,7 +98,7 @@ async def test_branch_routes_through_leaf_extractor(
 
     monkeypatch.setattr(dispatch_mod, fake_attr, _fake_leaf)
     record = _acquisition_record(fmt=fmt, publisher=publisher)
-    result = await extract(record, store, reextract=True)
+    result = await extract(record, store, backend=backend, reextract=True)
     assert result == f'sentinel-{fake_attr}'
     assert captured['record'] is record
     assert captured['store'] is store
@@ -99,17 +106,18 @@ async def test_branch_routes_through_leaf_extractor(
 
 
 @pytest.mark.parametrize(
-    ('fmt', 'publisher', 'fake_attr'),
+    ('fmt', 'publisher', 'fake_attr', 'backend'),
     [
-        (Format.PDF, Publisher.WILEY, 'extract_pdf'),
-        (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats'),
-        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier'),
+        (Format.PDF, Publisher.WILEY, 'extract_pdf', DOCLING_STANDARD),
+        (Format.JATS_XML, Publisher.SPRINGER_NATURE, 'extract_jats', DEFAULT_PDF_BACKEND),
+        (Format.ELSEVIER_XML, Publisher.ELSEVIER, 'extract_elsevier', DEFAULT_PDF_BACKEND),
     ],
 )
 async def test_branch_default_reextract_is_false(
     fmt: Format,
     publisher: Publisher,
     fake_attr: str,
+    backend: str,
     store: ArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,7 +136,7 @@ async def test_branch_default_reextract_is_false(
 
     monkeypatch.setattr(dispatch_mod, fake_attr, _fake_leaf)
     record = _acquisition_record(fmt=fmt, publisher=publisher)
-    await extract(record, store)
+    await extract(record, store, backend=backend)
     assert captured['reextract'] is False
 
 
@@ -156,7 +164,9 @@ async def test_pdf_branch_forwards_model_cache_dir(
     monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fake_extract_pdf)
     record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
     weights_dir = tmp_path / 'docling-weights'
-    await extract(record, store, model_cache_dir=weights_dir)
+    # ``model_cache_dir`` is the docling weight cache — exercised on the docling
+    # leg, which is now reached by an explicit ``--backend docling-standard``.
+    await extract(record, store, backend=DOCLING_STANDARD, model_cache_dir=weights_dir)
     assert captured['model_cache_dir'] == weights_dir
 
 
@@ -194,10 +204,14 @@ async def test_pdf_mineru_backend_routes_to_extract_mineru(
         *,
         reextract: bool = False,
         model_cache_dir: Path | None = None,
+        engine: str = DEFAULT_MINERU_ENGINE,
+        effort: str = DEFAULT_MINERU_EFFORT,
     ) -> object:
         del store, model_cache_dir
         captured['record'] = record
         captured['reextract'] = reextract
+        captured['engine'] = engine
+        captured['effort'] = effort
         return 'sentinel-mineru'
 
     async def _fail_pdf(*_args: object, **_kwargs: object) -> object:
@@ -212,6 +226,40 @@ async def test_pdf_mineru_backend_routes_to_extract_mineru(
     assert result == 'sentinel-mineru'
     assert captured['record'] is record
     assert captured['reextract'] is True
+    # Defaults ride along untouched when the caller doesn't set them.
+    assert captured['engine'] == DEFAULT_MINERU_ENGINE
+    assert captured['effort'] == DEFAULT_MINERU_EFFORT
+
+
+async def test_pdf_mineru_engine_and_effort_thread_through(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mineru_engine`` / ``mineru_effort`` reach ``extract_mineru`` verbatim."""
+    captured: dict[str, object] = {}
+
+    async def _fake_mineru(
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
+        engine: str = DEFAULT_MINERU_ENGINE,
+        effort: str = DEFAULT_MINERU_EFFORT,
+    ) -> object:
+        del record, store, reextract, model_cache_dir
+        captured['engine'] = engine
+        captured['effort'] = effort
+        return 'sentinel-mineru'
+
+    monkeypatch.setattr(dispatch_mod, 'extract_mineru', _fake_mineru)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+
+    await extract(
+        record, store, backend=MINERU, mineru_engine='hybrid-engine', mineru_effort='high'
+    )
+
+    assert captured['engine'] == 'hybrid-engine'
+    assert captured['effort'] == 'high'
 
 
 async def test_pdf_unknown_backend_raises_backend_not_applicable(
@@ -221,6 +269,43 @@ async def test_pdf_unknown_backend_raises_backend_not_applicable(
     record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
     with pytest.raises(BackendNotApplicableError):
         await extract(record, store, backend='no-such-backend')
+
+
+async def test_mineru_engine_on_docling_backend_raises(store: ArtifactStore) -> None:
+    """A non-default ``--mineru-engine`` with any other ``--backend`` is rejected."""
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+    with pytest.raises(BackendNotApplicableError):
+        await extract(record, store, backend=DOCLING_STANDARD, mineru_engine='hybrid-engine')
+
+
+async def test_mineru_effort_on_xml_raises(store: ArtifactStore) -> None:
+    """A non-default ``--mineru-effort`` on an XML artifact is rejected, not ignored."""
+    record = _acquisition_record(fmt=Format.JATS_XML, publisher=Publisher.SPRINGER_NATURE)
+    with pytest.raises(BackendNotApplicableError):
+        await extract(record, store, mineru_effort='high')
+
+
+async def test_default_mineru_knobs_on_docling_backend_are_tolerated(
+    store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving ``--mineru-engine``/``--mineru-effort`` at default never trips the guard."""
+
+    async def _fake_pdf(
+        record: AcquisitionRecord,
+        store: ArtifactStore,
+        *,
+        reextract: bool = False,
+        model_cache_dir: Path | None = None,
+    ) -> object:
+        del record, store, reextract, model_cache_dir
+        return 'sentinel-docling'
+
+    monkeypatch.setattr(dispatch_mod, 'extract_pdf', _fake_pdf)
+    record = _acquisition_record(fmt=Format.PDF, publisher=Publisher.WILEY)
+
+    result = await extract(record, store, backend=DOCLING_STANDARD)
+
+    assert result == 'sentinel-docling'
 
 
 @pytest.mark.parametrize(
@@ -233,10 +318,15 @@ async def test_pdf_unknown_backend_raises_backend_not_applicable(
 async def test_non_default_backend_on_xml_raises(
     fmt: Format, publisher: Publisher, store: ArtifactStore
 ) -> None:
-    """``--backend`` is meaningless on XML; an explicit choice is rejected."""
+    """``--backend`` is meaningless on XML; an explicit choice is rejected.
+
+    Uses ``docling-standard`` as the explicit non-default: since the promotion,
+    ``mineru`` *is* the default backend (== "unset"), so it no longer trips the
+    XML guard — ``docling-standard`` is now the value that does.
+    """
     record = _acquisition_record(fmt=fmt, publisher=publisher)
     with pytest.raises(BackendNotApplicableError):
-        await extract(record, store, backend=MINERU)
+        await extract(record, store, backend=DOCLING_STANDARD)
 
 
 async def test_default_backend_on_xml_is_tolerated(

@@ -20,13 +20,25 @@ PdfBackendId = Literal['docling-standard', 'mineru']
 """Identifier for a wired PDF parsing backend, recorded in extract ``meta.json``."""
 
 DOCLING_STANDARD: Final[PdfBackendId] = 'docling-standard'
-"""The docling text-layer pipeline — the default, exact-geometry backend."""
+"""The docling text-layer pipeline — the opt-in, exact-geometry fallback backend."""
 
 MINERU: Final[PdfBackendId] = 'mineru'
-"""The MinerU ``pipeline`` engine (``docs/mineru-backend-spec.md`` §3)."""
+"""The MinerU backend (``docs/mineru-backend-spec.md`` §3) — the default PDF parser.
 
-DEFAULT_PDF_BACKEND: Final[PdfBackendId] = DOCLING_STANDARD
-"""Backend used when neither ``--backend`` nor ``LITSPECTRAITS_PDF_BACKEND`` is set."""
+Which MinerU local engine runs is a separate knob
+(:data:`~litspectraits.extract.mineru.DEFAULT_MINERU_ENGINE`, default
+``'vlm-engine'``); this id only selects *MinerU* over docling. See
+``docs/mineru-primary-promotion.md`` for the promotion rationale.
+"""
+
+DEFAULT_PDF_BACKEND: Final[PdfBackendId] = MINERU
+"""Backend used when neither ``--backend`` nor ``LITSPECTRAITS_PDF_BACKEND`` is set.
+
+Promoted from ``docling-standard`` to ``mineru`` — MinerU's VLM parse recovers
+formula/table values docling loses on Wiley PDFs
+(``docs/mineru-primary-promotion.md`` §1). docling remains available via
+``--backend docling-standard``.
+"""
 
 PDF_BACKEND_IDS: Final[tuple[PdfBackendId, ...]] = (DOCLING_STANDARD, MINERU)
 """All wired PDF backend ids, for CLI choice validation and dispatch."""

@@ -517,6 +517,14 @@ not, do that first.
 
 ## 11. Open decisions (for `docs/triage.md`)
 
+> **Update (MinerU-primary promotion — `docs/mineru-primary-promotion.md`).**
+> MinerU's `vlm-engine` is now the **default** PDF backend. That closes Q-D as
+> an *accepted* trade (approximate geometry corpus-wide, reversible via
+> `DEFAULT_MINERU_ENGINE`) rather than a blocking gate, and Q-E as an accepted
+> deferral (the canonical vlm path currently trusts its formula/table heads; a
+> render-back / repetition-loop guard remains a follow-on). See the promotion
+> doc §0 (P2) and §9.
+
 - **Q-A. `Route` additive vs collapse.** Recommended: additive
   (`'mineru'` joins the literal; §2.1). The alternative — collapse PDF
   backends to a single `route='pdf'` and carry tool identity only in
