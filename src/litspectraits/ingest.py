@@ -81,6 +81,7 @@ from litspectraits.metadata import (
     publisher_for_doi,
     warn_on_publisher_mismatch,
 )
+from litspectraits.progress import report_stage
 from litspectraits.retrievers.dispatch import retriever_for
 from litspectraits.sniff import verify
 from litspectraits.store import ArtifactStore
@@ -146,17 +147,21 @@ async def ingest(
                     artifact_path=existing.artifact_path,
                 )
                 return existing
+        report_stage('Fetching CrossRef metadata…')
         meta = await fetch_metadata(doi, client=client, settings=settings)
         publisher = publisher_for_doi(doi)
         warn_on_publisher_mismatch(meta, publisher)
         retriever = retriever_for(publisher)
+        report_stage(f'Retrieving from {publisher.value}…')
         payload = await retriever.fetch(
             doi, meta, client=client, tmp_dir=store.tmp_dir, settings=settings
         )
+        report_stage('Validating bytes…')
         verify(payload.tmp_path, expected=payload.format, doi=doi)
         record = _build_record(
             doi=doi, meta=meta, publisher=publisher, payload=payload, store=store
         )
+        report_stage('Committing to store…')
         store.commit(src=payload.tmp_path, record=record)
         _logger.info(
             'ingest committed',

@@ -736,6 +736,7 @@ model cache + accelerator detection, plus opt-in
 | `LITSPECTRAITS_DATA_DIR` | store root | `platformdirs.user_data_dir('litspectraits')` |
 | `LITSPECTRAITS_DOCLING_MODEL_CACHE_DIR` | docling model-weights dir (passed as `PdfPipelineOptions.artifacts_path`; also where `doctor --download-models` writes) | unset → docling default `settings.cache_dir / 'models'` (`~/.cache/docling/models`) |
 | `LITSPECTRAITS_LOG_FORMAT` | `rich` / `json` | `rich` |
+| `LITSPECTRAITS_LOG_LEVEL` | console verbosity (`critical`/`error`/`warning`/`info`/`debug`); the per-operator baseline the global `--log-level` / `-v` flags override per run | `warning` |
 | `LITSPECTRAITS_HTTP_TIMEOUT_S` | per-request timeout (CrossRef + doctor IP check) | `30` |
 | `WILEY_TDM_TOKEN` | Wiley token (consumed by `wiley-tdm` lib) | unset → `wiley` retriever raises `MissingCredentialError` unless IP-based auth succeeds |
 | `SPRINGER_OA_API_KEY` | Springer Nature **Open Access tier** API key (dev-portal key, free; routes through `api.springernature.com/openaccess/jats`) | unset → if `SPRINGER_TDM_API_KEY` is also unset, `springer` retriever raises `MissingCredentialError` |
